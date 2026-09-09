@@ -1,0 +1,31 @@
+# secrets and local state — never committed
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.seed
+*.pass
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# node
+node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/
+
+# internal working documents stay private
+.fable/
+*.md
+!README.md
+!api/.env.example
+deploy/
+
+# OS / editor
+.DS_Store
