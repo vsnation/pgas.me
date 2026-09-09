@@ -1,20 +1,18 @@
-// Balances read client-side: the connected wallet's holdings across every chain deBridge lists
-// (Deposit page, tap-to-pay chips) and a destination's native balance per chain (Wallets page).
+// Balances read client-side: the connected wallet's holdings across every chain the API lists —
+// the Deposit page's tap-to-pay chips. (The per-destination native balances went with the Wallets
+// page on 2026-09-09: a payout address is typed now, not registered, so there is no list to price.)
 // The chip row is buybeam.my's: one horizontally scrolling line of pills, token logo with the chain
 // badge on its corner, symbol over the USD value (or the balance when nothing priced it).
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { formatEther } from 'ethers';
-import { DESTINATION_CHAINS, chainIconUrl, chainName } from '../lib/chains';
+import { chainIconUrl } from '../lib/chains';
 import { fmtAgo, fmtNumber, fmtUsd } from '../lib/format';
 import {
   loadCachedPortfolio,
-  nativeBalance,
   pricesRateLimited,
   scanPortfolio,
   sortForDisplay,
   type ChainScan,
   type Holding,
-  type NativeRead,
   type Portfolio as PortfolioData,
 } from '../lib/portfolio';
 import { useStore } from '../state/store';
@@ -111,12 +109,30 @@ export function Portfolio({
   const holdings = portfolio ? portfolio.holdings : sortForDisplay(live.flatMap((s) => s.holdings));
   const evm = scans.filter((c) => !c.nonEvm);
   const reachable = evm.filter((c) => c.via !== 'none').length;
-  const unreachable = evm.filter((c) => c.via === 'none').length;
   const nonEvm = scans.filter((c) => c.nonEvm).length;
   const chips = holdings.slice(0, MAX_CHIPS);
   const firstKey = chips[0]?.key;
   const totalUsd = holdings.reduce((s, h) => s + (h.usd ?? 0), 0);
   const settled = !!portfolio && !scanning;
+
+  // How the scan went — chains read, chains skipped, unreachable endpoints, missing prices — is not
+  // something a depositor acts on, so it is the Refresh button's tooltip rather than a line of text
+  // under the chips. The empty state still says it out loud when NOTHING could be read.
+  const scanNote = [
+    `read ${reachable} of ${evm.length} EVM chains${scans.some((c) => c.via === 'wallet') ? ' (one through the wallet)' : ''}`,
+    nonEvm ? `${nonEvm} not scanned (non-EVM)` : '',
+    holdings.length > MAX_CHIPS ? `showing the top ${MAX_CHIPS} of ${holdings.length}` : '',
+    portfolio && !scanning && holdings.length > 0 && !portfolio.priced
+      ? pricesRateLimited()
+        ? 'prices skipped (CoinGecko rate limit)'
+        : 'prices unavailable'
+      : '',
+    ...scans
+      .filter((c) => c.errors.length || c.note)
+      .map((c) => `${c.name} (${c.via}) — ${[...c.errors, c.note].filter(Boolean).join('; ')}`),
+  ]
+    .filter(Boolean)
+    .join(' · ');
 
   // chains land one by one and the list re-sorts when prices arrive; Chrome keeps whatever chip was
   // leftmost in place, which leaves the row scrolled past the biggest holdings. Whenever a new chip
@@ -130,7 +146,6 @@ export function Portfolio({
       <div className="card-head">
         <div>
           <h2>Your portfolio</h2>
-          <p className="small muted">Read client-side from every chain deBridge supports — tap a holding to pay with it.</p>
         </div>
         <div className="row">
           {portfolio?.priced && totalUsd > 0 && (
@@ -139,7 +154,14 @@ export function Portfolio({
             </span>
           )}
           {settled && <span className="tiny muted">as of {fmtAgo(portfolio.at)}</span>}
-          <button type="button" className="btn btn-sm" onClick={() => scan(true)} disabled={scanning || !chains.length}>
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={() => scan(true)}
+            disabled={scanning || !chains.length}
+            title={scanNote ? `Re-read every chain — ${scanNote}` : 'Re-read every chain'}
+            data-scan-note={scanNote || undefined}
+          >
             {scanning ? 'Scanning…' : 'Refresh'}
           </button>
         </div>
@@ -188,70 +210,8 @@ export function Portfolio({
                 : `No holdings found on ${reachable} reachable chain${reachable === 1 ? '' : 's'}.`}
             </div>
           )}
-          <div className="row small muted">
-            <span>
-              {reachable} of {evm.length} chains read
-              {scans.some((c) => c.via === 'wallet') ? ' (one through the wallet)' : ''}
-              {nonEvm ? ` · ${nonEvm} not scanned (non-EVM)` : ''}
-            </span>
-            {holdings.length > MAX_CHIPS && (
-              <span>
-                · showing the top {MAX_CHIPS} of {holdings.length}
-              </span>
-            )}
-            {settled && holdings.length > 0 && !portfolio.priced && (
-              <span>· {pricesRateLimited() ? 'prices skipped (CoinGecko rate limit)' : 'prices unavailable'}</span>
-            )}
-            {scans.some((c) => c.errors.length || c.note) && (
-              <details className="plain">
-                <summary>{unreachable ? `${unreachable} unreachable` : 'notes'}</summary>
-                <ul className="tiny" style={{ margin: '6px 0 0', paddingLeft: 18 }}>
-                  {scans
-                    .filter((c) => c.errors.length || c.note)
-                    .map((c) => (
-                      <li key={c.chainId}>
-                        <b>{c.name}</b> ({c.via}) — {[...c.errors, c.note].filter(Boolean).join('; ')}
-                      </li>
-                    ))}
-                </ul>
-              </details>
-            )}
-          </div>
         </div>
       )}
     </section>
-  );
-}
-
-/** A destination's native balance on Ethereum · Arbitrum · Base, cached for a minute. */
-export function NativeBalances({ address, refreshKey }: { address: string; refreshKey: number }) {
-  const { wallet, data } = useStore();
-  const [reads, setReads] = useState<Record<number, NativeRead | undefined>>({});
-  const { provider, chainId } = wallet;
-  useEffect(() => {
-    let alive = true;
-    setReads({});
-    for (const cid of DESTINATION_CHAINS) {
-      nativeBalance(cid, address, provider ? { provider, chainId } : null, refreshKey > 0).then((r) => {
-        if (alive) setReads((s) => ({ ...s, [cid]: r }));
-      });
-    }
-    return () => {
-      alive = false;
-    };
-  }, [address, provider, chainId, refreshKey]);
-  return (
-    <div className="row" style={{ gap: '6px 14px' }}>
-      {DESTINATION_CHAINS.map((cid) => {
-        const r = reads[cid];
-        return (
-          <span key={cid} className="bal-line" title={r?.error ?? (r ? `read via ${r.via}` : 'reading…')}>
-            <span className="muted">{chainName(cid, data.chains)}</span>
-            <b>{r === undefined ? '…' : r.value === null ? 'n/a' : fmtNumber(Number(formatEther(r.value)), 5)}</b>
-            {r && r.value !== null && <span className="muted">ETH</span>}
-          </span>
-        );
-      })}
-    </div>
   );
 }

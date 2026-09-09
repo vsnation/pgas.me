@@ -1,26 +1,62 @@
-// Deposit: portfolio → target asset + source chain/token/amount → quote → (armed) approve/deposit
-// → status timeline. When the Beam wallet is not armed the quote is a preview and nothing is sent.
+// Deposit: portfolio chips → what you pay with (chain + token in one picker) → what you receive →
+// amount → quote → (armed) approve/deposit → status timeline. When the Beam wallet is not armed the
+// quote is a preview and nothing is sent.
 //
-// Three quote modes (API_CONTRACT.md): `dln` is the cross-chain order; `direct` skips deBridge and
-// pays the pipe itself; `swap` is a single-chain DLN swap into the user's OWN wallet, after which we
-// re-quote what actually arrived and continue as `direct`. A swap tx is never registered as a deposit.
+// Four quote modes (API_CONTRACT.md). `uniswap` is the primary ingress and the one this page leads
+// with when the API says that path is open: one transaction on Ethereum into the Pgas gateway pool,
+// whose hook swaps on the canonical pool and locks the output in the Beam bridge in the same
+// transaction — so its tx is built with the quote and there is nothing to arm. `xchain` is the
+// cross-chain order; `direct` skips the router and pays the pipe itself; `swap` is a single-chain
+// swap into the user's OWN wallet, after which we re-quote what actually arrived and continue as
+// `direct`. A swap tx is never registered as a deposit.
+//
+// Which paths are open is the API's statement, never this file's assumption — lib/ingress.ts reads
+// it in one place and every branch here reads that answer.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BrowserProvider, Interface, formatUnits } from 'ethers';
+import { HowItWorks } from '../components/HowItWorks';
 import { Portfolio } from '../components/Portfolio';
 import { SignInGate } from '../components/SignInGate';
 import { depositStatusLabel } from '../components/Status';
-import { api, errorText } from '../lib/api';
-import { NATIVE_ADDRESS, getFallbackProvider, isNativeToken } from '../lib/chains';
+import { ApiError, api, errorText } from '../lib/api';
+import { NATIVE_ADDRESS, chainIconUrl, getFallbackProvider, isNativeToken } from '../lib/chains';
 import { explorerTx, fmtDuration, fmtUnits, fmtUsd, parseAmount, toDate } from '../lib/format';
+import { ingressPartial, isUniswapToken, resolveIngress } from '../lib/ingress';
 import { loadCachedPortfolio, loadTokens, type Holding } from '../lib/portfolio';
-import type { Asset, AssetKey, Chain, Deposit, Quote, Token } from '../lib/types';
+import { quoteMode, type ArmedQuote, type Asset, type AssetKey, type Chain, type Deposit, type Quote, type Token } from '../lib/types';
 import { useStore } from '../state/store';
 
 const QUOTE_DEBOUNCE_MS = 500;
-const QUOTE_TTL_FALLBACK_S = 30; // DLN quotes live ~30 s; used when the API sends no expires_at
-const MIN_ETH_GROTH = 2_000_000; // 0.02 ETH-equivalent product minimum
+const QUOTE_TTL_FALLBACK_S = 30; // a router quote lives ~30 s; used when the API sends no expires_at
+/** How far the armed order may move from the estimate the user was shown before they re-agree. */
+const ESTIMATE_DRIFT_LIMIT = 0.005;
 
-type Stage = 'idle' | 'approving' | 'approved' | 'swapping' | 'swap-wait' | 'sending' | 'registering' | 'tracking';
+/**
+ * The deposit floor is the API's and only the API's — `POST /v1/quote` answers 400 "below the
+ * minimum deposit …" with the live number in it. The client used to carry its own 0.02 ETH copy,
+ * which said the wrong thing the moment the operator moved the floor (it is 0.002 ETH today).
+ * Two implementations of one fact disagree; this one reads.
+ */
+function isBelowMinimum(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 400 && /below the minimum deposit/i.test(e.detail);
+}
+
+/**
+ * `arming` is the T2b split (2026-09-09): `POST /v1/quote` costs ONE router call and returns the
+ * estimate, and the hook-carrying order is built by `POST /v1/quote/{id}/arm` when the user clicks
+ * Deposit. `confirm` is the stage that stage can land in — the armed order came back more than
+ * ESTIMATE_DRIFT_LIMIT away from the number on the screen, so the new one is shown and the user
+ * clicks again. A quote is never auto-refreshed out from under either.
+ */
+type Stage = 'idle' | 'arming' | 'confirm' | 'approving' | 'approved' | 'swapping' | 'swap-wait' | 'sending' | 'registering' | 'tracking';
+
+/** |new − shown| / shown, on decimal-string raw units; a double is far finer than the 0.5 % gate. */
+function estimateDrift(shown: string, next: string): number {
+  const a = Number(shown);
+  const b = Number(next);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0) return 0;
+  return Math.abs(b - a) / a;
+}
 
 const ERC20 = new Interface(['function balanceOf(address owner) view returns (uint256)']);
 
@@ -47,8 +83,8 @@ function assetDecimals(assets: Asset[], key: AssetKey): number {
   return assets.find((a) => a.key === key)?.decimals ?? (key === 'WBTC' ? 8 : 18);
 }
 
-function expiresInSeconds(q: Quote, receivedAt: number): number {
-  const d = toDate(q.expires_at);
+function expiresInSeconds(expiresAt: string | number | null, receivedAt: number): number {
+  const d = toDate(expiresAt);
   if (d) return Math.max(0, Math.round((d.getTime() - Date.now()) / 1000));
   return Math.max(0, QUOTE_TTL_FALLBACK_S - Math.round((Date.now() - receivedAt) / 1000));
 }
@@ -66,11 +102,17 @@ export function DepositPage() {
   const [amount, setAmount] = useState('');
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [maxRaw, setMaxRaw] = useState<bigint | null>(null);
+  /** Set the moment the user picks a source chain by hand; from then on the wallet stops steering. */
+  const pickedByUser = useRef(false);
 
   const [quote, setQuote] = useState<Quote | null>(null);
   const [quoteAt, setQuoteAt] = useState(0);
+  const [expiresAt, setExpiresAt] = useState<string | number | null>(null);
+  const [armed, setArmed] = useState<ArmedQuote | null>(null);
+  const [needsConfirm, setNeedsConfirm] = useState(false);
   const [quoteLoading, setQuoteLoading] = useState(false);
   const [quoteError, setQuoteError] = useState<string | null>(null);
+  const [belowMin, setBelowMin] = useState(false); // the API said 400 "below the minimum deposit …"
   const [expiresIn, setExpiresIn] = useState(0);
   const [requoteTick, setRequoteTick] = useState(0);
 
@@ -89,13 +131,51 @@ export function DepositPage() {
   const chain: Chain | undefined = useMemo(() => chains.find((c) => c.chain_id === chainId), [chains, chainId]);
   const targetAsset = assets.find((a) => a.key === target);
   const outDecimals = assetDecimals(assets, target);
-  const busy = stage === 'approving' || stage === 'sending' || stage === 'registering' || stage === 'swapping' || stage === 'swap-wait';
-  const mode = quote?.mode ?? 'dln';
+
+  // ---- which ingress paths are open (the API's statement; see lib/ingress.ts) ----
+  const flags = useMemo(() => resolveIngress(data.ingress, ingressPartial(session.account)), [data.ingress, session.account]);
+  const onEthereum = chain?.chain_id === 1;
+  /**
+   * The Uniswap route takes ETH out (DAI and WBTC keep their own pipe, which is the direct path)
+   * and only the tokens it has a registered gateway pool for. Asking for a route the API does not
+   * have would be a 400 the user did nothing to deserve, so the request simply does not name it.
+   */
+  const uniswapPair = isUniswapToken(token, data.uniswapTokens);
+  const askUniswap = flags.uniswap && !!onEthereum && target === 'ETH' && uniswapPair;
+  /** A source off Ethereum with the cross-chain path closed: there is nothing to quote. */
+  const xchainClosed = !!chain && !onEthereum && !flags.xchain;
+  /**
+   * The Ethereum token list, narrowed to the pairs the Uniswap route takes — but only while that is
+   * the path, and never to nothing: an empty list would be this filter's opinion, not the API's, so
+   * a list that matches no pair falls back to the whole list.
+   */
+  const uniswapChoice = flags.uniswap && !!onEthereum && target === 'ETH';
+  const payTokens = useMemo(() => {
+    if (!uniswapChoice) return tokens;
+    const kept = tokens.filter((t) => isUniswapToken(t, data.uniswapTokens));
+    return kept.length ? kept : tokens;
+  }, [tokens, uniswapChoice, data.uniswapTokens]);
+  const busy =
+    stage === 'arming' ||
+    stage === 'approving' ||
+    stage === 'sending' ||
+    stage === 'registering' ||
+    stage === 'swapping' ||
+    stage === 'swap-wait';
+  const mode = quoteMode(quote);
+  const uniswap = mode === 'uniswap';
+  /**
+   * The card leads with Uniswap when that is what the click would do — and stops the moment a quote
+   * comes back as something else, because a title that names a path the API did not take is a lie.
+   */
+  const uniswapPrimary = askUniswap && (!quote || uniswap);
   const rawAmount = token ? parseAmount(amount, token.decimals) : null;
 
   const resetFlow = useCallback(() => {
     setStage('idle');
     setFlowError(null);
+    setArmed(null);
+    setNeedsConfirm(false);
     setApproveHash(null);
     setTxHash(null);
     setDepositId(null);
@@ -103,13 +183,29 @@ export function DepositPage() {
     setSwapDone(null);
   }, []);
 
-  // default chain: the wallet's if supported, else Ethereum
+  /**
+   * "Pay with" follows the wallet — until the user says otherwise. On the first render it is the
+   * chain the wallet is on (Ethereum when that is not a chain we take), and a `chainChanged` from
+   * the wallet moves it too, which re-quotes on the chain the money is actually on. Once the user
+   * has picked a chain themselves (the picker, or a portfolio chip) the wallet stops steering: they
+   * asked to pay from somewhere else, and switching the wallet to send it must not undo that.
+   */
   useEffect(() => {
-    if (chainId !== null || !chains.length) return;
+    if (!chains.length) return;
+    if (chainId === null) {
+      const w = wallet.chainId;
+      if (w !== null && chains.some((c) => c.chain_id === w)) setChainId(w);
+      else setChainId(chains.find((c) => c.chain_id === 1)?.chain_id ?? chains[0].chain_id);
+      return;
+    }
+    if (pickedByUser.current) return;
     const w = wallet.chainId;
-    if (w !== null && chains.some((c) => c.chain_id === w)) setChainId(w);
-    else setChainId(chains.find((c) => c.chain_id === 1)?.chain_id ?? chains[0].chain_id);
-  }, [chains, chainId, wallet.chainId]);
+    if (w === null || w === chainId || !chains.some((c) => c.chain_id === w)) return;
+    setChainId(w);
+    setSelectedKey(null);
+    setMaxRaw(null);
+    resetFlow();
+  }, [chains, chainId, wallet.chainId, resetFlow]);
 
   // token list per chain (native first; keep the current token when it exists on the new chain)
   useEffect(() => {
@@ -149,6 +245,7 @@ export function DepositPage() {
 
   const onPick = useCallback(
     (h: Holding) => {
+      pickedByUser.current = true;
       setChainId(h.chainId);
       setSelectedKey(h.key);
       setMaxRaw(h.raw);
@@ -161,15 +258,20 @@ export function DepositPage() {
 
   // ---- quote: debounced, abortable, re-quoted automatically when it expires ----
   const sessionToken = session.session?.token ?? null;
-  const canQuote = !!sessionToken && !!wallet.address && !!chain && !!token && rawAmount !== null && stage !== 'tracking';
+  const canQuote =
+    !!sessionToken && !!wallet.address && !!chain && !!token && rawAmount !== null && stage !== 'tracking' && !xchainClosed;
   const rawAmountKey = rawAmount?.toString() ?? '';
-  const srcChain = chain?.chain_id; // the API takes EVM ids and maps to deBridge's internal id itself
+  const srcChain = chain?.chain_id; // the API takes EVM ids and maps to the router's own id itself
   const srcToken = token?.address;
   const sender = wallet.address;
   useEffect(() => {
     if (!canQuote || srcChain === undefined || !srcToken || !rawAmountKey || !sender) {
       setQuote(null);
+      setExpiresAt(null);
+      setArmed(null);
+      setNeedsConfirm(false);
       setQuoteError(null);
+      setBelowMin(false);
       setQuoteLoading(false);
       return;
     }
@@ -179,17 +281,35 @@ export function DepositPage() {
     const t = setTimeout(async () => {
       try {
         const q = await api.quote(
-          { src_chain_id: srcChain, src_token: srcToken, amount: rawAmountKey, target_asset: target, sender },
+          {
+            src_chain_id: srcChain,
+            src_token: srcToken,
+            amount: rawAmountKey,
+            target_asset: target,
+            sender,
+            // named only when the API says that path is open AND it takes this pair; left off
+            // otherwise so an API build that has never heard of the field answers exactly as before
+            ...(askUniswap ? { route: 'uniswap' as const } : {}),
+          },
           ctrl.signal,
         );
         if (ctrl.signal.aborted) return;
         setQuote(q);
         setQuoteAt(Date.now());
-        setExpiresIn(expiresInSeconds(q, Date.now()));
+        setExpiresAt(q.expires_at ?? null);
+        setExpiresIn(expiresInSeconds(q.expires_at ?? null, Date.now()));
+        // a fresh estimate invalidates any order armed against the previous one
+        setArmed(null);
+        setNeedsConfirm(false);
+        setBelowMin(false);
       } catch (e) {
         if (ctrl.signal.aborted || (e as Error)?.name === 'AbortError') return;
         setQuote(null);
-        setQuoteError(errorText(e));
+        setExpiresAt(null);
+        setArmed(null);
+        setNeedsConfirm(false);
+        setQuoteError(errorText(e)); // the API's own sentence, verbatim — including its minimum
+        setBelowMin(isBelowMinimum(e));
       } finally {
         if (!ctrl.signal.aborted) setQuoteLoading(false);
       }
@@ -198,35 +318,42 @@ export function DepositPage() {
       clearTimeout(t);
       ctrl.abort();
     };
-  }, [canQuote, srcChain, srcToken, rawAmountKey, target, sender, sessionToken, requoteTick]);
+  }, [canQuote, srcChain, srcToken, rawAmountKey, target, sender, sessionToken, requoteTick, askUniswap]);
 
   useEffect(() => {
     if (!quote) return;
     const t = setInterval(() => {
-      const left = expiresInSeconds(quote, quoteAt);
+      const left = expiresInSeconds(expiresAt, quoteAt);
       setExpiresIn(left);
-      if (left <= 0 && !busy && stage !== 'tracking') setRequoteTick((n) => n + 1);
+      // never re-quote under a user who is looking at a changed number and deciding (stage 'confirm')
+      if (left <= 0 && !busy && stage !== 'tracking' && stage !== 'confirm') setRequoteTick((n) => n + 1);
     }, 1000);
     return () => clearInterval(t);
-  }, [quote, quoteAt, busy, stage]);
+  }, [quote, quoteAt, expiresAt, busy, stage]);
 
-  // ---- approve / deposit / register ----
+  // ---- approve / arm / deposit / register ----
+  const sendApproval = async (approval: NonNullable<Quote['approval']>) => {
+    const iface = new Interface(['function approve(address spender, uint256 amount)']);
+    const hash = await wallet.sendTransaction({
+      to: approval.token,
+      data: iface.encodeFunctionData('approve', [approval.spender, BigInt(approval.amount)]),
+      chainId: data.resolveEvmChainId(approval.chain_id),
+    });
+    setApproveHash(hash);
+    if (wallet.provider) {
+      // best effort: wait for the approval to be mined; the wallet's RPC may not expose receipts
+      await new BrowserProvider(wallet.provider).waitForTransaction(hash, 1, 120_000).catch(() => null);
+    }
+    return hash;
+  };
+
+  /** The explicit button, for the quotes that carry their approval up front: `direct` and `swap`. */
   const approve = async () => {
     if (!quote?.approval) return;
     setFlowError(null);
     setStage('approving');
     try {
-      const iface = new Interface(['function approve(address spender, uint256 amount)']);
-      const hash = await wallet.sendTransaction({
-        to: quote.approval.token,
-        data: iface.encodeFunctionData('approve', [quote.approval.spender, BigInt(quote.approval.amount)]),
-        chainId: data.resolveEvmChainId(quote.approval.chain_id),
-      });
-      setApproveHash(hash);
-      if (wallet.provider) {
-        // best effort: wait for the approval to be mined; the wallet's RPC may not expose receipts
-        await new BrowserProvider(wallet.provider).waitForTransaction(hash, 1, 120_000).catch(() => null);
-      }
+      await sendApproval(quote.approval);
       setStage('approved');
     } catch (e) {
       setFlowError(errorText(e));
@@ -242,17 +369,60 @@ export function DepositPage() {
     void session.refreshAccount();
   };
 
+  /**
+   * One click, up to four steps: arm the order (`xchain` only — `uniswap`, `direct` and `swap`
+   * already carry their tx), let the user re-agree if the armed number moved, approve if the order
+   * needs it, send, register. A second click after `confirm` reuses the SAME armed order: `/arm` is
+   * idempotent but re-calling it would be a second chance to move the number the user just accepted.
+   */
   const send = async () => {
-    if (!quote?.tx) return;
+    if (!quote) return;
     setFlowError(null);
-    setStage('sending');
+    let plan: ArmedQuote | null = armed;
+    if (quoteMode(quote) === 'xchain' && !plan) {
+      setStage('arming');
+      try {
+        plan = await api.armQuote(quote.quote_id);
+      } catch (e) {
+        setFlowError(errorText(e));
+        setStage('idle');
+        return;
+      }
+      setArmed(plan);
+      if (plan.expires_at) {
+        setExpiresAt(plan.expires_at);
+        setQuoteAt(Date.now());
+        setExpiresIn(expiresInSeconds(plan.expires_at, Date.now()));
+      }
+      if (plan.estimate?.out_units && estimateDrift(quote.estimate.out_units, plan.estimate.out_units) > ESTIMATE_DRIFT_LIMIT) {
+        setNeedsConfirm(true);
+        setStage('confirm');
+        return;
+      }
+    }
+    const tx = plan?.tx ?? quote.tx;
+    if (!tx) {
+      setFlowError('The quote carries no transaction to send — refresh it.');
+      setStage('idle');
+      return;
+    }
+    setNeedsConfirm(false);
     let hash: string | null = null;
     try {
+      // the armed order brings its own approval (the estimate never had one), and the Uniswap route
+      // carries its router approval on the quote; the up-front approvals of `direct`/`swap` went
+      // through the button above and must not be sent twice
+      const upfront = plan?.approval ?? (quoteMode(quote) === 'uniswap' ? quote.approval : undefined);
+      if (upfront && approveHash === null) {
+        setStage('approving');
+        await sendApproval(upfront);
+      }
+      setStage('sending');
       hash = await wallet.sendTransaction({
-        to: quote.tx.to,
-        data: quote.tx.data,
-        value: quote.tx.value,
-        chainId: data.resolveEvmChainId(quote.tx.chain_id),
+        to: tx.to,
+        data: tx.data,
+        value: tx.value,
+        chainId: data.resolveEvmChainId(tx.chain_id),
       });
       setTxHash(hash);
       await register(quote, hash);
@@ -262,7 +432,7 @@ export function DepositPage() {
     }
   };
 
-  // ---- swap (mode "swap"): one DLN swap into the user's own wallet, then a fresh `direct` quote ----
+  // ---- swap (mode "swap"): one swap into the user's own wallet, then a fresh `direct` quote ----
   const runSwap = async () => {
     if (!quote?.swap_tx || !quote.next || !targetAsset || !sender) return;
     const nextToken = quote.next.src_token;
@@ -315,9 +485,39 @@ export function DepositPage() {
     [session.account, depositId, txHash],
   );
 
-  const needsApproval = !!quote?.approval && (stage === 'idle' || stage === 'approving');
-  const belowMin = !!quote && target === 'ETH' && quote.estimate.out_groth > 0 && quote.estimate.out_groth < MIN_ETH_GROTH;
-  const txChainName = quote?.tx ? (data.chainById(data.resolveEvmChainId(quote.tx.chain_id))?.name ?? `chain ${quote.tx.chain_id}`) : '';
+  /**
+   * The button that appears BEFORE Deposit, for the quotes whose approval the user must send first:
+   * `direct` and `swap`. The Uniswap route is deliberately not one of them — its spender is the
+   * router named in the quote, known before the click, so `send()` approves and deposits on one
+   * press. Two buttons for one intention is what the second click was.
+   */
+  const needsApproval = !!quote?.approval && !uniswap && (stage === 'idle' || stage === 'approving');
+  // a cross-chain order tx exists only after /arm, and it always lands on the source chain — which
+  // is what the button has to name BEFORE the click that arms it
+  const txChainId =
+    armed?.tx?.chain_id ?? quote?.tx?.chain_id ?? (quote && quoteMode(quote) === 'xchain' ? quote.estimate.src.chain_id : undefined);
+  const txChainName = txChainId === undefined ? '' : (data.chainById(data.resolveEvmChainId(txChainId))?.name ?? `chain ${txChainId}`);
+  const expired = !!quote && expiresIn <= 0 && !busy && stage !== 'tracking';
+  /** What the user is looking at: the armed order's final estimate once there is one, else the quote's. */
+  const est = quote ? (armed?.estimate ?? quote.estimate) : null;
+  /**
+   * The bridge relayer's cut in dollars, priced off the quote's own USD figure so there is no
+   * second price source: fee/out is a ratio of the same units, and `usd` is what that `out` is
+   * worth. Null when the quote carries no USD — a fee we cannot price is one we do not state.
+   */
+  const relayerFeeUsd = useMemo(() => {
+    if (!est?.relayer_fee_units || typeof est.usd !== 'number') return null;
+    try {
+      const out = Number(formatUnits(est.out_units, outDecimals));
+      const fee = Number(formatUnits(est.relayer_fee_units, outDecimals));
+      if (!Number.isFinite(out) || !Number.isFinite(fee) || out <= 0) return null;
+      return (est.usd * fee) / out;
+    } catch {
+      return null;
+    }
+  }, [est, outDecimals]);
+  /** `xchain` gets its tx from /arm on the click; `direct` and `swap` must already carry one. */
+  const canDeposit = !!quote?.armed && (quoteMode(quote) === 'xchain' || !!quote.tx);
 
   return (
     <div className="page">
@@ -325,8 +525,8 @@ export function DepositPage() {
         <div className="stack-sm">
           <h1>Deposit</h1>
           <p className="muted">
-            Pay any token on any chain. One transaction from your wallet: a deBridge order whose hook locks the target asset in the Beam
-            bridge. The credit lands as a balance held for this wallet — no fee at deposit, 2% when you withdraw.
+            Pay from any chain. Fund fresh wallets later, with no on-chain link to the source.{' '}
+            <HowItWorks route={uniswapPrimary ? 'uniswap' : 'xchain'} />
           </p>
         </div>
       </div>
@@ -337,22 +537,47 @@ export function DepositPage() {
         <section className="card">
           <h2>Your portfolio</h2>
           <p className="muted small" style={{ marginTop: 6 }}>
-            Connect a wallet and its holdings across every supported chain show up here as tap-to-pay chips.
+            Connect your wallet and everything it holds, on every chain, becomes a tap-to-pay chip here.
           </p>
-          <div style={{ marginTop: 12 }}>
-            <button type="button" className="btn btn-primary" onClick={wallet.openPicker}>
-              Connect wallet
-            </button>
-          </div>
         </section>
       )}
 
       <div className="grid-2">
-        <section className="card" data-testid="deposit-form">
+        <section className="card" data-testid="deposit-form" data-route={uniswapPrimary ? 'uniswap' : 'classic'}>
           <div className="card-head">
-            <h2>What to deposit</h2>
+            <h2>{uniswapPrimary ? 'Pay with Uniswap V4' : 'What to deposit'}</h2>
+            {uniswapPrimary && (
+              <span className="tiny muted" data-testid="uniswap-primary">
+                one transaction on Ethereum
+              </span>
+            )}
           </div>
           <div className="stack">
+            <div className="field">
+              <span className="label">Pay with</span>
+              <PayWithSelect
+                chains={sortedChains}
+                chainId={chainId}
+                tokens={payTokens}
+                value={token}
+                loading={tokensLoading}
+                disabled={busy}
+                onChainChange={(id) => {
+                  pickedByUser.current = true;
+                  setChainId(id);
+                  setSelectedKey(null);
+                  setAmount('');
+                  resetFlow();
+                }}
+                onChange={(t) => {
+                  setToken(t);
+                  setSelectedKey(null);
+                  resetFlow();
+                }}
+              />
+              {tokensError && <span className="error-text">Token list: {tokensError}</span>}
+            </div>
+
             <div className="field">
               <span className="label">Receive as</span>
               <div className="seg" role="radiogroup" aria-label="Target asset">
@@ -373,52 +598,10 @@ export function DepositPage() {
                   </button>
                 ))}
               </div>
-              {targetAsset && (
-                <span className="help">
-                  Credited as {targetAsset.beam_symbol} on Beam (8 decimals). Withdrawals pay out {targetAsset.symbol} on Ethereum.
-                </span>
-              )}
-            </div>
-
-            <div className="field">
-              <label className="label" htmlFor="src-chain">
-                Source chain
-              </label>
-              <select
-                id="src-chain"
-                className="select"
-                value={chainId ?? ''}
-                disabled={!chains.length || busy}
-                onChange={(e) => {
-                  setChainId(Number(e.target.value));
-                  setSelectedKey(null);
-                  setAmount('');
-                  resetFlow();
-                }}
-              >
-                {!chains.length && <option value="">Loading chains…</option>}
-                {sortedChains.map((c) => (
-                  <option key={c.chain_id} value={c.chain_id}>
-                    {c.name} ({c.native_symbol})
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="field">
-              <span className="label">Token</span>
-              <TokenSelect
-                tokens={tokens}
-                value={token}
-                loading={tokensLoading}
-                disabled={busy}
-                onChange={(t) => {
-                  setToken(t);
-                  setSelectedKey(null);
-                  resetFlow();
-                }}
-              />
-              {tokensError && <span className="error-text">Token list: {tokensError}</span>}
+              <span className="help">
+                Your balance is kept in this asset.
+                {uniswapChoice ? '' : flags.uniswap && onEthereum ? ' DAI and WBTC go through their own bridge pipe.' : ''}
+              </span>
             </div>
 
             <div className="field">
@@ -452,14 +635,16 @@ export function DepositPage() {
                 </span>
               </div>
               {amount !== '' && rawAmount === null && <span className="error-text">Enter a positive number.</span>}
+              {typeof est?.usd === 'number' && est.usd > 0 && (
+                <span className="help num" data-testid="amount-usd">
+                  ≈ {fmtUsd(est.usd)}
+                </span>
+              )}
               {maxRaw !== null && token && (
                 <span className="help num">
                   Balance {fmtUnits(maxRaw, token.decimals)} {token.symbol}
                 </span>
               )}
-              <span className="help">
-                Minimum 0.02 ETH-equivalent — below it the deposit is still credited, but ingress costs dominate.
-              </span>
             </div>
           </div>
         </section>
@@ -467,44 +652,97 @@ export function DepositPage() {
         <section className="card" data-testid="quote-card">
           <div className="card-head">
             <h2>Quote</h2>
-            {quote && expiresIn > 0 && !busy && stage !== 'tracking' && (
-              <span className="tiny muted num" aria-live="polite">
-                refreshes in {expiresIn}s
-              </span>
+            {/* The countdown was noise: the quote re-quotes itself silently. Only a quote that
+                actually lapsed (a re-quote in flight, or one suppressed mid-send) is worth a word. */}
+            {expired && (
+              <button
+                type="button"
+                className="btn btn-sm"
+                data-testid="quote-expired"
+                aria-live="polite"
+                onClick={() => setRequoteTick((n) => n + 1)}
+              >
+                Quote expired — refresh
+              </button>
             )}
           </div>
-          <SignInGate what="a quote">
-            {!chain || !token ? (
-              <p className="muted small">Pick a chain and a token.</p>
+          <SignInGate what="a quote" verb="get">
+            {xchainClosed ? (
+              /* The chips stay: what the wallet holds elsewhere is still worth seeing. What is
+                 closed is the crossing, and the only thing that opens it is paying from Ethereum. */
+              <div className="stack-sm">
+                <div className="banner banner-warn" data-testid="xchain-closed">
+                  <span>Switch to Ethereum to pay with Uniswap</span>
+                </div>
+                <div className="row">
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    data-testid="use-ethereum"
+                    onClick={() => {
+                      pickedByUser.current = true;
+                      setChainId(1);
+                      setSelectedKey(null);
+                      setAmount('');
+                      resetFlow();
+                    }}
+                  >
+                    Pay from Ethereum
+                  </button>
+                </div>
+              </div>
+            ) : !chain || !token ? (
+              <p className="muted small">Pick what you want to pay with.</p>
             ) : rawAmount === null ? (
-              <p className="muted small">
-                Enter an amount to get a quote. DLN quotes are valid for about 30 s and refresh here automatically.
-              </p>
+              <p className="muted small">Enter an amount and the quote appears here.</p>
             ) : (
               <div className="stack">
                 {stage === 'tracking' && <div className="banner banner-ok">Transaction sent — follow the status below.</div>}
                 {quoteLoading && !quote && <p className="muted small">Getting a quote…</p>}
-                {quoteError && <div className="banner banner-error">{quoteError}</div>}
-                {quote && (
+                {quoteError &&
+                  (belowMin ? (
+                    // the only place a minimum is ever stated, and it is the API's own sentence
+                    <div className="banner banner-warn" data-testid="min-deposit">
+                      {quoteError}
+                    </div>
+                  ) : (
+                    <div className="banner banner-error">{quoteError}</div>
+                  ))}
+                {quote && est && (
                   <>
                     <div className="tile tile-accent-teal">
                       <div className="tile-label">You receive (estimate)</div>
                       <div className="tile-value" data-testid="quote-out">
-                        {fmtUnits(quote.estimate.out_units, outDecimals, target === 'WBTC' ? 8 : 6)}
+                        {fmtUnits(est.out_units, outDecimals, target === 'WBTC' ? 8 : 6)}
                         <span className="unit">{quote.target_asset}</span>
                       </div>
                       <div className="tile-sub">
-                        {typeof quote.estimate.usd === 'number' ? `≈ ${fmtUsd(quote.estimate.usd)} · ` : ''}
-                        ETA {fmtDuration(quote.estimate.eta_s)}
-                        {quote.estimate.relayer_fee_units
-                          ? ` · bridge relayer fee ${fmtUnits(quote.estimate.relayer_fee_units, outDecimals, 6)} ${quote.target_asset}`
-                          : ''}
-                        {quoteLoading ? ' · refreshing…' : ''}
+                        {typeof est.usd === 'number' ? `≈ ${fmtUsd(est.usd)}` : ''}
+                        {quoteLoading ? (typeof est.usd === 'number' ? ' · refreshing…' : 'refreshing…') : ''}
                       </div>
                     </div>
+                    {/* One line where two rows of bookkeeping used to be ("Paying …", "Credited on
+                        Beam …"): what a depositor waits for is the wait, and the bridge's cut is a
+                        cent — a number worth rounding, not stating to six decimals. */}
+                    {/* The two numbers that only the Uniswap route has, and the only slippage bound
+                        that works on it: `min_out_units` is what the hook itself reverts below. */}
+                    {uniswap && est.min_out_units && (
+                      <p className="help num" data-testid="min-out">
+                        min you receive {fmtUnits(est.min_out_units, outDecimals, target === 'WBTC' ? 8 : 6)} {quote.target_asset}
+                      </p>
+                    )}
+                    {uniswap && typeof est.price_impact_bps === 'number' && (
+                      <p className="help num" data-testid="price-impact">
+                        price impact {(est.price_impact_bps / 100).toFixed(2)}%
+                      </p>
+                    )}
+                    <p className="help" data-testid="lands-in">
+                      Lands in your balance in ≈ {fmtDuration(est.eta_s)}
+                      {relayerFeeUsd !== null ? ` · bridge fee ${fmtUsd(relayerFeeUsd)}` : ''}
+                    </p>
                     {mode === 'direct' && (
                       <div className="banner banner-ok" data-testid="direct-note">
-                        Direct deposit — your {quote.target_asset} goes straight into the Beam bridge, no deBridge fee.
+                        Direct deposit — your {quote.target_asset} goes straight into the Beam bridge, no routing fee.
                       </div>
                     )}
                     {swapDone && (
@@ -512,39 +750,16 @@ export function DepositPage() {
                         Swapped {swapDone.from} → {swapDone.amount} {swapDone.to}. Step 2: deposit it below.
                       </div>
                     )}
-                    <dl className="kv">
-                      <dt>Paying</dt>
-                      <dd className="num">
-                        {fmtUnits(quote.estimate.src.amount, quote.estimate.src.decimals)} {quote.estimate.src.symbol} on {chain.name}
-                      </dd>
-                      <dt>Credited on Beam</dt>
-                      <dd className="num">
-                        {(quote.estimate.out_groth / 1e8).toLocaleString('en-US', { maximumFractionDigits: 8 })}{' '}
-                        {targetAsset?.beam_symbol ?? `b${target}`}
-                      </dd>
-                      <dt>Quote id</dt>
-                      <dd className="mono wrap">{quote.quote_id}</dd>
-                      {quote.order_id && (
-                        <>
-                          <dt>Order</dt>
-                          <dd className="mono wrap">{quote.order_id}</dd>
-                        </>
-                      )}
-                    </dl>
-                    {belowMin && (
-                      <div className="banner banner-warn">Below the 0.02 ETH minimum — credited, but ingress costs dominate.</div>
-                    )}
-
                     {mode === 'swap' && quote.swap_tx ? (
                       <div className="stack-sm" data-testid="swap-panel">
                         <div className="banner banner-warn">
                           <span>
-                            {quote.estimate.src.symbol} is not {quote.target_asset}. Step 1 swaps it in your own wallet through deBridge;
-                            the {quote.target_asset} lands in your wallet, never ours.
+                            {est.src.symbol} is not {quote.target_asset}. Step 1 swaps it in your own wallet; the {quote.target_asset} lands
+                            in your wallet, never ours.
                           </span>
                         </div>
                         <span className="strong">
-                          Step 1 — Swap {quote.estimate.src.symbol} → {quote.target_asset} in your wallet (deBridge)
+                          Step 1 — Swap {est.src.symbol} → {quote.target_asset} in your wallet
                         </span>
                         {quote.approval && (
                           <div className="row">
@@ -555,11 +770,7 @@ export function DepositPage() {
                               onClick={approve}
                               data-testid="approve-btn"
                             >
-                              {stage === 'approving'
-                                ? 'Waiting for approval…'
-                                : needsApproval
-                                  ? `Approve ${quote.estimate.src.symbol}`
-                                  : 'Approved'}
+                              {stage === 'approving' ? 'Waiting for approval…' : needsApproval ? `Approve ${est.src.symbol}` : 'Approved'}
                             </button>
                             {approveHash && (
                               <a
@@ -585,7 +796,7 @@ export function DepositPage() {
                               ? 'Confirm in the wallet…'
                               : stage === 'swap-wait'
                                 ? 'Waiting for the swap…'
-                                : `Swap ${fmtUnits(quote.estimate.src.amount, quote.estimate.src.decimals)} ${quote.estimate.src.symbol}`}
+                                : `Swap ${fmtUnits(est.src.amount, est.src.decimals)} ${est.src.symbol}`}
                           </button>
                           {swapHash && (
                             <a href={explorerTx(1, swapHash)} target="_blank" rel="noreferrer" className="small">
@@ -597,10 +808,11 @@ export function DepositPage() {
                           Step 2 appears by itself: Pgas.me re-quotes the {quote.target_asset} that actually arrived as a direct deposit.
                         </span>
                       </div>
-                    ) : !quote.armed || !quote.tx ? (
+                    ) : !canDeposit ? (
+                      // the API's own note here is `ingress not armed: no Beam pubkey configured`,
+                      // which names a flag and a key the user has never heard of
                       <div className="banner banner-warn" data-testid="unarmed-banner">
-                        <span>Deposits open when the Beam wallet is armed — this is a preview.</span>
-                        {quote.note && <span className="small muted">{quote.note}</span>}
+                        <span>Deposits are paused right now — this is a preview of what you would get.</span>
                       </div>
                     ) : (
                       stage !== 'tracking' && (
@@ -614,11 +826,7 @@ export function DepositPage() {
                                 onClick={approve}
                                 data-testid="approve-btn"
                               >
-                                {stage === 'approving'
-                                  ? 'Waiting for approval…'
-                                  : needsApproval
-                                    ? `Approve ${quote.estimate.src.symbol}`
-                                    : 'Approved'}
+                                {stage === 'approving' ? 'Waiting for approval…' : needsApproval ? `Approve ${est.src.symbol}` : 'Approved'}
                               </button>
                               {approveHash && (
                                 <a
@@ -632,6 +840,15 @@ export function DepositPage() {
                               )}
                             </div>
                           )}
+                          {needsConfirm && armed && (
+                            <div className="banner banner-warn" data-testid="estimate-changed">
+                              <span>
+                                The cross-chain order came back at{' '}
+                                {fmtUnits(armed.estimate.out_units, outDecimals, target === 'WBTC' ? 8 : 6)} {quote.target_asset}, not{' '}
+                                {fmtUnits(quote.estimate.out_units, outDecimals, target === 'WBTC' ? 8 : 6)}. Tap Deposit again to take it.
+                              </span>
+                            </div>
+                          )}
                           <button
                             type="button"
                             className="btn btn-primary btn-lg"
@@ -639,26 +856,39 @@ export function DepositPage() {
                             onClick={stage === 'registering' && txHash ? retryRegister : send}
                             data-testid="deposit-btn"
                           >
-                            {stage === 'sending'
-                              ? 'Confirm in the wallet…'
-                              : stage === 'registering'
-                                ? 'Registering the deposit…'
-                                : `Deposit ${fmtUnits(quote.estimate.src.amount, quote.estimate.src.decimals)} ${quote.estimate.src.symbol}`}
+                            {stage === 'arming'
+                              ? 'Preparing the cross-chain order…'
+                              : stage === 'approving'
+                                ? 'Waiting for approval…'
+                                : stage === 'sending'
+                                  ? 'Confirm in the wallet…'
+                                  : stage === 'registering'
+                                    ? 'Registering the deposit…'
+                                    : needsConfirm
+                                      ? `Deposit at ${fmtUnits(est.out_units, outDecimals, target === 'WBTC' ? 8 : 6)} ${quote.target_asset}`
+                                      : // the chain lives in the label, so no sentence has to explain the switch
+                                        `Deposit ${fmtUnits(est.src.amount, est.src.decimals)} ${est.src.symbol}${
+                                          txChainName ? ` on ${txChainName}` : ''
+                                        }`}
                           </button>
+                          {uniswap && (
+                            <span className="help" data-testid="uniswap-note">
+                              via Uniswap V4 — one transaction, the hook locks your ETH in the Beam bridge
+                            </span>
+                          )}
                           {stage === 'registering' && txHash && flowError && (
                             <span className="small">
                               The transaction was sent (
-                              <a href={explorerTx(data.resolveEvmChainId(quote.tx.chain_id), txHash)} target="_blank" rel="noreferrer">
+                              <a
+                                href={explorerTx(txChainId === undefined ? undefined : data.resolveEvmChainId(txChainId), txHash)}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
                                 view
                               </a>
                               ) but Pgas.me could not register it — retry above.
                             </span>
                           )}
-                          <span className="help">
-                            {mode === 'direct'
-                              ? `The wallet switches to ${txChainName} and sends one transaction to the Beam bridge pipe.`
-                              : `The wallet switches to ${txChainName} and sends one transaction to the deBridge order contract.`}
-                          </span>
                         </div>
                       )
                     )}
@@ -676,6 +906,7 @@ export function DepositPage() {
           deposit={tracked}
           txHash={txHash}
           chainId={chain?.chain_id}
+          uniswap={tracked?.mode ? tracked.mode === 'uniswap' : uniswap}
           onNew={() => {
             resetFlow();
             setAmount('');
@@ -688,21 +919,31 @@ export function DepositPage() {
 }
 
 // ---------- status timeline ----------
-const STEPS = ['Submitted', 'Order filled', 'Locked in Beam bridge', 'Confirming', 'Credited'];
+// Five words for five waits, and it appears only once a transaction has actually been sent — before
+// that there is nothing to follow, and a greyed-out list of steps is a page full of things the user
+// cannot act on.
+//
+// The Uniswap route has four: there is no order for anyone to fill — the swap and the lock are the
+// same transaction — so `order_seen` cannot happen on it and a step that can never light up is a
+// step that makes the wait look longer than it is.
+const STEPS = ['Submitted', 'Order filled', 'Bridging', 'Confirming', 'Credited'];
+const UNISWAP_STEPS = ['Submitted', 'Bridging', 'Confirming', 'Credited'];
 
-function stepIndex(status: string): number {
+function stepIndex(status: string, uniswap: boolean): number {
+  const at = (label: string) => (uniswap ? UNISWAP_STEPS : STEPS).indexOf(label);
   switch (status) {
     case 'submitted':
-      return 0;
+      return at('Submitted');
     case 'order_seen':
     case 'fallback_pending':
-      return 1;
+      // never reached on the Uniswap route; if the API ever said it, "Bridging" is the honest step
+      return uniswap ? at('Bridging') : at('Order filled');
     case 'locked':
-      return 2;
+      return at('Bridging');
     case 'confirming':
-      return 3;
+      return at('Confirming');
     case 'credited':
-      return 4;
+      return at('Credited');
     default:
       return -1;
   }
@@ -712,17 +953,23 @@ function DepositTimeline({
   deposit,
   txHash,
   chainId,
+  uniswap,
   onNew,
 }: {
   deposit: Deposit | undefined;
   txHash: string | null;
   chainId?: number;
+  /** the Uniswap route's four steps instead of the cross-chain order's five */
+  uniswap?: boolean;
   onNew: () => void;
 }) {
   const { wallet } = useStore();
   const [confs, setConfs] = useState<number | null>(null);
   const status = deposit?.status ?? 'submitted';
-  const idx = stepIndex(status);
+  const steps = uniswap ? UNISWAP_STEPS : STEPS;
+  const idx = stepIndex(status, !!uniswap);
+  /** The step the confirmation counter belongs to, whichever list is on screen. */
+  const confirmIdx = steps.indexOf('Confirming');
   const failed = status === 'failed' || status === 'expired';
   const block = deposit?.eth?.block;
   const updatedAt = deposit?.updated_at;
@@ -763,23 +1010,21 @@ function DepositTimeline({
         </div>
       </div>
       <div className="grid-2">
-        <div className="timeline">
-          {STEPS.map((label, i) => {
+        <div className="timeline" data-route={uniswap ? 'uniswap' : 'classic'}>
+          {steps.map((label, i) => {
             const cur = Math.max(idx, 0);
             const cls =
               failed && i === cur ? 'failed' : i < idx || (i === idx && status === 'credited') ? 'done' : i === idx ? 'current' : '';
             let sub = '';
-            if (i === 3 && status === 'confirming') sub = confs !== null ? `${confs}/12 confirmations` : 'waiting for 12 confirmations';
-            if (i === 1 && status === 'fallback_pending')
-              sub = 'Bridging (manual) — the hook fell back to a Pgas.me address; a worker bridges it';
-            if (i === 2 && deposit?.eth?.msg_id !== undefined) sub = `Beam message id ${deposit.eth.msg_id}`;
+            if (i === confirmIdx && status === 'confirming')
+              sub = confs !== null ? `${confs}/12 confirmations` : 'waiting for 12 confirmations';
             if (failed && i === cur) sub = depositStatusLabel(status) + (deposit?.note ? ` — ${deposit.note}` : '');
             return (
               <div key={label} className={`tl-step ${cls}`}>
                 <div className="tl-dot">{cls === 'done' ? '✓' : i + 1}</div>
                 <div>
                   <div className="tl-title">
-                    {i === 3 && status === 'confirming' && confs !== null ? `Confirming (${confs}/12)` : label}
+                    {i === confirmIdx && status === 'confirming' && confs !== null ? `Confirming (${confs}/12)` : label}
                   </div>
                   {sub && <div className="tl-sub">{sub}</div>}
                 </div>
@@ -792,7 +1037,7 @@ function DepositTimeline({
           <dd>{deposit ? depositStatusLabel(deposit.status) : 'Registered — waiting for the first status poll'}</dd>
           {txHash && (
             <>
-              <dt>Source tx</dt>
+              <dt>Your payment</dt>
               <dd>
                 <a href={explorerTx(chainId ?? deposit?.src.chain_id, txHash)} target="_blank" rel="noreferrer" className="mono">
                   {txHash.slice(0, 10)}…{txHash.slice(-6)}
@@ -800,15 +1045,9 @@ function DepositTimeline({
               </dd>
             </>
           )}
-          {deposit?.order_id && (
-            <>
-              <dt>DLN order</dt>
-              <dd className="mono wrap">{deposit.order_id}</dd>
-            </>
-          )}
           {deposit?.eth?.tx && (
             <>
-              <dt>Ethereum tx</dt>
+              <dt>Into the bridge</dt>
               <dd>
                 <a href={explorerTx(1, deposit.eth.tx)} target="_blank" rel="noreferrer" className="mono">
                   {deposit.eth.tx.slice(0, 10)}…{deposit.eth.tx.slice(-6)}
@@ -836,7 +1075,12 @@ function DepositTimeline({
   );
 }
 
-// ---------- searchable token picker ----------
+// ---------- the "Pay with" picker ----------
+// One control for two facts that only ever move together: the chain and the token on it. Two
+// separate rows (a chain <select>, then a token combobox that reloaded under it) made the user
+// answer a question — "which chain?" — that they only ever answer because they hold something
+// there. Here the chain is a row of buttons INSIDE the picker, the search covers the chosen
+// chain's list, and the portfolio chips above set both at once.
 function TokenLogo({ token, size = 22 }: { token: Token | null | undefined; size?: number }) {
   const [broken, setBroken] = useState(false);
   const logo = token?.logo;
@@ -845,16 +1089,35 @@ function TokenLogo({ token, size = 22 }: { token: Token | null | undefined; size
   return <span className="logo-fallback">{(token?.symbol ?? '?').slice(0, 3).toUpperCase()}</span>;
 }
 
-function TokenSelect({
+/** The token's logo with the chain's badge on its corner — the portfolio chip, at picker size. */
+function PayWithIcons({ token, chainId }: { token: Token | null; chainId: number | null }) {
+  const [chainBroken, setChainBroken] = useState(false);
+  const icon = chainId === null ? null : chainIconUrl(chainId);
+  useEffect(() => setChainBroken(false), [icon]);
+  return (
+    <span className="pw-icons">
+      <TokenLogo token={token} size={24} />
+      {icon && !chainBroken && <img className="pw-chain-badge" src={icon} alt="" loading="lazy" onError={() => setChainBroken(true)} />}
+    </span>
+  );
+}
+
+function PayWithSelect({
+  chains,
+  chainId,
   tokens,
   value,
   onChange,
+  onChainChange,
   loading,
   disabled,
 }: {
+  chains: Chain[];
+  chainId: number | null;
   tokens: Token[];
   value: Token | null;
   onChange: (t: Token) => void;
+  onChainChange: (chainId: number) => void;
   loading?: boolean;
   disabled?: boolean;
 }) {
@@ -863,6 +1126,7 @@ function TokenSelect({
   const [active, setActive] = useState(0);
   const root = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLInputElement>(null);
+  const chain = chains.find((c) => c.chain_id === chainId);
 
   useEffect(() => {
     if (!open) return;
@@ -882,7 +1146,7 @@ function TokenSelect({
     return list.slice(0, 200);
   }, [tokens, q]);
 
-  useEffect(() => setActive(0), [q, open]);
+  useEffect(() => setActive(0), [q, open, chainId]);
 
   const pick = (t: Token) => {
     onChange(t);
@@ -894,20 +1158,16 @@ function TokenSelect({
     <div className="combo" ref={root}>
       <button
         type="button"
-        className="combo-btn"
+        className="combo-btn pay-with-btn"
         onClick={() => setOpen((o) => !o)}
-        disabled={disabled || loading}
+        disabled={disabled}
         aria-haspopup="listbox"
         aria-expanded={open}
-        data-testid="token-select"
+        data-testid="pay-with"
       >
-        <TokenLogo token={value} />
-        <span className="strong">{loading ? 'Loading tokens…' : value ? value.symbol : 'Choose a token'}</span>
-        {value && (
-          <span className="muted small" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {isNativeToken(value.address) ? 'native' : value.name}
-          </span>
-        )}
+        <PayWithIcons token={value} chainId={chainId} />
+        <span className="strong">{value ? value.symbol : loading ? 'Loading tokens…' : 'Choose a token'}</span>
+        <span className="muted small pw-on">{chain ? `on ${chain.name}` : chains.length ? '' : 'loading chains…'}</span>
       </button>
       {open && (
         <div className="combo-pop">
@@ -931,8 +1191,28 @@ function TokenSelect({
             }}
             aria-label="Search tokens"
           />
+          <div className="pw-chains" role="group" aria-label="Chain" data-testid="pay-with-chains">
+            {chains.map((c) => {
+              const icon = chainIconUrl(c.chain_id);
+              return (
+                <button
+                  key={c.chain_id}
+                  type="button"
+                  className={`pw-chain${c.chain_id === chainId ? ' active' : ''}`}
+                  aria-pressed={c.chain_id === chainId}
+                  data-chain={c.chain_id}
+                  title={c.name}
+                  onClick={() => onChainChange(c.chain_id)}
+                >
+                  {icon && <img src={icon} alt="" loading="lazy" />}
+                  <span>{c.name}</span>
+                </button>
+              );
+            })}
+          </div>
           <div className="combo-list" role="listbox">
-            {filtered.length === 0 && <div className="empty">No token matches</div>}
+            {loading && <div className="empty">Loading tokens…</div>}
+            {!loading && filtered.length === 0 && <div className="empty">No token matches</div>}
             {filtered.map((t, i) => (
               <button
                 key={`${t.address}-${i}`}

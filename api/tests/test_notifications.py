@@ -9,7 +9,7 @@ The table this file enforces:
             locked           deposit_locked        scanner.handle_log / retry         queued
             confirming       deposit_confirming    workers._step_confirm (once)       queued
             credited         deposit_credited      workers._credit / reconcile        queued
-            failed (DLN)     deposit_failed        workers._step_order_seen           queued
+        failed (router)      deposit_failed        workers._step_order_seen           queued
             failed (hash)    deposit_mismatch      workers._mismatch / registration   IMMEDIATE
             fallback_pending deposit_fallback      workers._step_order_seen           IMMEDIATE
             (unattributed)   lock_unattributed     scanner.record_unattributed        IMMEDIATE
@@ -25,10 +25,10 @@ import time
 from typing import Any
 
 import pytest
-from conftest import DLN_ESTIMATE, PUBKEY, USDC_ARB, fulfilled_log, fund, lock_log
+from conftest import PUBKEY, USDC_ARB, XCHAIN_ESTIMATE, fulfilled_log, fund, lock_log
 from eth_account import Account as EthAccount
 
-from pgasme import dln, ledger, scanner, tg, workers
+from pgasme import ledger, scanner, tg, workers, xchain
 from pgasme.assets import ASSETS
 from pgasme.config import settings
 
@@ -44,7 +44,7 @@ def offline(monkeypatch):
     monkeypatch.setattr(scanner, "LITE_RETRY_SLEEP_S", 0.0)
 
     async def create_tx(params: dict[str, Any]) -> dict[str, Any]:
-        body = copy.deepcopy(DLN_ESTIMATE)
+        body = copy.deepcopy(XCHAIN_ESTIMATE)
         if params["dstChainTokenOutAmount"] != "auto":
             out = body["estimation"]["dstChainTokenOut"]
             out["amount"] = out["recommendedAmount"] = params["dstChainTokenOutAmount"]
@@ -54,8 +54,8 @@ def offline(monkeypatch):
     async def no_ids(tx_hash: str, timeout: float | None = None) -> list[str]:
         return []
 
-    monkeypatch.setattr(dln, "create_tx", create_tx)
-    monkeypatch.setattr(dln, "order_ids_by_tx", no_ids)
+    monkeypatch.setattr(xchain, "create_tx", create_tx)
+    monkeypatch.setattr(xchain, "order_ids_by_tx", no_ids)
 
 
 async def kinds(mock_db) -> list[str]:
@@ -70,6 +70,8 @@ async def test_a_deposit_emits_exactly_one_event_per_status(
     h = user["headers"]
     quote = (await client.post("/v1/quote", json=Q, headers=h)).json()
     assert quote["armed"] is True
+    armed = (await client.post(f"/v1/quote/{quote['quote_id']}/arm", headers=h)).json()
+    quote = {**quote, **armed}
 
     # ── submitted
     r = await client.post(
@@ -78,14 +80,14 @@ async def test_a_deposit_emits_exactly_one_event_per_status(
     dep_id = r.json()["deposit_id"]
     assert await kinds(mock_db) == ["deposit_submitted"]
 
-    # ── order_seen (the quote's own order id, seen on deBridge)
+    # ── order_seen (the quote's own order id, seen by the router)
     async def ids(tx_hash: str, timeout: float | None = None) -> list[str]:
         return [ORDER]
 
-    monkeypatch.setattr(dln, "order_ids_by_tx", ids)
+    monkeypatch.setattr(xchain, "order_ids_by_tx", ids)
     await d.deposits.update_one({"_id": dep_id}, {"$set": {"created_at": time.time() - 3600}})
-    await workers.dln_secondary()
-    await workers.dln_secondary()  # a second pass must not repeat the event
+    await workers.xchain_secondary()
+    await workers.xchain_secondary()  # a second pass must not repeat the event
     assert (await d.deposits.find_one({"_id": dep_id}))["status"] == "order_seen"
     assert await kinds(mock_db) == ["deposit_submitted", "deposit_order_seen"]
 
@@ -156,7 +158,7 @@ async def test_a_cancelled_order_and_a_hook_fallback_each_emit_one_event(mock_db
     base = {
         "account_id": "acct1",
         "asset": "ETH",
-        "mode": "dln",
+        "mode": "xchain",
         "status": "order_seen",
         "src": {},
         "src_tx_hash": TX,
@@ -177,20 +179,20 @@ async def test_a_cancelled_order_and_a_hook_fallback_each_emit_one_event(mock_db
     async def status_ok(oid: str) -> dict[str, str]:
         return {"status": "Fulfilled"}
 
-    monkeypatch.setattr(dln, "order_status", status)
+    monkeypatch.setattr(xchain, "order_status", status)
     await d.deposits.delete_one({"_id": "fallback1"})
-    await workers.dln_secondary()
+    await workers.xchain_secondary()
     assert (await d.deposits.find_one({"_id": "cancelled1"}))["status"] == "failed"
     ev = await d.events.find_one({"kind": "deposit_failed"})
     assert ev["deposit_id"] == "cancelled1" and ev["notified"] is False  # queued is fine here
 
     await d.deposits.delete_many({})
     await d.events.delete_many({})
-    monkeypatch.setattr(dln, "order_status", status_ok)
+    monkeypatch.setattr(xchain, "order_status", status_ok)
     await d.deposits.insert_one(
         {**base, "_id": "fallback1", "fulfilled_seen_at": time.time() - 7200}
     )
-    await workers.dln_secondary()
+    await workers.xchain_secondary()
     assert (await d.deposits.find_one({"_id": "fallback1"}))["status"] == "fallback_pending"
     ev = await d.events.find_one({"kind": "deposit_fallback"})
     # the user's money is in their own wallet: the operator hears NOW, not on the next minute
@@ -210,26 +212,23 @@ async def test_an_unattributed_lock_alerts_immediately_and_once(mock_db, rpc, mo
 
 
 async def test_a_withdrawal_emits_one_event_per_transition(client, user, mock_db, monkeypatch):
-    from conftest import add_destination
-
     monkeypatch.setattr(settings, "payout_direct_enabled", True)
     await fund(user, "ETH", 100_000_000)
     dest = EthAccount.create()
-    assert (await add_destination(client, user, dest)).status_code == 200
     r = await client.post(
         "/v1/withdrawals",
         json={
             "asset": "ETH",
             "items": [{"W": dest.address, "amount_groth": 1_000_000}],
             "mode": "direct",
-            "window_s": 0,
         },
         headers=user["headers"],
     )
     rid = r.json()["request_ids"][0]
     d = mock_db["pgasme_test"]
     ev = await d.events.find_one({"kind": "withdrawal_requested"})
-    assert ev["request_ids"] == [rid] and dest.address.lower() not in ev["text"].lower()
+    # ONE event per ORDER (2026-09-09: a withdrawal is a list of them), ids only
+    assert ev["request_id"] == rid and dest.address.lower() not in ev["text"].lower()
     assert await client.post(f"/v1/withdrawals/{rid}/cancel", headers=user["headers"])
     assert await kinds(mock_db) == ["withdrawal_requested", "withdrawal_cancelled"]
     ev = await d.events.find_one({"kind": "withdrawal_cancelled"})
@@ -257,7 +256,7 @@ async def test_a_due_payout_that_nothing_executed_is_paged(mock_db, monkeypatch)
 
 
 async def test_every_worker_failure_reaches_the_operator_at_once(mock_db, monkeypatch):
-    """A pass that raised, a pipe that cannot be scanned and a DLN step that blew up are sent
+    """A pass that raised, a pipe that cannot be scanned and a cross-chain step that blew up are sent
     immediately (with a cooldown), never queued behind the monitor."""
     sent: list[str] = []
 
@@ -291,7 +290,7 @@ async def test_every_worker_failure_reaches_the_operator_at_once(mock_db, monkey
             "_id": "dep1",
             "account_id": "a",
             "asset": "ETH",
-            "mode": "dln",
+            "mode": "xchain",
             "status": "order_seen",
             "order_id": ORDER,
             "src": {},
@@ -301,6 +300,6 @@ async def test_every_worker_failure_reaches_the_operator_at_once(mock_db, monkey
             "updated_at": 0.0,
         }
     )
-    monkeypatch.setattr(dln, "order_status", lambda oid: boom())
-    await workers.dln_secondary()
-    assert any("DLN step failed on <code>dep1</code>" in t for t in sent)
+    monkeypatch.setattr(xchain, "order_status", lambda oid: boom())
+    await workers.xchain_secondary()
+    assert any("Cross-chain step failed on <code>dep1</code>" in t for t in sent)

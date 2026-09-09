@@ -113,7 +113,94 @@ def decode_new_local_message(log: dict[str, Any]) -> dict[str, Any]:
 
 
 class RpcError(RuntimeError):
-    pass
+    """A call that no allowed endpoint answered. `url` and `code` survive the wrapping so the
+    caller can tell WHY: an endpoint that lags behind the head it just claimed is a different
+    thing from an endpoint that is down, and only one of them is worth retrying elsewhere."""
+
+    def __init__(self, message: str, *, url: str | None = None, code: int | None = None):
+        super().__init__(message)
+        self.url = url
+        self.code = code
+
+
+# What a node says when its logs backend is behind the head its eth_blockNumber just reported.
+# Recorded on prod 2026-09-09: rpc.flashbots.net answers eth_blockNumber with H and then
+# {"code": -32602, "message": "block range extends beyond current head block"} for [H-10, H].
+LAG_HINTS = (
+    "beyond current head",
+    "beyond the current head",
+    "block range",
+    "head block",
+    "header not found",
+    "unknown block",
+    "block not found",
+    "requested block is beyond",
+    "cannot query unfinalized",
+)
+
+
+# The other half, measured on the same probe run: providers refuse a range they COULD serve for
+# plan/capability reasons — publicnode "Archive requests require a personal token", 1rpc
+# "eth_getLogs is limited to 0 - 50 blocks range", drpc "Can't route your request to suitable
+# provider", ankr "You must authenticate your request with an API key". Different sentence, same
+# fact: THIS endpoint will not answer THIS query, and the remedy is another endpoint.
+SERVE_HINTS = (
+    "archive",
+    "personal token",
+    "api key",
+    "unauthorized",
+    "limited to",
+    "suitable provider",
+    "discontinued",
+    "too many results",
+    "query returned more than",
+    "response size",
+    "cannot fulfill",
+    "capacity",
+    "rate limit",
+    "too many requests",
+    "exceeded",
+)
+
+
+def is_head_lag(e: BaseException) -> bool:
+    """True when the answer means "I do not have those blocks YET" — an endpoint problem, not a
+    range problem. The pass switches endpoints; it never treats it as "no logs"."""
+    text = str(e).lower()
+    if any(h in text for h in LAG_HINTS):
+        return True
+    code = getattr(e, "code", None)
+    return code == -32602 and any(w in text for w in ("head", "range", "block"))
+
+
+# `_post` stamps transport failures with the exception's own class name; a node that does not
+# answer is the strongest reason of all to ask a different one.
+TRANSPORT_HINTS = (
+    "connecterror",
+    "connecttimeout",
+    "readtimeout",
+    "writetimeout",
+    "pooltimeout",
+    "connectionreset",
+    "remoteprotocolerror",
+    "readerror",
+    "proxyerror",
+    "jsondecodeerror",
+    "timeoutexception",
+)
+
+
+def cannot_serve(e: BaseException) -> bool:
+    """True when this endpoint will not answer this query — lag, a range cap, an archive/plan
+    wall, a routing failure, a rate limit, or no answer at all. Ask the next endpoint; never
+    conclude "no logs". A malformed request of OURS matches none of these and stays a real
+    failure, because rotating endpoints cannot fix our own bug."""
+    text = str(e).lower()
+    return (
+        is_head_lag(e)
+        or any(h in text for h in SERVE_HINTS)
+        or any(h in text for h in TRANSPORT_HINTS)
+    )
 
 
 class Rpc:
@@ -125,6 +212,10 @@ class Rpc:
     every read to the endpoint that vouched for the head, because a lagging endpoint answering
     eth_getLogs with `[]` is not "no locks" — it is "I cannot see those blocks yet", and
     checkpointing that answer skips a real deposit forever.
+
+    A pin therefore has to fail LOUDLY and SPECIFICALLY: `is_head_lag()` on the raised error
+    tells the scanner to re-resolve the head on the next endpoint instead of stalling. A pin
+    that just says "no endpoint answered" turns one lagging provider into a dead watcher.
     """
 
     def __init__(self, urls: list[str] | None = None, timeout: float = 8.0):
@@ -140,11 +231,16 @@ class Rpc:
             )
             body = r.json()
         except (httpx.HTTPError, ValueError) as e:
-            raise RpcError(f"{url}: {type(e).__name__}: {e}") from e
+            raise RpcError(f"{url}: {type(e).__name__}: {e}", url=url) from e
         if isinstance(body, dict) and "result" in body:
             return body["result"]
         err = body.get("error") if isinstance(body, dict) else body
-        raise RpcError(f"{url}: {json.dumps(err)[:200]}")
+        code = err.get("code") if isinstance(err, dict) else None
+        raise RpcError(
+            f"{url}: {json.dumps(err)[:200]}",
+            url=url,
+            code=int(code) if isinstance(code, int) else None,
+        )
 
     async def call(
         self, method: str, params: list[Any], prefer: str | None = None, pin: bool = False
@@ -170,7 +266,13 @@ class Rpc:
                     return await self._post(c, url, method, params), url
                 except RpcError as e:
                     last = e
-        raise RpcError(f"{method}: no endpoint answered ({last})")
+        # the last endpoint's verdict travels with the wrapper: a pinned call must be able to
+        # say "that endpoint lags" rather than the useless "nobody answered"
+        raise RpcError(
+            f"{method}: no endpoint answered ({last})",
+            url=getattr(last, "url", None),
+            code=getattr(last, "code", None),
+        ) from last
 
     async def call_on(self, url: str, method: str, params: list[Any]) -> Any:
         """One explicit endpoint, no fallback — for capability probes."""

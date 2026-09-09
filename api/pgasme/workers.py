@@ -1,10 +1,13 @@
 """Background workers — started from the app lifespan when PGAS_WORKERS_ENABLED=1.
 
   deposit_watcher (15 s)  PRIMARY: scan the pipes on-chain (scanner.py) → locked → confirming → credited
-                          SECONDARY: the DLN API for what the chain cannot show —
+                          SECONDARY: the router's API for what the chain cannot show —
                           submitted → order_seen (order id), cancelled → failed,
-                          filled-but-no-lock → fallback_pending. A `direct` deposit has no DLN
+                          filled-but-no-lock → fallback_pending. A `direct` deposit has no cross-chain
                           order at all and is skipped there: the chain is its only witness.
+  payout_processor (30 s) the order processors (payouts.py): every payout order's next step
+                          (scheduled → releasing → bridging → delivering → sent) and every
+                          credited deposit's treasury work (claim → shield). Dark by flag.
   monitor         (60 s)  Telegram (default-deny) for queued events, stuck states, upstream reachability
   stats_refresher (60 s)  the shielded-pool numbers from the explorer (served by /v1/stats)
 
@@ -14,7 +17,7 @@ of a pass that raised (15 min cooldown), and the sleep.
 
 Evidence rule (the only one that moves money): a deposit is credited ONLY after the pipe's
 NewLocalMessage log naming OUR pubkey and EXACTLY the deposit's value is found and has
-`lock_confirmations` blocks on top. A DLN status of Fulfilled by itself is never enough.
+`lock_confirmations` blocks on top. A router status of Fulfilled by itself is never enough.
 
 Notification rule: every status transition writes exactly ONE event row (tg.queue for the ones
 the operator can read a minute later, tg.alert for the ones they cannot: worker failures,
@@ -33,24 +36,64 @@ from typing import Any
 
 import httpx
 
-from . import dln, ethpipe, ledger, scanner, tg
+from . import beampay, ethpipe, ledger, scanner, tg, xchain
 from .assets import ASSETS
 from .config import settings
 from .db import db
 
 log = logging.getLogger("pgasme.workers")
 
-SUBMITTED_GRACE_S = 120  # the chain is asked first; DLN's order-ids only after this
+SUBMITTED_GRACE_S = 120  # the chain is asked first; the router's order-ids only after this
+# how long a deposit that advanced without being verified keeps being offered to the router's index.
+# Bounded on purpose: an unbounded re-check would ask the same question about the same old rows
+# every 15 seconds forever. ⛔ A DAY WAS TOO SHORT, and for a reason that has nothing to do with
+# how fast the router indexes: the re-check only runs while this process runs, so a row whose evidence
+# was there all along stays unverified unless a DEPLOY lands inside the window. The 2026-09-09
+# 20:40Z deposit is the proof — real, credited, `verified: false`, and out of a 24 h window
+# before anyone looked. A week covers a normal deploy cadence; it is still finite.
+REVERIFY_WINDOW_S = int(getattr(settings, "reverify_window_s", 7 * 86400))
 UNFILLED_AFTER_S = 20 * 60  # a `Created` order this old gets a note (a solver may still fill it)
 UNFILLED_ALERT_COOLDOWN_S = 6 * 3600
 UNFILLED_NOTE = (
-    "not filled yet — a solver can still fill it; you can cancel from the deBridge order page "
+    "not filled yet — a solver can still fill it; you can cancel from the router's order page "
     "for a refund"
 )
 EVENT_MAX_TRIES = 6  # a poison event row is parked, never spun on
 EVENT_RETRY_BACKOFF_S = 60.0
 EVENT_RETRY_MAX_S = 3600.0
 PAYOUT_DUE_GRACE_S = 30 * 60  # scheduled, release_at passed, still not executed → page
+# The order processors' SLAs (pgasme/payouts.py). Each is the point at which waiting stops
+# being normal: `bridging` is 61 Beam confirmations (~60 min) plus the relayer's own batching,
+# and `delivering` is the measured b2e tail (4 h 03 m, 5.5 h, 18 h — §7.6). A row a FLAG is
+# holding is marked `dark` and is deliberately not stuck: pages that cry wolf get ignored.
+SLA_S: dict[str, float] = {
+    "releasing": 15 * 60,
+    "bridging": 3 * 3600,
+    "delivering": 18 * 3600,
+}
+TREASURY_SLA_S: dict[str, float] = {"claiming": 30 * 60, "shielding": 2 * 3600}
+NOT_DARK = {"dark": {"$ne": True}}
+# A row a HUMAN owns (payouts._hold_for_a_human): no handler resolves it, so it can only leave
+# by hand — and it must be said out loud until it does.
+HELD_SLA_S = 6 * 3600
+
+
+def stale(field: str, cut: float) -> dict[str, Any]:
+    """"This row has been in its status since before `cut`", measured by a clock the handlers
+    do not touch.
+
+    ⛔ `updated_at` cannot be that clock. `_payout_delivering` writes a scan checkpoint on every
+    30-second pass, so a delivering row's `updated_at` was never older than 30 s and the
+    18-hour SLA — the ONE monitor for a crossing whose bETH is already burned and cannot be
+    recalled — never fired once. `<field>_at` is stamped only by `payouts._advance`, i.e. only
+    when the status actually changes. Rows written before this build have no such stamp, so
+    they fall back to `updated_at` rather than becoming invisible."""
+    return {
+        "$or": [
+            {field: {"$lt": cut}},
+            {field: {"$exists": False}, "updated_at": {"$lt": cut}},
+        ]
+    }
 PAUSED_REASON = (
     "Pgas.me is paused by the operator (the stop file is set): nothing that moves money is "
     "accepted right now. Balances and estimates are unaffected — try again shortly."
@@ -71,8 +114,13 @@ async def ensure_indexes() -> None:
     (db.ensure_indexes owns the rest). Idempotent; called once at worker start."""
     if _indexes["done"]:
         return
+    from . import payouts  # local: payouts imports this module (kill switch, RPC pool)
+
     await scanner.ensure_indexes()
     await ledger.ensure_indexes()
+    # one txid is one row's evidence, and one delivery settles one request — the DATABASE says
+    # so, not a read (payouts.ensure_indexes)
+    await payouts.ensure_indexes()
     _indexes["done"] = True
 
 
@@ -233,44 +281,90 @@ async def reconcile_credits() -> None:
         await _notify_credited(dep, " (reconciled)")
 
 
-# ----------------------------------------------------------------------------- SECONDARY: DLN API
+# ----------------------------------------------------------------------------- SECONDARY: the router's API
+
+
+def _candidate_orders(dep: dict[str, Any]) -> list[str]:
+    """Every cross-chain order id THIS deposit's own quote was armed with, newest first.
+
+    ⛔ THE ROW'S SINGLE `order_id` IS NOT THE CANDIDATE SET. /arm can rebuild a quote's order,
+    and an unsigned cross-chain order exists only as a transaction we handed over — so an EARLIER order
+    of the same quote is still this quote's own order. When the router has not indexed the transaction
+    yet (the normal case, and the whole reason `verified` starts false) the row is stamped with
+    the LATEST armed id, so a user who signed anything but the last one was failed here as a
+    hijack: `_mismatch` set the row `failed` and released the hash, the fill's lock then resolved
+    to the quote by metadata tag and found a row that is no longer claimable, and re-registering
+    the hash only rebuilt the same wrong row. A guard that fails politely is a guard that fails.
+    """
+    ids = [str(i) for i in (dep.get("order_ids_armed") or []) if i]
+    want = str(dep.get("order_id") or "")
+    if want and want.lower() not in [i.lower() for i in ids]:
+        ids.insert(0, want)
+    return ids
+
+
+def _adopt(dep: dict[str, Any], matched: str) -> dict[str, Any]:
+    """The fields that make the row describe the order the chain says was actually signed —
+    including the amounts THAT order was built at (/arm re-prices on the router's recommendation,
+    so two orders of one quote are worth different money, and the credit pays the row's number)."""
+    fields: dict[str, Any] = {"verified": True}
+    if matched.lower() == str(dep.get("order_id") or "").lower():
+        return fields
+    fields["order_id"] = matched
+    fields["order_id_adopted_from"] = dep.get("order_id")
+    snap = next(
+        (
+            s
+            for s in (dep.get("orders_armed") or [])
+            if str((s or {}).get("order_id") or "").lower() == matched.lower()
+        ),
+        None,
+    )
+    if snap:
+        fields["eth.value_units"] = str(snap["value_units"])
+        fields["eth.relayer_fee_units"] = str(snap["relayer_fee_units"])
+        fields["value_groth"] = int(snap["value_groth"])
+    return fields
 
 
 async def _step_submitted(dep: dict[str, Any]) -> None:
-    """The registered hash is re-checked here against DLN's own index. The row's order id is the
-    QUOTE's, never the transaction's first id: adopting ids[0] hands a stranger's fill to
-    whoever registered the hash first, and locks the person who actually signed it out with a
-    409 forever. A hash whose orders do not include ours is a mismatch, not a rename."""
+    """The registered hash is re-checked here against the router's own index. The ids it is checked
+    against are THIS QUOTE's own (see `_candidate_orders`), never the transaction's first id:
+    adopting ids[0] hands a stranger's fill to whoever registered the hash first, and locks the
+    person who actually signed it out with a 409 forever. A hash carrying none of this quote's
+    orders is a mismatch; a hash carrying an earlier one of them is this quote's deposit."""
     if time.time() - float(dep.get("created_at") or 0) < SUBMITTED_GRACE_S:
         return
-    ids = await dln.order_ids_by_tx(dep["src_tx_hash"])
+    ids = await xchain.order_ids_by_tx(dep["src_tx_hash"])
     if not ids:
         return  # not indexed yet; the monitor pages after 60 min
-    want = str(dep.get("order_id") or "").lower()
+    candidates = _candidate_orders(dep)
     have = [str(i).lower() for i in ids]
-    if not want:
-        # an armed quote DLN gave no orderId for: nothing to verify against. Do not adopt one —
+    if not candidates:
+        # an armed quote the router gave no orderId for: nothing to verify against. Do not adopt one —
         # the scanner still attributes this deposit by its metadata tag.
         if not dep.get("order_ids_seen"):
             await _set(dep["_id"], order_ids_seen=ids)
             await tg.alert(
                 "deposit_unverifiable",
-                "Deposit has no order id of its own: the DLN order ids of its transaction were "
+                "Deposit has no order id of its own: the router's order ids for its transaction were "
                 "recorded but NOT adopted; attribution falls back to the metadata tag",
                 deposit_id=dep["_id"],
             )
         return
-    if want not in have:
+    matched = next((c for c in candidates if c.lower() in have), None)
+    if matched is None:
         await _mismatch(
             dep,
-            f"the registered transaction carries DLN order(s) {', '.join(have)}, not this "
-            f"quote's own order",
+            f"the registered transaction carries router order(s) {', '.join(have)}, not any of this "
+            f"quote's own orders",
         )
         return
-    await _set(dep["_id"], "order_seen", order_seen_at=time.time(), verified=True)
+    await _set(dep["_id"], "order_seen", order_seen_at=time.time(), **_adopt(dep, matched))
+    dep = await db().deposits.find_one({"_id": dep["_id"]}) or dep
     await tg.queue(
         "deposit_order_seen",
-        f"Deposit order seen on deBridge: {dep['asset']} "
+        f"Deposit order seen by the router: {dep['asset']} "
         f"{tg.fmt_groth(int(dep['value_groth']))}",
         deposit_id=dep["_id"],
     )
@@ -301,17 +395,17 @@ async def _mismatch(dep: dict[str, Any], why: str) -> None:
 
 
 async def _step_order_seen(dep: dict[str, Any]) -> None:
-    status = (await dln.order_status(dep["order_id"])).get("status")
+    status = (await xchain.order_status(dep["order_id"])).get("status")
     now = time.time()
-    if status in dln.TERMINAL_CANCELLED:
+    if status in xchain.TERMINAL_CANCELLED:
         note = "order cancelled — funds refunded to you on the source chain; nothing was locked"
-        await _set(dep["_id"], "failed", dln_status=status, note=note)
+        await _set(dep["_id"], "failed", route_status=status, note=note)
         await tg.queue(
-            "deposit_failed", f"Deposit failed: DLN order {status}", deposit_id=dep["_id"]
+            "deposit_failed", f"Deposit failed: cross-chain order {status}", deposit_id=dep["_id"]
         )
         return
-    if status not in dln.TERMINAL_OK:
-        fields: dict[str, Any] = {"dln_status": status}
+    if status not in xchain.TERMINAL_OK:
+        fields: dict[str, Any] = {"route_status": status}
         seen_at = float(dep.get("order_seen_at") or dep.get("created_at") or now)
         if status == "Created" and now - seen_at > UNFILLED_AFTER_S:
             # EthPipe.sendFunds needs msg.value == value + relayerFee EXACTLY; a solver that
@@ -335,7 +429,7 @@ async def _step_order_seen(dep: dict[str, Any]) -> None:
         await _set(
             dep["_id"],
             "fallback_pending",
-            dln_status=status,
+            route_status=status,
             fulfilled_seen_at=fulfilled_at,
             note=note,
         )
@@ -345,31 +439,69 @@ async def _step_order_seen(dep: dict[str, Any]) -> None:
             deposit_id=dep["_id"],
         )
         return
-    await _set(dep["_id"], dln_status=status, fulfilled_seen_at=fulfilled_at)
+    await _set(dep["_id"], route_status=status, fulfilled_seen_at=fulfilled_at)
 
 
-async def dln_secondary() -> int:
+async def _reverify(dep: dict[str, Any]) -> None:
+    """Flip `verified` on a row the chain moved past `submitted` before the router had indexed it.
+
+    Recorded live 2026-09-09 20:40Z: a BSC deposit was registered seconds after it was signed,
+    so the router's index could not vouch for the hash yet (`verified: false`, which is correct); the
+    PRIMARY pass then found the pipe lock and moved the row straight to `locked`, and the
+    re-check only ever ran on `submitted` rows — so the flag stayed false through credited,
+    forever. The evidence exists, it was simply never asked for again.
+
+    Only ever sets it TRUE. A row whose money already landed is not failed here: the mismatch
+    path belongs to `_step_submitted`, where nothing has been credited yet."""
+    try:
+        ids = await xchain.order_ids_by_tx(dep["src_tx_hash"])
+    except xchain.XchainError:
+        return  # not indexed yet, or unreachable — "I do not know" is never a verdict
+    have = [str(i).lower() for i in ids]
+    # the SAME candidate set the re-check uses: an earlier order of this quote is this quote's
+    # own evidence too. The row is past `submitted` here, so only the flag moves — the amounts
+    # and the id belong to whatever already claimed the lock.
+    if any(c.lower() in have for c in _candidate_orders(dep)):
+        await _set(dep["_id"], verified=True)
+
+
+async def xchain_secondary() -> int:
     cur = (
         db()
-        .deposits.find({"status": {"$in": ["submitted", "order_seen"]}})
+        .deposits.find(
+            {
+                "$or": [
+                    {"status": {"$in": ["submitted", "order_seen"]}},
+                    # advanced past the re-check without ever being verified: ask the router once more
+                    # while its index can still be expected to hold the transaction
+                    {
+                        "status": {"$in": ["locked", "confirming", "credited"]},
+                        "verified": False,
+                        "created_at": {"$gte": time.time() - REVERIFY_WINDOW_S},
+                    },
+                ]
+            }
+        )
         .sort("created_at", 1)
         .limit(100)
     )
     n = 0
     for dep in await cur.to_list(100):
         if dep.get("mode") == "direct":
-            continue  # no DLN order exists for a direct deposit; only the chain can advance it
+            continue  # no cross-chain order exists for a direct deposit; only the chain can advance it
         try:
             if dep["status"] == "submitted":
                 if dep.get("src_tx_hash"):
                     await _step_submitted(dep)
-            else:
+            elif dep["status"] == "order_seen":
                 await _step_order_seen(dep)
+            elif dep.get("src_tx_hash"):
+                await _reverify(dep)
             n += 1
         except Exception as e:  # noqa: BLE001 — one bad deposit must not block the others
-            log.exception("dln step %s: %s", dep["_id"], e)
+            log.exception("xchain step %s: %s", dep["_id"], e)
             await tg.send(
-                f"DLN step failed on <code>{dep['_id']}</code>: {tg.esc(f'{type(e).__name__}: {e}')[:300]}",
+                f"Cross-chain step failed on <code>{dep['_id']}</code>: {tg.esc(f'{type(e).__name__}: {e}')[:300]}",
                 key=f"dep-err:{dep['_id']}",
                 cooldown_s=900,
             )
@@ -395,7 +527,7 @@ async def deposit_watcher_once() -> dict[str, Any]:
     out["late_attributed"] = await scanner.retry_unattributed(rpc)
     out["confirmed"] = await confirm_locked()
     await reconcile_credits()
-    out["dln"] = await dln_secondary()  # SECONDARY: what the chain cannot show
+    out["xchain"] = await xchain_secondary()  # SECONDARY: what the chain cannot show
     return out
 
 
@@ -520,18 +652,50 @@ async def drain_events() -> int:
 async def stuck_checks() -> None:
     now = time.time()
     d = db()
-    q = {"status": "bridging", "updated_at": {"$lt": now - 120 * 60}}
-    for r in await d.payout_requests.find(q).limit(50).to_list(50):
-        await tg.send(
-            "STUCK: direct payout bridging for over 120 min — the relayer lags or is down. "
-            f"<code>{r['_id']}</code>",
-            key=f"stuck:req:{r['_id']}",
-            cooldown_s=6 * 3600,
-        )
+    # the payout order machine: each status has its own SLA, and only the relayer's own two
+    # legs get hours — a release that has not gone out in 15 min is ours to explain.
+    for status, sla in SLA_S.items():
+        q = {"status": status, **stale("status_at", now - sla), **NOT_DARK}
+        for r in await d.payout_requests.find(q).limit(50).to_list(50):
+            mins = int(sla // 60)
+            tail = (
+                " — the relayer lags or is down; the message cannot be cancelled once the bETH "
+                "is burned"
+                if status in ("bridging", "delivering")
+                else " — no processor moved it"
+            )
+            await tg.send(
+                f"STUCK: direct payout {status} for over {mins} min{tail}. <code>{r['_id']}</code>",
+                key=f"stuck:req:{r['_id']}:{status}",
+                cooldown_s=6 * 3600,
+            )
+    # the deposit treasury sub-machine (claim → shield)
+    for tstatus, sla in TREASURY_SLA_S.items():
+        q = {"treasury": tstatus, **stale("treasury_at", now - sla), **NOT_DARK}
+        for r in await d.deposits.find(q).limit(50).to_list(50):
+            await tg.send(
+                f"STUCK: treasury {tstatus} for over {int(sla // 60)} min — the claim/shield "
+                f"chain is not advancing. <code>{r['_id']}</code>",
+                key=f"stuck:treasury:{r['_id']}:{tstatus}",
+                cooldown_s=6 * 3600,
+            )
+    # rows parked for a human: the money is somewhere the machine may not touch, so the pager
+    # keeps saying so — a held row that nobody hears about is the same as a lost one
+    for coll, field, what in (
+        ("payout_requests", "status", "payout"),
+        ("deposits", "treasury", "deposit"),
+    ):
+        for r in await d[coll].find({field: "held"}).limit(50).to_list(50):
+            await tg.send(
+                f"HELD: {what} parked for a human — {tg.esc(str(r.get('hold_reason') or ''))[:200]}"
+                f" <code>{r['_id']}</code>",
+                key=f"held:{coll}:{r['_id']}",
+                cooldown_s=HELD_SLA_S,
+            )
     q = {"status": {"$in": ["submitted", "order_seen"]}, "created_at": {"$lt": now - 60 * 60}}
     for r in await d.deposits.find(q).limit(50).to_list(50):
         await tg.send(
-            f"STUCK: deposit {r['status']} for over 60 min — no DLN fill yet. <code>{r['_id']}</code>",
+            f"STUCK: deposit {r['status']} for over 60 min — no cross-chain fill yet. <code>{r['_id']}</code>",
             key=f"stuck:dep:{r['_id']}:{r['status']}",
             cooldown_s=6 * 3600,
         )
@@ -543,7 +707,7 @@ async def stuck_checks() -> None:
             cooldown_s=6 * 3600,
         )
     # a scheduled payout whose release_at has passed and which nothing has moved on
-    q = {"status": "scheduled", "release_at": {"$lt": now - PAYOUT_DUE_GRACE_S}}
+    q = {"status": "scheduled", "release_at": {"$lt": now - PAYOUT_DUE_GRACE_S}, **NOT_DARK}
     for r in await d.payout_requests.find(q).limit(50).to_list(50):
         await tg.send(
             "STUCK: payout due for over 30 min and still scheduled — no executor moved it. "
@@ -560,12 +724,19 @@ def down_for(health: dict[str, Any]) -> float:
 
 
 async def upstream_checks() -> None:
-    if time.time() - float(dln.health["last_ok_at"]) > 300:
+    if time.time() - float(xchain.health["last_ok_at"]) > 300:
         try:
-            await dln.supported_chains(force=True)
-        except dln.DlnError:
-            pass  # the health bookkeeping happened inside dln._get
-    for name, health in (("deBridge DLN", dln.health), ("beamsmart explorer", pool_health)):
+            await xchain.supported_chains(force=True)
+        except xchain.XchainError:
+            pass  # the health bookkeeping happened inside xchain._get
+    # BeamPay is the SYSTEM OF RECORD for the Beam side: while it is unreachable no claim, no
+    # shield and no payout can read a balance or register a txid. Its health is what the
+    # processors themselves observed on their own calls — never a separate probe (§8).
+    for name, health in (
+        ("cross-chain router", xchain.health),
+        ("beamsmart explorer", pool_health),
+        ("BeamPay", beampay.health),
+    ):
         down = down_for(health)
         if down > 300:
             await tg.send(
@@ -625,10 +796,17 @@ async def _ensure_indexes_task() -> None:
 
 
 def start() -> list[asyncio.Task]:
+    # imported HERE, not at module scope: payouts imports this module for the kill switch and
+    # the RPC pool, so a top-level import would be a cycle.
+    from . import payouts
+
     return [
         asyncio.create_task(_ensure_indexes_task()),
         asyncio.create_task(
             run_forever("deposit_watcher", settings.watcher_interval_s, deposit_watcher_once)
+        ),
+        asyncio.create_task(
+            run_forever("payout_processor", settings.payout_interval_s, payouts.process_once)
         ),
         asyncio.create_task(run_forever("monitor", settings.monitor_interval_s, monitor_once)),
         asyncio.create_task(
@@ -638,6 +816,14 @@ def start() -> list[asyncio.Task]:
 
 
 async def stop(tasks: list[asyncio.Task]) -> None:
+    """Cancel every loop, then GIVE THE PAYOUT LEASE BACK.
+
+    The TTL is what makes a crash safe; handing the lease back is what makes a restart fast.
+    Without this the dying process's claim stands for a whole `payout_lease_ttl_s`, so the new
+    processor does nothing for two minutes and pages that "a second payout processor is running"
+    — about its own corpse. It runs AFTER the loops are cancelled, so the lease is never released
+    out from under a pass that is still executing, and `release_lease` releases only a lease THIS
+    process owns and never raises."""
     for t in tasks:
         t.cancel()
     for t in tasks:
@@ -645,3 +831,6 @@ async def stop(tasks: list[asyncio.Task]) -> None:
             await t
         except (asyncio.CancelledError, Exception):  # noqa: BLE001 — shutdown never raises
             pass
+    from . import payouts  # local import: payouts imports this module (see `start`)
+
+    await payouts.release_lease()

@@ -14,18 +14,18 @@ import time
 from typing import Any
 
 import pytest
-from conftest import DLN_ESTIMATE, OTHER_PUBKEY, PUBKEY, USDC_ARB, FakeRpc, fund, lock_log
+from conftest import OTHER_PUBKEY, PUBKEY, USDC_ARB, XCHAIN_ESTIMATE, FakeRpc, fund, lock_log
 from eth_account import Account as EthAccount
 from pymongo.errors import DuplicateKeyError
 
-from pgasme import dln, ethpipe, ledger, scanner, tg, workers
+from pgasme import ethpipe, ledger, scanner, tg, workers, xchain
 from pgasme.assets import ASSETS
 from pgasme.config import settings
 
 ETH = ASSETS["ETH"]
 ZERO = "0x0000000000000000000000000000000000000000"
 HALF_ETH_TENTH = 50_000_000_000_000_000  # 0.05 ETH — clears the 0.02 ETH floor
-Q_DLN = {"src_chain_id": 42161, "src_token": USDC_ARB, "amount": "10000000", "target_asset": "ETH"}
+Q_XCHAIN = {"src_chain_id": 42161, "src_token": USDC_ARB, "amount": "10000000", "target_asset": "ETH"}
 Q_DIRECT = {"src_chain_id": 1, "src_token": ZERO, "amount": str(HALF_ETH_TENTH), "target_asset": "ETH"}
 VALUE = 3_774_700_000_000_000
 TX = "0x" + "aa" * 32
@@ -33,7 +33,7 @@ TX = "0x" + "aa" * 32
 
 @pytest.fixture(autouse=True)
 def offline(monkeypatch):
-    """Nothing in this file may reach CoinGecko, deBridge or an Ethereum node by accident."""
+    """Nothing in this file may reach CoinGecko, the router or an Ethereum node by accident."""
 
     async def px(force: bool = False) -> dict[str, float]:
         return {"ETH": 2500.0, "DAI": 1.0, "WBTC": 80000.0}
@@ -42,11 +42,11 @@ def offline(monkeypatch):
         return []
 
     monkeypatch.setattr("pgasme.routers.quote.usd_prices", px)
-    monkeypatch.setattr(dln, "order_ids_by_tx", no_ids)
+    monkeypatch.setattr(xchain, "order_ids_by_tx", no_ids)
     monkeypatch.setattr(scanner, "LITE_RETRY_SLEEP_S", 0.0)
 
 
-class FakeDln:
+class FakeRouter:
     """create_tx like the recorded API: `auto` → the estimate, an explicit amount → it echoed."""
 
     def __init__(self, recommended: dict[int, int] | None = None) -> None:
@@ -55,11 +55,11 @@ class FakeDln:
 
     async def __call__(self, params: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(params)
-        body = copy.deepcopy(DLN_ESTIMATE)
+        body = copy.deepcopy(XCHAIN_ESTIMATE)
         out = body["estimation"]["dstChainTokenOut"]
         if params["dstChainTokenOutAmount"] != "auto":
             amt = int(params["dstChainTokenOutAmount"])
-            base = int(DLN_ESTIMATE["estimation"]["dstChainTokenOut"]["amount"])
+            base = int(XCHAIN_ESTIMATE["estimation"]["dstChainTokenOut"]["amount"])
             out["amount"] = str(amt)
             out["recommendedAmount"] = str(self.recommended.get(amt, amt))
             out["approximateUsdValue"] = round(out["approximateUsdValue"] * amt / base, 6)
@@ -68,17 +68,21 @@ class FakeDln:
 
 
 @pytest.fixture
-def fake_dln(monkeypatch):
-    f = FakeDln()
-    monkeypatch.setattr(dln, "create_tx", f)
+def fake_xchain(monkeypatch):
+    f = FakeRouter()
+    monkeypatch.setattr(xchain, "create_tx", f)
     monkeypatch.setattr(settings, "min_deposit_wei", 10**15)
     return f
 
 
-async def armed_dln_quote(client, user) -> dict[str, Any]:
-    r = await client.post("/v1/quote", json=Q_DLN, headers=user["headers"])
+async def armed_xchain_quote(client, user) -> dict[str, Any]:
+    """The two calls the web makes since 2026-09-09: the estimate, then /arm for the order."""
+    r = await client.post("/v1/quote", json=Q_XCHAIN, headers=user["headers"])
     assert r.status_code == 200, r.text
-    return r.json()
+    q = r.json()
+    a = await client.post(f"/v1/quote/{q['quote_id']}/arm", headers=user["headers"])
+    assert a.status_code == 200, a.text
+    return {**q, **a.json()}
 
 
 async def armed_direct_quote(client, user) -> dict[str, Any]:
@@ -87,22 +91,22 @@ async def armed_direct_quote(client, user) -> dict[str, Any]:
     return r.json()
 
 
-# ═══════════════════════ defect 1 — the hash is not a claim (dln + direct) ═══════════════════
+# ═══════════════════════ defect 1 — the hash is not a claim (xchain + direct) ═══════════════════
 
 
-async def test_dln_hijack_the_registration_refuses_a_foreign_transaction(
-    client, user, armed_eth, fake_dln, mock_db, monkeypatch
+async def test_xchain_hijack_the_registration_refuses_a_foreign_transaction(
+    client, user, armed_eth, fake_xchain, mock_db, monkeypatch
 ):
     """The attacker holds a quote of their own and offers somebody else's transaction hash.
-    deBridge's index says that transaction created a DIFFERENT order → 400, no row, no claim."""
-    quote = await armed_dln_quote(client, user)
+    the router's index says that transaction created a DIFFERENT order → 400, no row, no claim."""
+    quote = await armed_xchain_quote(client, user)
     victim_tx = "0x" + "be" * 32
 
     async def ids(tx_hash: str, timeout: float | None = None) -> list[str]:
         assert tx_hash == victim_tx
         return ["0x" + "99" * 32]  # the victim's order, not this quote's
 
-    monkeypatch.setattr(dln, "order_ids_by_tx", ids)
+    monkeypatch.setattr(xchain, "order_ids_by_tx", ids)
     r = await client.post(
         "/v1/deposits",
         json={"quote_id": quote["quote_id"], "src_tx_hash": victim_tx},
@@ -110,7 +114,7 @@ async def test_dln_hijack_the_registration_refuses_a_foreign_transaction(
     )
     assert r.status_code == 400
     assert r.json()["detail"] == (
-        "that transaction does not carry this quote's deBridge order — register the transaction "
+        "that transaction does not carry this quote's cross-chain order — register the transaction "
         "you signed for this quote"
     )
     d = mock_db["pgasme_test"]
@@ -119,13 +123,13 @@ async def test_dln_hijack_the_registration_refuses_a_foreign_transaction(
     assert ev and ev["quote_id"] == quote["quote_id"] and user["address"] not in ev["text"]
 
 
-async def test_dln_a_not_yet_indexed_hash_is_accepted_unverified_and_rechecked(
-    client, user, armed_eth, fake_dln, mock_db, monkeypatch
+async def test_xchain_a_not_yet_indexed_hash_is_accepted_unverified_and_rechecked(
+    client, user, armed_eth, fake_xchain, mock_db, monkeypatch
 ):
-    """DLN indexes with delay, so a freshly signed transaction cannot be verified at
+    """The router indexes with delay, so a freshly signed transaction cannot be verified at
     registration. It is taken UNVERIFIED and the worker is the gate: a foreign order id fails
     the row, is never adopted, and the hash goes back so its real owner can register it."""
-    quote = await armed_dln_quote(client, user)
+    quote = await armed_xchain_quote(client, user)
     tx = "0x" + "cc" * 32
     r = await client.post(
         "/v1/deposits",
@@ -143,9 +147,9 @@ async def test_dln_a_not_yet_indexed_hash_is_accepted_unverified_and_rechecked(
     async def ids(tx_hash: str, timeout: float | None = None) -> list[str]:
         return [stranger]
 
-    monkeypatch.setattr(dln, "order_ids_by_tx", ids)
+    monkeypatch.setattr(xchain, "order_ids_by_tx", ids)
     await d.deposits.update_one({"_id": dep_id}, {"$set": {"created_at": time.time() - 3600}})
-    await workers.dln_secondary()
+    await workers.xchain_secondary()
     dep = await d.deposits.find_one({"_id": dep_id})
     assert dep["status"] == "failed" and dep["order_id"] == quote["order_id"] != stranger
     assert dep.get("src_tx_hash") is None and dep["src_tx_hash_rejected"] == tx
@@ -278,12 +282,29 @@ async def test_one_deposit_per_source_transaction_is_a_database_rule(mock_db):
 # ═══════════════════ defect 2 — a lagging endpoint cannot checkpoint "no locks" ═══════════════
 
 
-async def test_a_pinned_scan_refuses_a_range_the_answering_endpoint_cannot_see(mock_db, monkeypatch):
+async def test_a_pinned_scan_refuses_a_range_the_answering_endpoint_cannot_see(
+    mock_db, monkeypatch
+):
+    """The quiet half of the lag problem: the endpoint does not raise, it answers `[]` from a
+    node that does not have those blocks (a load balancer switching mid-pass). The chunk is not
+    checkpointed, so the lock inside it is still there to be found."""
+
+    class FlipFlopRpc(FakeRpc):
+        """Vouches for head 2000, then reports 1200 once it has answered the range."""
+
+        def __init__(self) -> None:
+            super().__init__(head=2000)
+            self.reads = 0
+            self.behind = 1200
+
+        async def block_number(self, prefer: str | None = None, pin: bool = False) -> int:
+            self.reads += 1
+            return 2000 if self.reads == 1 else self.behind
+
     monkeypatch.setattr(settings, "beam_pipe_pubkey_eth", PUBKEY)
     monkeypatch.setattr(settings, "lock_scan_chunk", 500)
     monkeypatch.setattr(settings, "lock_scan_blocks", 2000)
-    rpc = FakeRpc(head=2000)
-    rpc.heads[FakeRpc.PRIMARY] = 1200  # it vouched for 2000 and can only see 1200
+    rpc = FlipFlopRpc()
     rpc.logs_.append(lock_log(ETH.pipe, 9, VALUE, 1, PUBKEY, 1300, TX, 0))  # inside the gap
     st = await scanner.scan_pipe(ETH, rpc)
     assert st["prefer"] == FakeRpc.PRIMARY and st["chunks"] == 2
@@ -293,7 +314,8 @@ async def test_a_pinned_scan_refuses_a_range_the_answering_endpoint_cannot_see(m
     ] == 999
     assert all(c[4] == FakeRpc.PRIMARY for c in rpc.calls)  # every read pinned to that endpoint
     # the lock is NOT lost: when the endpoint catches up the same range is read again
-    rpc.heads[FakeRpc.PRIMARY] = 2000
+    rpc.behind = 2000
+    rpc.reads = 0
     rpc.receipts[TX] = {"logs": [rpc.logs_[0]]}
     st = await scanner.scan_pipe(ETH, rpc)
     assert st["from"] == 1000 and st["failed"] is None and st["unattributed"] == 1
@@ -462,16 +484,12 @@ async def test_the_debit_is_written_before_the_row_it_belongs_to(client, user, m
     monkeypatch.setattr(settings, "payout_direct_enabled", True)
     await fund(user, "ETH", 100_000_000)
     dest = EthAccount.create()
-    from conftest import add_destination
-
-    assert (await add_destination(client, user, dest)).status_code == 200
     r = await client.post(
         "/v1/withdrawals",
         json={
             "asset": "ETH",
             "items": [{"W": dest.address, "amount_groth": 1_000_000}],
             "mode": "direct",
-            "window_s": 0,
         },
         headers=user["headers"],
     )
@@ -490,9 +508,6 @@ async def test_concurrent_withdrawals_cannot_overdraw(client, user, mock_db, mon
     monkeypatch.setattr(settings, "payout_direct_enabled", True)
     await fund(user, "ETH", 1_020_000)  # room for exactly ONE 0.01 ETH payout incl. the 2% fee
     dest = EthAccount.create()
-    from conftest import add_destination
-
-    assert (await add_destination(client, user, dest)).status_code == 200
     real_balance = ledger.balance
 
     async def slow_balance(account_id: str, asset: str):
@@ -504,7 +519,6 @@ async def test_concurrent_withdrawals_cannot_overdraw(client, user, mock_db, mon
         "asset": "ETH",
         "items": [{"W": dest.address, "amount_groth": 1_000_000}],
         "mode": "direct",
-        "window_s": 0,
     }
     a, b = await asyncio.gather(
         client.post("/v1/withdrawals", json=body, headers=user["headers"]),
@@ -537,12 +551,16 @@ def paused(tmp_path, monkeypatch):
 
 
 async def test_the_stop_file_closes_ingress_not_the_whole_site(
-    client, user, armed_eth, fake_dln, paused, mock_db, rpc, monkeypatch
+    client, user, armed_eth, fake_xchain, paused, mock_db, rpc, monkeypatch
 ):
     h = user["headers"]
     monkeypatch.setattr(settings, "min_deposit_wei", 1)  # the floor is not what is under test
     assert workers.paused() is True
-    r = await client.post("/v1/quote", json=Q_DLN, headers=h)
+    # the xchain ESTIMATE spends nothing and still answers; arming it is what puts money in our
+    # pipe, and that is what the switch closes
+    q = await client.post("/v1/quote", json=Q_XCHAIN, headers=h)
+    assert q.status_code == 200 and "tx" not in q.json()
+    r = await client.post(f"/v1/quote/{q.json()['quote_id']}/arm", headers=h)
     assert r.status_code == 409 and r.json()["detail"] == workers.PAUSED_REASON
     assert (await client.post("/v1/quote", json=Q_DIRECT, headers=h)).status_code == 409
     r = await client.post(
@@ -552,18 +570,18 @@ async def test_the_stop_file_closes_ingress_not_the_whole_site(
     r = await client.post(
         "/v1/withdrawals",
         json={"asset": "ETH", "items": [{"W": "0x" + "ab" * 20, "amount_groth": 1}],
-              "mode": "direct", "window_s": 0},
+              "mode": "direct"},
         headers=h,
     )
     assert r.status_code == 409 and r.json()["detail"] == workers.PAUSED_REASON
     health = (await client.get("/v1/health")).json()
     assert health["paused"] is True
     # a quote that could never carry OUR transaction still answers: an estimate spends nothing
-    estimate_only = await client.post("/v1/quote", json={**Q_DLN, "target_asset": "DAI"}, headers=h)
+    estimate_only = await client.post("/v1/quote", json={**Q_XCHAIN, "target_asset": "DAI"}, headers=h)
     assert estimate_only.status_code == 200 and estimate_only.json()["armed"] is False
 
 
-async def test_ingress_reopens_when_the_stop_file_goes(client, user, armed_eth, fake_dln, paused):
+async def test_ingress_reopens_when_the_stop_file_goes(client, user, armed_eth, fake_xchain, paused):
     assert (await client.post("/v1/quote", json=Q_DIRECT, headers=user["headers"])).status_code == 409
     paused.unlink()
     r = await client.post("/v1/quote", json=Q_DIRECT, headers=user["headers"])
@@ -575,24 +593,27 @@ async def test_ingress_reopens_when_the_stop_file_goes(client, user, armed_eth, 
 
 async def test_the_minimum_deposit_is_rechecked_after_the_requote(client, user, armed_eth, monkeypatch):
     first = 3774812168855201
-    rec = first - 81_000_000_000_000  # DLN prices the hook's gas in and recommends less
-    monkeypatch.setattr(dln, "create_tx", FakeDln(recommended={first: rec}))
+    rec = first - 81_000_000_000_000  # the router prices the hook's gas in and recommends less
+    monkeypatch.setattr(xchain, "create_tx", FakeRouter(recommended={first: rec}))
     monkeypatch.setattr(settings, "min_deposit_wei", first - 10)  # between the two amounts
-    r = await client.post("/v1/quote", json=Q_DLN, headers=user["headers"])
+    q = (await client.post("/v1/quote", json=Q_XCHAIN, headers=user["headers"])).json()
+    assert q["estimate"]["out_units"] == str(first)  # the estimate clears the floor
+    r = await client.post(f"/v1/quote/{q['quote_id']}/arm", headers=user["headers"])
+    # …and the order that was actually placed does not: the floor belongs on what the user gets
     assert r.status_code == 400 and "minimum deposit" in r.json()["detail"]
     # and below the floor for BOTH amounts it is refused before the order is ever placed
     monkeypatch.setattr(settings, "min_deposit_wei", first + 10**15)
-    assert (await client.post("/v1/quote", json=Q_DLN, headers=user["headers"])).status_code == 400
+    assert (await client.post("/v1/quote", json=Q_XCHAIN, headers=user["headers"])).status_code == 400
 
 
 async def test_the_usd_of_a_requoted_order_is_never_the_old_one(client, user, armed_eth, monkeypatch):
     first = 3774812168855201
     rec = first - 81_000_000_000_000
-    monkeypatch.setattr(dln, "create_tx", FakeDln(recommended={first: rec}))
+    monkeypatch.setattr(xchain, "create_tx", FakeRouter(recommended={first: rec}))
     monkeypatch.setattr(settings, "min_deposit_wei", 10**15)
-    body = (await client.post("/v1/quote", json=Q_DLN, headers=user["headers"])).json()
+    body = await armed_xchain_quote(client, user)
     est = body["estimate"]
-    first_usd = DLN_ESTIMATE["estimation"]["dstChainTokenOut"]["approximateUsdValue"]
+    first_usd = XCHAIN_ESTIMATE["estimation"]["dstChainTokenOut"]["approximateUsdValue"]
     assert est["out_units"] == str(rec)
     # the usd describes the ORDER that was placed, not the estimate that was abandoned
     assert est["usd"] != first_usd
@@ -665,15 +686,15 @@ async def test_stats_negative_caches_a_failing_explorer(mock_db, monkeypatch, cl
 # ═══════════════════════ defect 11 — one account cannot flood the quote path ══════════════════
 
 
-async def test_a_per_account_quote_cap_answers_429_with_retry_after(client, user, fake_dln, mock_db):
+async def test_a_per_account_quote_cap_answers_429_with_retry_after(client, user, fake_xchain, mock_db):
     now = time.time()
     for i in range(20):
         await mock_db["pgasme_test"].quotes.insert_one(
             {"_id": f"q{i}", "account_id": user["account_id"], "at": now - 1}
         )
-    r = await client.post("/v1/quote", json=Q_DLN, headers=user["headers"])
+    r = await client.post("/v1/quote", json=Q_XCHAIN, headers=user["headers"])
     assert r.status_code == 429 and "too many quotes" in r.json()["detail"]
     assert 1 <= int(r.headers["retry-after"]) <= 61
     # another account is unaffected, and an aged-out window is too
     await mock_db["pgasme_test"].quotes.update_many({}, {"$set": {"at": now - 120}})
-    assert (await client.post("/v1/quote", json=Q_DLN, headers=user["headers"])).status_code == 200
+    assert (await client.post("/v1/quote", json=Q_XCHAIN, headers=user["headers"])).status_code == 200

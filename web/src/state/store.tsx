@@ -1,13 +1,26 @@
-// The one store: connected wallet, signed-in session (+ polled account), public reference data and
-// the current tab. Four hooks compose into a single context so pages read `useStore()` and nothing
-// else; each slice is memoized so a render only re-runs when its own inputs change.
+// The one store: connected wallet, signed-in session (+ polled account), public reference data, the
+// light/dark choice and the current tab. Five hooks compose into a single context so pages read
+// `useStore()` and nothing else; each slice is memoized so a render only re-runs when its own
+// inputs change.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { hexlify, toBeHex, toUtf8Bytes } from 'ethers';
-import { SESSION_EVENT, SESSION_EXPIRED_EVENT, api, clearSession, errorText, getSession, setSession, type Session } from '../lib/api';
+import {
+  SESSION_EVENT,
+  SESSION_EXPIRED_EVENT,
+  api,
+  clearSession,
+  errorText,
+  getSession,
+  rejectedByUser,
+  setSession,
+  type Session,
+} from '../lib/api';
 import { CHAIN_META } from '../lib/chains';
 import { checksum, hexValue } from '../lib/format';
+import { ingressPartial, uniswapTokenList, type IngressPartial } from '../lib/ingress';
 import { buildSiweMessage } from '../lib/siwe';
-import type { Account, Asset, AssetKey, Balance, Chain, Stats } from '../lib/types';
+import { applyTheme, currentTheme, onSystemThemeChange, setTheme as persistTheme, storedTheme, type ThemeChoice } from '../lib/theme';
+import type { Account, Asset, AssetKey, Balance, Chain } from '../lib/types';
 import {
   WALLETCONNECT_ID,
   getWalletOptions,
@@ -53,10 +66,32 @@ interface Attached {
   provider: Eip1193Provider;
   onAccounts: (...args: unknown[]) => void;
   onChain: (...args: unknown[]) => void;
-  onDisconnect?: () => void;
+  onDisconnect: () => void;
 }
 
 type ConnectedOption = WalletOption & { provider: Eip1193Provider };
+
+/**
+ * "I do not understand these parameters" — the JSON-RPC -32602 answer, in every dress wallets put
+ * it in (MetaMask nests the real error under `data.originalError`, ethers under `info.error`).
+ * A user rejection (4001) is explicitly NOT this: retrying a rejection in another shape re-prompts
+ * someone who already said no.
+ */
+export function isBadParams(e: unknown): boolean {
+  if (!e || typeof e !== 'object') return false;
+  const o = e as {
+    code?: number | string;
+    message?: string;
+    data?: { originalError?: { code?: number | string; message?: string } };
+    error?: { code?: number | string; message?: string };
+    info?: { error?: { code?: number | string; message?: string } };
+  };
+  const codes = [o.code, o.data?.originalError?.code, o.error?.code, o.info?.error?.code];
+  if (codes.some((c) => c === 4001 || c === 'ACTION_REJECTED')) return false;
+  if (codes.some((c) => c === -32602)) return true;
+  const text = [o.message, o.data?.originalError?.message, o.error?.message, o.info?.error?.message].filter(Boolean).join(' ');
+  return /invalid (method )?param|params? (are|is) invalid|unsupported (message )?format|must be a (utf-?8 )?string/i.test(text);
+}
 
 function useWalletState(onDisconnect: () => void): WalletState {
   const [options, setOptions] = useState<WalletOption[]>([]);
@@ -77,7 +112,7 @@ function useWalletState(onDisconnect: () => void): WalletState {
     if (!a) return;
     a.provider.removeListener?.('accountsChanged', a.onAccounts);
     a.provider.removeListener?.('chainChanged', a.onChain);
-    if (a.onDisconnect) a.provider.removeListener?.('disconnect', a.onDisconnect);
+    a.provider.removeListener?.('disconnect', a.onDisconnect);
     attached.current = null;
   }, []);
 
@@ -112,9 +147,27 @@ function useWalletState(onDisconnect: () => void): WalletState {
       const onChain = (id: unknown) => setChainId(parseChainId(id));
       p.on?.('accountsChanged', onAccounts);
       p.on?.('chainChanged', onChain);
-      // only WalletConnect's 'disconnect' means the session ended; injected wallets emit it for RPC hiccups
-      const onDisconnect = o.source === 'walletconnect' ? () => disconnect() : undefined;
-      if (onDisconnect) p.on?.('disconnect', onDisconnect);
+      /**
+       * WalletConnect's `disconnect` IS the session ending. An injected wallet's is not: MetaMask,
+       * OKX and Rabby all emit it when their own RPC hiccups, with the account still connected and
+       * every later request still answered — a wallet that "disconnected" three times an hour while
+       * nothing was wrong. So for an injected provider the event is a question: ask for the
+       * accounts, and end the session only when there are none. A provider that cannot even answer
+       * is having the hiccup the event is about, and is left alone.
+       */
+      const onDisconnect = () => {
+        if (o.source === 'walletconnect') {
+          disconnect();
+          return;
+        }
+        void p.request({ method: 'eth_accounts' }).then(
+          (accs) => {
+            if (!Array.isArray(accs) || accs.length === 0) disconnect();
+          },
+          () => undefined,
+        );
+      };
+      p.on?.('disconnect', onDisconnect);
       attached.current = { provider: p, onAccounts, onChain, onDisconnect };
       optionRef.current = o;
       setOption(o);
@@ -141,7 +194,9 @@ function useWalletState(onDisconnect: () => void): WalletState {
         // WalletConnect pairs through its QR modal in connect(); request() throws until a session exists
         if (o.source === 'walletconnect' && !provider.session) await provider.connect?.();
         const accs = (await provider.request({ method: 'eth_requestAccounts' })) as string[];
-        if (!Array.isArray(accs) || !accs.length) throw new Error('The wallet granted no account');
+        // A locked wallet answers [] instead of throwing (MetaMask, OKX, Bitget all do it). "The
+        // wallet granted no account" left the user staring at the picker with nothing to do.
+        if (!Array.isArray(accs) || !accs.length) throw new Error(`Unlock your ${o.name} wallet and try again — it granted no account`);
         await attach({ ...o, provider }, accs);
         setPickerOpen(false);
       } catch (e) {
@@ -206,6 +261,9 @@ function useWalletState(onDisconnect: () => void): WalletState {
     } catch (e) {
       const err = e as { code?: number; message?: string; data?: { originalError?: { code?: number } } };
       const code = err?.code ?? err?.data?.originalError?.code;
+      // Cancel is an answer. Reading it as "the wallet does not know this chain" would follow the
+      // refusal with an Add-chain prompt — the same user, asked again, harder.
+      if (rejectedByUser(e)) throw e;
       const unknownChain = code === 4902 || /unrecognized|not (been )?added|4902|unsupported chain|unknown chain/i.test(err?.message ?? '');
       if (!unknownChain) throw e;
       const meta = CHAIN_META[target];
@@ -218,13 +276,40 @@ function useWalletState(onDisconnect: () => void): WalletState {
     setChainId(target);
   }, []);
 
+  /**
+   * The one signature Pgas.me ever asks for: the EIP-4361 (SIWE) sign-in message.
+   *
+   * EIP-191 says `personal_sign` takes the message hex-encoded, and that is what is sent first —
+   * it is the only form that survives a message with a non-ASCII character. Coin98 and Binance
+   * Web3 answer that with -32602 "invalid params" and want the plain UTF-8 string; a couple of
+   * in-app browsers want the two parameters the other way round. So a REFUSAL of the shape (and
+   * only that: never a user rejection, never a wallet error) is retried in the next shape.
+   *
+   * ⛔ Only a refusal retries. A wallet that signed is never asked to sign again — two signatures
+   * of one nonce is two sign-ins the user did not ask for, and the second prompt is what trains
+   * people to click through prompts without reading them.
+   */
   const personalSign = useCallback(async (message: string, from?: string) => {
     const p = attached.current?.provider;
     const addr = from ?? addressRef.current;
     if (!p || !addr) throw new Error('Connect a wallet first');
-    const sig = await p.request({ method: 'personal_sign', params: [hexlify(toUtf8Bytes(message)), addr] });
-    if (typeof sig !== 'string' || !sig.startsWith('0x')) throw new Error('The wallet returned no signature');
-    return sig;
+    const shapes: unknown[][] = [
+      [hexlify(toUtf8Bytes(message)), addr], // EIP-191: hex message, then the address
+      [message, addr], // Coin98 / Binance Web3: the plain string
+      [addr, message], // a few in-app browsers read the parameters the other way round
+    ];
+    let last: unknown = null;
+    for (let i = 0; i < shapes.length; i++) {
+      try {
+        const sig = await p.request({ method: 'personal_sign', params: shapes[i] });
+        if (typeof sig !== 'string' || !sig.startsWith('0x')) throw new Error('The wallet returned no signature');
+        return sig;
+      } catch (e) {
+        last = e;
+        if (i === shapes.length - 1 || !isBadParams(e)) throw e;
+      }
+    }
+    throw last; // unreachable: the loop either returns or throws
   }, []);
 
   const sendTransaction = useCallback(
@@ -335,6 +420,8 @@ function useSessionState(wallet: WalletState, disconnectSignal: number): Session
   const [signingIn, setSigningIn] = useState(false);
   const [signInError, setSignInError] = useState<string | null>(null);
   const [expired, setExpired] = useState(false);
+  /** The address auto sign-in has already asked for: a refusal is never re-asked by itself. */
+  const autoAskedFor = useRef<string | null>(null);
 
   useEffect(() => {
     const onSession = () => setSessionState(getSession());
@@ -351,12 +438,13 @@ function useSessionState(wallet: WalletState, disconnectSignal: number): Session
     };
   }, []);
 
-  // a wallet disconnect ends the session too
+  // a wallet disconnect ends the session too — and re-arms auto sign-in, so connecting again asks
   useEffect(() => {
     if (disconnectSignal === 0) return;
     clearSession();
     setAccount(null);
     setExpired(false);
+    autoAskedFor.current = null;
   }, [disconnectSignal]);
 
   const refreshAccount = useCallback(async () => {
@@ -425,6 +513,32 @@ function useSessionState(wallet: WalletState, disconnectSignal: number): Session
     }
   }, [wallet]);
 
+  /**
+   * The account IS the wallet, so a wallet that switches account switches account here: the old
+   * session is dropped and the effect below signs the new address in. Without this the header sat
+   * on "signed in as someone else" and every locked page showed another wallet's money.
+   */
+  useEffect(() => {
+    if (!wallet.address || !session) return;
+    if (session.address.toLowerCase() === wallet.address.toLowerCase()) return;
+    clearSession();
+    setAccount(null);
+    setExpired(false);
+  }, [wallet.address, session]);
+
+  /**
+   * Sign in the moment the wallet connects (admin 2026-09-09): connecting and signing in were two
+   * clicks for one intention, and the second one is free and moves nothing. Asked ONCE per address
+   * — a user who rejects the signature gets the Sign-in card, not a wallet that keeps prompting.
+   */
+  useEffect(() => {
+    const addr = wallet.address;
+    if (!addr || !wallet.provider || session || signingIn) return;
+    if (autoAskedFor.current === addr.toLowerCase()) return;
+    autoAskedFor.current = addr.toLowerCase();
+    void signIn().catch(() => undefined); // the error is on `signInError`; the gate offers a retry
+  }, [wallet.address, wallet.provider, session, signingIn, signIn]);
+
   const signOut = useCallback(() => {
     clearSession();
     setAccount(null);
@@ -468,8 +582,14 @@ function useSessionState(wallet: WalletState, disconnectSignal: number): Session
 export interface DataState {
   chains: Chain[];
   assets: Asset[];
-  stats: Stats | null;
-  statsError: string | null;
+  /**
+   * Which ingress paths the API states are open — what `/v1/assets` and `/v1/health` said, and only
+   * what they said. Resolve it with `resolveIngress()` (lib/ingress.ts), which supplies the
+   * defaults and lets the account have the last word when the public reads stated nothing.
+   */
+  ingress: IngressPartial;
+  /** The tokens the Uniswap route is registered for, when the API names them; else null. */
+  uniswapTokens: string[] | null;
   loading: boolean;
   error: string | null;
   reload(): void;
@@ -481,8 +601,8 @@ export interface DataState {
 function useDataState(): DataState {
   const [chains, setChains] = useState<Chain[]>([]);
   const [assets, setAssets] = useState<Asset[]>([]);
-  const [stats, setStats] = useState<Stats | null>(null);
-  const [statsError, setStatsError] = useState<string | null>(null);
+  const [ingress, setIngress] = useState<IngressPartial>({});
+  const [uniswapTokens, setUniswapTokens] = useState<string[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [generation, setGeneration] = useState(0);
@@ -491,13 +611,20 @@ function useDataState(): DataState {
     let alive = true;
     setLoading(true);
     void (async () => {
-      const [c, a] = await Promise.allSettled([api.chains(), api.assets()]);
+      const [c, a, h] = await Promise.allSettled([api.chains(), api.assets(), api.health()]);
       if (!alive) return;
       const errs: string[] = [];
       if (c.status === 'fulfilled') setChains(Array.isArray(c.value.chains) ? c.value.chains : []);
       else errs.push(`chains: ${errorText(c.reason)}`);
       if (a.status === 'fulfilled') setAssets(Array.isArray(a.value.assets) ? a.value.assets : []);
       else errs.push(`assets: ${errorText(a.reason)}`);
+      // The ingress flags are published on both reads; `/assets` wins where both state one, and a
+      // build with no `/health` route (or none of these keys) simply states nothing. It is never an
+      // error: the deposit paths have defaults, and a 404 here must not colour the page red.
+      const health = h.status === 'fulfilled' ? h.value : null;
+      const assetsPayload = a.status === 'fulfilled' ? a.value : null;
+      setIngress({ ...ingressPartial(health), ...ingressPartial(assetsPayload) });
+      setUniswapTokens(uniswapTokenList(assetsPayload) ?? uniswapTokenList(health));
       setError(errs.length ? errs.join(' · ') : null);
       setLoading(false);
     })();
@@ -506,45 +633,27 @@ function useDataState(): DataState {
     };
   }, [generation]);
 
-  useEffect(() => {
-    let alive = true;
-    const load = () =>
-      api.stats().then(
-        (s) => {
-          if (alive) {
-            setStats(s);
-            setStatsError(null);
-          }
-        },
-        (e) => alive && setStatsError(errorText(e)),
-      );
-    void load();
-    const t = setInterval(load, 60_000);
-    return () => {
-      alive = false;
-      clearInterval(t);
-    };
-  }, [generation]);
-
   const chainById = useCallback((id: number) => chains.find((c) => c.chain_id === id), [chains]);
   const resolveEvmChainId = useCallback((id: number) => id, []);
   const reload = useCallback(() => setGeneration((n) => n + 1), []);
 
   return useMemo<DataState>(
-    () => ({ chains, assets, stats, statsError, loading, error, reload, chainById, resolveEvmChainId }),
-    [chains, assets, stats, statsError, loading, error, reload, chainById, resolveEvmChainId],
+    () => ({ chains, assets, ingress, uniswapTokens, loading, error, reload, chainById, resolveEvmChainId }),
+    [chains, assets, ingress, uniswapTokens, loading, error, reload, chainById, resolveEvmChainId],
   );
 }
 
 // ---------- route ----------
-export type Tab = 'deposit' | 'balance' | 'wallets' | 'withdraw' | 'activity';
+export type Tab = 'deposit' | 'balance' | 'schedule';
 
+// Three tabs, one intention each: put money in, look at it, send it out (admin 2026-09-09).
+// The Wallets tab went with the destination registry earlier the same day — an address is typed on
+// Schedule, so there is nothing to register — and Activity went with the screen review: deposits and
+// payouts are one timeline at the bottom of Balance, which is where a user looks for them.
 export const TABS: { id: Tab; label: string; path: string }[] = [
   { id: 'deposit', label: 'Deposit', path: '/' },
   { id: 'balance', label: 'Balance', path: '/balance' },
-  { id: 'wallets', label: 'Wallets', path: '/wallets' },
-  { id: 'withdraw', label: 'Withdraw', path: '/withdraw' },
-  { id: 'activity', label: 'Activity', path: '/activity' },
+  { id: 'schedule', label: 'Schedule', path: '/schedule' },
 ];
 
 export interface RouteState {
@@ -554,6 +663,7 @@ export interface RouteState {
 
 function tabFromPath(path: string): Tab {
   const p = path.replace(/\/+$/, '') || '/';
+  if (p === '/activity') return 'balance'; // the old bookmark still lands on the timeline
   return TABS.find((t) => t.path === p)?.id ?? 'deposit';
 }
 
@@ -573,12 +683,47 @@ function useRouteState(): RouteState {
   return useMemo(() => ({ tab, navigate }), [tab, navigate]);
 }
 
+// ---------- theme ----------
+export interface ThemeState {
+  /** The theme in force — never "system": the OS is resolved to one of these two. */
+  theme: ThemeChoice;
+  /** Whether that came from the OS (no stored choice) — the toggle's title says so. */
+  fromSystem: boolean;
+  toggle(): void;
+}
+
+function useThemeState(): ThemeState {
+  const [theme, setTheme] = useState<ThemeChoice>(() => currentTheme());
+  const [fromSystem, setFromSystem] = useState<boolean>(() => storedTheme() === null);
+
+  // while the user has made no choice of their own, the OS keeps the last word
+  useEffect(
+    () =>
+      onSystemThemeChange((t) => {
+        if (storedTheme() !== null) return;
+        applyTheme(t);
+        setTheme(t);
+      }),
+    [],
+  );
+
+  const toggle = useCallback(() => {
+    const next: ThemeChoice = currentTheme() === 'dark' ? 'light' : 'dark';
+    persistTheme(next);
+    setTheme(next);
+    setFromSystem(false);
+  }, []);
+
+  return useMemo<ThemeState>(() => ({ theme, fromSystem, toggle }), [theme, fromSystem, toggle]);
+}
+
 // ---------- the store ----------
 export interface Store {
   wallet: WalletState;
   session: SessionState;
   data: DataState;
   route: RouteState;
+  theme: ThemeState;
 }
 
 const StoreContext = createContext<Store | null>(null);
@@ -590,7 +735,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const session = useSessionState(wallet, disconnects);
   const data = useDataState();
   const route = useRouteState();
-  const value = useMemo<Store>(() => ({ wallet, session, data, route }), [wallet, session, data, route]);
+  const theme = useThemeState();
+  const value = useMemo<Store>(() => ({ wallet, session, data, route, theme }), [wallet, session, data, route, theme]);
   return <StoreContext.Provider value={value}>{children}</StoreContext.Provider>;
 }
 

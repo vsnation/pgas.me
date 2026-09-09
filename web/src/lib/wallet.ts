@@ -30,6 +30,13 @@ export interface WalletOption {
   rdns?: string;
   hint?: string;
   disabledReason?: string;
+  /**
+   * An injected global that is the ONLY wallet in this browser because no EIP-6963 announcement
+   * arrived inside the grace window — i.e. a wallet's own in-app browser (Trust, Coin98, Bitget,
+   * TokenPocket on a phone). It is the row the user gets, not a fallback behind a detection that is
+   * never coming.
+   */
+  inApp?: boolean;
 }
 
 export const WALLETCONNECT_ID = 'walletconnect';
@@ -94,6 +101,20 @@ const listeners = new Set<() => void>();
 let discoveryStarted = false;
 let farcasterOption: WalletOption | null = null;
 
+/**
+ * How long EIP-6963 gets before a legacy `window.*` global is treated as the wallet rather than as a
+ * duplicate of an announcement still on its way. Extensions answer `eip6963:requestProvider`
+ * synchronously; the in-app browsers that never announce at all (Trust, Coin98, TokenPocket,
+ * Binance) are the case this exists for — they must not sit behind a detection that never lands.
+ */
+const LEGACY_GRACE_MS = 300;
+let graceOver = false;
+
+/** True once the grace window closed with nothing announced: this browser IS the wallet. */
+export function inAppOnly(): boolean {
+  return graceOver && announced.size === 0;
+}
+
 function notify(): void {
   for (const l of listeners) l();
 }
@@ -124,7 +145,10 @@ export function startDiscovery(): void {
   window.dispatchEvent(new Event('eip6963:requestProvider'));
   // some wallets inject after DOMContentLoaded
   window.addEventListener('ethereum#initialized', notify);
-  setTimeout(notify, 300);
+  setTimeout(() => {
+    graceOver = true;
+    notify();
+  }, LEGACY_GRACE_MS);
   setTimeout(notify, 1500);
   void detectFarcaster();
 }
@@ -176,16 +200,32 @@ function legacyOptions(): WalletOption[] {
   return out;
 }
 
+/**
+ * A wallet's identity across the two detections, so one install is one row. Provider identity is the
+ * strongest signal but not a reliable one: several wallets announce one object over EIP-6963 and put
+ * a different proxy on their `window.*` global, and their two names differ only by the word "Wallet"
+ * (announced "Rabby Wallet" / flag-detected "Rabby", announced "Coin98 Wallet" / "Coin98"). Matching
+ * on the exact string showed those wallets twice.
+ */
+function nameKey(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/\bwallet\b/g, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+
 /** EIP-6963 first (real icons), then legacy globals not already announced, Farcaster, WalletConnect last. */
 export function getWalletOptions(): WalletOption[] {
   const list: WalletOption[] = [...announced.values()];
   const byProvider = new Set(list.map((o) => o.provider));
-  const byName = new Set(list.map((o) => o.name.toLowerCase()));
+  const byName = new Set(list.map((o) => nameKey(o.name)));
+  const inApp = inAppOnly();
   for (const o of legacyOptions()) {
     if (byProvider.has(o.provider)) continue;
-    if (o.name !== 'Browser wallet' && byName.has(o.name.toLowerCase())) continue;
+    if (o.name !== 'Browser wallet' && byName.has(nameKey(o.name))) continue;
     if (o.name === 'Browser wallet' && list.length) continue; // a bare window.ethereum already announced under its rdns
-    list.push(o);
+    byName.add(nameKey(o.name));
+    list.push(inApp ? { ...o, inApp: true } : o);
   }
   if (farcasterOption) list.push(farcasterOption);
   list.push(walletConnectOption());

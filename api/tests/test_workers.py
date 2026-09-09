@@ -1,4 +1,4 @@
-"""The DLN secondary path, the loop helper (kill switch, survives exceptions), the monitor and
+"""The cross-chain secondary path, the loop helper (kill switch, survives exceptions), the monitor and
 the pool cache. tg.send is muted here (no env) and must return False."""
 
 from __future__ import annotations
@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from pgasme import dln, ethpipe, ledger, tg, workers
+from pgasme import ethpipe, ledger, tg, workers, xchain
 from pgasme.config import settings
 
 
@@ -47,8 +47,8 @@ async def test_submitted_becomes_order_seen_after_the_grace_period(mock_db, monk
         calls.append(h)
         return ["0x" + "88" * 32, ours]
 
-    monkeypatch.setattr(dln, "order_ids_by_tx", ids)
-    await workers.dln_secondary()
+    monkeypatch.setattr(xchain, "order_ids_by_tx", ids)
+    await workers.xchain_secondary()
     assert (
         calls == []
         and (await mock_db["pgasme_test"].deposits.find_one({"_id": "dep1"}))["status"]
@@ -57,7 +57,7 @@ async def test_submitted_becomes_order_seen_after_the_grace_period(mock_db, monk
     await mock_db["pgasme_test"].deposits.update_one(
         {"_id": "dep1"}, {"$set": {"created_at": time.time() - 300}}
     )
-    await workers.dln_secondary()
+    await workers.xchain_secondary()
     dep = await mock_db["pgasme_test"].deposits.find_one({"_id": "dep1"})
     assert (
         dep["status"] == "order_seen"
@@ -69,14 +69,90 @@ async def test_submitted_becomes_order_seen_after_the_grace_period(mock_db, monk
     assert ev and ev["deposit_id"] == "dep1"
 
 
+async def test_a_deposit_that_advanced_unverified_is_verified_when_the_router_catches_up(
+    mock_db, monkeypatch
+):
+    """Recorded live 2026-09-09 20:40Z. The hash was registered seconds after it was signed, so
+    the router could not vouch for it yet (verified:false, correctly); the CHAIN then found the pipe
+    lock and moved the row to `locked`, and the re-check only ever looked at `submitted` rows —
+    so the flag stayed false through credited, forever. The evidence existed all along."""
+    ours = "0x" + "77" * 32
+    d = mock_db["pgasme_test"]
+    for i, status in enumerate(("locked", "confirming", "credited")):
+        await _deposit(
+            mock_db, _id=f"dep{i}", status=status, verified=False, order_id=ours, mode="xchain"
+        )
+
+    async def ids(h, timeout=None):
+        return ["0x" + "88" * 32, ours]
+
+    monkeypatch.setattr(xchain, "order_ids_by_tx", ids)
+    await workers.xchain_secondary()
+    rows = await d.deposits.find({}).to_list(10)
+    assert all(r["verified"] is True for r in rows)
+    # …and the row is not moved, failed or re-notified: only the flag changed
+    assert sorted(r["status"] for r in rows) == ["confirming", "credited", "locked"]
+    assert await d.events.count_documents({}) == 0
+
+
+async def test_the_reverify_never_fails_a_row_and_never_concludes_from_silence(
+    mock_db, monkeypatch
+):
+    ours = "0x" + "77" * 32
+    d = mock_db["pgasme_test"]
+    await _deposit(mock_db, status="credited", verified=False, order_id=ours, mode="xchain")
+
+    async def unreachable(h, timeout=None):
+        raise xchain.XchainError("router.example: ConnectError")
+
+    monkeypatch.setattr(xchain, "order_ids_by_tx", unreachable)
+    await workers.xchain_secondary()
+    dep = await d.deposits.find_one({"_id": "dep1"})
+    assert dep["verified"] is False and dep["status"] == "credited"  # unreadable ≠ a verdict
+
+    async def stranger(h, timeout=None):
+        return ["0x" + "99" * 32]
+
+    monkeypatch.setattr(xchain, "order_ids_by_tx", stranger)
+    await workers.xchain_secondary()
+    dep = await d.deposits.find_one({"_id": "dep1"})
+    # the money already landed on the chain's own evidence: this pass never fails such a row
+    assert dep["verified"] is False and dep["status"] == "credited"
+    assert await d.events.count_documents({}) == 0
+
+
+async def test_an_old_unverified_row_stops_being_asked_about(mock_db, monkeypatch):
+    """Bounded on purpose: the router indexes in minutes, so an unbounded re-check would ask the same
+    question about the same rows every 15 seconds forever."""
+    ours = "0x" + "77" * 32
+    calls = []
+
+    async def ids(h, timeout=None):
+        calls.append(h)
+        return [ours]
+
+    monkeypatch.setattr(xchain, "order_ids_by_tx", ids)
+    await _deposit(
+        mock_db,
+        status="credited",
+        verified=False,
+        order_id=ours,
+        mode="xchain",
+        created_at=time.time() - workers.REVERIFY_WINDOW_S - 1,
+    )
+    await workers.xchain_secondary()
+    assert calls == []
+    assert (await mock_db["pgasme_test"].deposits.find_one({"_id": "dep1"}))["verified"] is False
+
+
 async def test_cancelled_order_fails_the_deposit(mock_db, monkeypatch):
     await _deposit(mock_db, status="order_seen", order_id="0xo")
 
     async def status(oid):
         return {"status": "OrderCancelled", "orderId": oid}
 
-    monkeypatch.setattr(dln, "order_status", status)
-    await workers.dln_secondary()
+    monkeypatch.setattr(xchain, "order_status", status)
+    await workers.xchain_secondary()
     dep = await mock_db["pgasme_test"].deposits.find_one({"_id": "dep1"})
     assert dep["status"] == "failed" and "refunded" in dep["note"]
     assert await mock_db["pgasme_test"].events.find_one({"kind": "deposit_failed"})
@@ -88,19 +164,19 @@ async def test_fulfilled_alone_never_credits_and_falls_back_after_the_timer(mock
     async def status(oid):
         return {"status": "Fulfilled", "orderId": oid}
 
-    monkeypatch.setattr(dln, "order_status", status)
-    await workers.dln_secondary()
+    monkeypatch.setattr(xchain, "order_status", status)
+    await workers.xchain_secondary()
     dep = await mock_db["pgasme_test"].deposits.find_one({"_id": "dep1"})
     assert (
         dep["status"] == "order_seen"
-        and dep["dln_status"] == "Fulfilled"
+        and dep["route_status"] == "Fulfilled"
         and dep["fulfilled_seen_at"] > 0
     )
     assert await mock_db["pgasme_test"].entries.count_documents({}) == 0
     await mock_db["pgasme_test"].deposits.update_one(
         {"_id": "dep1"}, {"$set": {"fulfilled_seen_at": time.time() - 3600}}
     )
-    await workers.dln_secondary()
+    await workers.xchain_secondary()
     dep = await mock_db["pgasme_test"].deposits.find_one({"_id": "dep1"})
     assert dep["status"] == "fallback_pending" and "your own wallet" in dep["note"]
     assert await mock_db["pgasme_test"].events.find_one({"kind": "deposit_fallback"})
@@ -117,21 +193,21 @@ async def test_created_order_gets_the_unfilled_note_and_one_event_per_six_hours(
     async def status(oid):
         return {"status": "Created", "orderId": oid}
 
-    monkeypatch.setattr(dln, "order_status", status)
+    monkeypatch.setattr(xchain, "order_status", status)
     d = mock_db["pgasme_test"]
-    await workers.dln_secondary()
+    await workers.xchain_secondary()
     dep = await d.deposits.find_one({"_id": "dep1"})
     assert dep["status"] == "order_seen" and "note" not in dep  # 10 min: too early
     await d.deposits.update_one({"_id": "dep1"}, {"$set": {"order_seen_at": time.time() - 21 * 60}})
-    await workers.dln_secondary()
-    await workers.dln_secondary()
+    await workers.xchain_secondary()
+    await workers.xchain_secondary()
     dep = await d.deposits.find_one({"_id": "dep1"})
     assert dep["status"] == "order_seen" and dep["note"] == workers.UNFILLED_NOTE
     assert await d.events.count_documents({"kind": "deposit_unfilled"}) == 1  # cooldown holds
     await d.deposits.update_one(
         {"_id": "dep1"}, {"$set": {"unfilled_alert_at": time.time() - 7 * 3600}}
     )
-    await workers.dln_secondary()
+    await workers.xchain_secondary()
     assert await d.events.count_documents({"kind": "deposit_unfilled"}) == 2
     assert await d.entries.count_documents({}) == 0
 
@@ -197,7 +273,7 @@ async def test_monitor_drains_events_and_pages_stuck_states(mock_db, monkeypatch
         return False
 
     monkeypatch.setattr(tg, "send", fake_send)
-    monkeypatch.setattr(dln, "supported_chains", lambda force=False: asyncio.sleep(0))
+    monkeypatch.setattr(xchain, "supported_chains", lambda force=False: asyncio.sleep(0))
     await tg.queue(
         "withdrawal_requested", "Withdrawal requested: 1 × direct ETH", request_ids=["r1"]
     )
@@ -230,7 +306,7 @@ async def test_upstream_down_alert_after_five_minutes(monkeypatch):
 
     monkeypatch.setattr(tg, "send", fake_send)
     monkeypatch.setattr(workers, "_started_at", time.time() - 3600)
-    monkeypatch.setitem(dln.health, "last_ok_at", time.time() - 10)
+    monkeypatch.setitem(xchain.health, "last_ok_at", time.time() - 10)
     monkeypatch.setitem(workers.pool_health, "last_ok_at", time.time() - 1000)
     monkeypatch.setitem(workers.pool_health, "last_fail_at", time.time())
     monkeypatch.setitem(workers.pool_health, "last_error", "ConnectError")

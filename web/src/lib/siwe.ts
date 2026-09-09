@@ -1,5 +1,8 @@
-// Message templates, verbatim from API_CONTRACT.md. Whitespace matters: the backend recovers
-// the signer from exactly this text.
+// The EIP-4361 sign-in message, verbatim from API_CONTRACT.md. Whitespace matters: the backend
+// recovers the signer from exactly this text.
+//
+// This is the ONLY message the app ever asks a wallet to sign. The destination-proof template that
+// used to live here went with the Wallets page (2026-09-09): a payout address is typed, not proved.
 
 export interface SiweParams {
   host: string;
@@ -24,15 +27,4 @@ export function buildSiweMessage(p: SiweParams): string {
     `Nonce: ${p.nonce}\n` +
     `Issued At: ${p.issuedAt}`
   );
-}
-
-export interface DestinationProofParams {
-  accountId: string;
-  address: string; // EIP-55
-  nonce: string;
-  issued: string; // ISO-8601
-}
-
-export function buildDestinationProof(p: DestinationProofParams): string {
-  return `Pgas.me destination\n` + `account: ${p.accountId}\n` + `address: ${p.address}\n` + `nonce: ${p.nonce}\n` + `issued: ${p.issued}`;
 }

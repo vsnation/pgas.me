@@ -3,18 +3,19 @@
 // UI to ask for a fresh sign-in. The account IS the wallet — the session holds a token, nothing else.
 import type {
   Account,
-  AddDestinationBody,
-  Asset,
+  ArmedQuote,
+  AssetKey,
+  AssetsResponse,
   Chain,
   Deposit,
-  Destination,
+  HealthResponse,
   NonceResponse,
   Quote,
   QuoteBody,
-  Stats,
   Token,
   VerifyResponse,
   WithdrawalBody,
+  WithdrawalFees,
   WithdrawalResponse,
 } from './types';
 
@@ -120,13 +121,37 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   return data as T;
 }
 
+/**
+ * Every EIP-1193 code a wallet can put a rejection in — its own `code`, MetaMask's nested
+ * `data.originalError`, the `error` an in-app bridge wraps it in, and ethers' `info.error`. A 4001
+ * that arrives one level down used to reach the screen as "Internal JSON-RPC error", which reads
+ * like a broken app rather than "you pressed Cancel".
+ */
+function walletCodes(e: unknown): (number | string | undefined)[] {
+  if (!e || typeof e !== 'object') return [];
+  const o = e as {
+    code?: number | string;
+    data?: { originalError?: { code?: number | string } };
+    error?: { code?: number | string };
+    info?: { error?: { code?: number | string } };
+    cause?: { code?: number | string };
+  };
+  return [o.code, o.data?.originalError?.code, o.error?.code, o.info?.error?.code, o.cause?.code];
+}
+
+/** The user pressed Cancel in the wallet — not a failure to retry, and never a loop. */
+export function rejectedByUser(e: unknown): boolean {
+  return walletCodes(e).some((c) => c === 4001 || c === 'ACTION_REJECTED');
+}
+
 /** One plain sentence for any failure: API detail, wallet rejection, RPC error or a generic Error. */
 export function errorText(e: unknown): string {
   if (e instanceof ApiError) return e.detail;
+  if (rejectedByUser(e)) return 'You rejected the request in the wallet';
   if (e && typeof e === 'object') {
-    const o = e as { code?: number | string; message?: string; info?: { error?: { message?: string } } };
-    if (o.code === 4001 || o.code === 'ACTION_REJECTED') return 'You rejected the request in the wallet';
+    const o = e as { message?: string; info?: { error?: { message?: string } }; data?: { originalError?: { message?: string } } };
     if (o.info?.error?.message) return o.info.error.message;
+    if (o.data?.originalError?.message) return o.data.originalError.message;
     if (typeof o.message === 'string') return o.message.length > 240 ? o.message.slice(0, 240) + '…' : o.message;
   }
   return String(e);
@@ -140,22 +165,29 @@ export const api = {
 
   account: (signal?: AbortSignal) => request<Account>('/account', { auth: true, signal }),
 
-  destinations: () => request<{ destinations: Destination[] }>('/destinations', { auth: true }),
-  destinationNonce: () => request<{ nonce: string; template: string }>('/destinations/nonce', { auth: true }),
-  addDestination: (body: AddDestinationBody) => request<Destination>('/destinations', { method: 'POST', body, auth: true }),
-  removeDestination: (address: string) => request<{ removed: string }>(`/destinations/${address}`, { method: 'DELETE', auth: true }),
-
   chains: () => request<{ chains: Chain[] }>('/dex/chains'),
   tokens: (chainId: number) => request<{ tokens: Token[] }>(`/dex/tokens?chain_id=${chainId}`),
-  assets: () => request<{ assets: Asset[] }>('/assets'),
+  /** The assets, and the ingress flags the 2026-09-10 build publishes alongside them. */
+  assets: () => request<AssetsResponse>('/assets'),
+  /**
+   * Public health. Read for one thing only: the second copy of the ingress flags, for a build that
+   * publishes them here and not on `/assets`. A build with no such route answers 404 and the caller
+   * carries on — an unreadable read is not evidence that a path is closed (see lib/ingress.ts).
+   */
+  health: () => request<HealthResponse>('/health'),
 
   quote: (body: QuoteBody, signal?: AbortSignal) => request<Quote>('/quote', { method: 'POST', body, auth: true, signal }),
+  /**
+   * Builds the order for a cross-chain quote — the slow half of the old one-shot quote, moved
+   * behind the Deposit click (T2b). Idempotent: a second call returns the stored tx while fresh.
+   */
+  armQuote: (quote_id: string) => request<ArmedQuote>(`/quote/${quote_id}/arm`, { method: 'POST', auth: true }),
   registerDeposit: (quote_id: string, src_tx_hash: string) =>
     request<{ deposit_id: string; status: string }>('/deposits', { method: 'POST', body: { quote_id, src_tx_hash }, auth: true }),
   deposit: (id: string) => request<Deposit>(`/deposits/${id}`, { auth: true }),
 
+  withdrawalFees: (asset: AssetKey) => request<WithdrawalFees>(`/withdrawals/fees?asset=${asset}`, { auth: true }),
   withdraw: (body: WithdrawalBody) => request<WithdrawalResponse>('/withdrawals', { method: 'POST', body, auth: true }),
-  cancelWithdrawal: (id: string) => request<{ cancelled: string }>(`/withdrawals/${id}/cancel`, { method: 'POST', auth: true }),
-
-  stats: () => request<Stats>('/stats'),
+  cancelWithdrawal: (id: string) =>
+    request<{ cancelled: string; refunded_groth?: number }>(`/withdrawals/${id}/cancel`, { method: 'POST', auth: true }),
 };

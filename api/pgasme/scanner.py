@@ -1,11 +1,19 @@
 """On-chain scanner — the PRIMARY evidence for deposits (the rules of the founder's proven
-scan_debridge_orders.py, ported):
+order scanner in the reference implementation, ported):
 
   * eth_getLogs on each target pipe (ETH / DAI / WBTC) for NewLocalMessage, in chunks of
     `lock_scan_chunk` blocks, PINNED to the endpoint that vouched for the head: the endpoint
     that said "the chain is at H" is the only one allowed to answer "[0, H] holds no locks",
     and its own head is re-read and required to be ≥ the chunk's end BEFORE the chunk is
     checkpointed. An empty answer from a lagging node is not evidence of no deposit;
+  * an endpoint that will not serve the pinned range — its logs lag the head it just claimed
+    (rpc.flashbots.net answers eth_blockNumber with H and then -32602 "block range extends
+    beyond current head block" for a range ending at H), or it caps the range, or the blocks are
+    behind an archive/API-key wall — is DEMOTED for a cooldown, and the same pass re-resolves
+    the head on the next endpoint and carries on FROM THE SAME BLOCK. The pin decides who may
+    answer; it must never decide that nobody does. The scanner starts from the endpoint that
+    served last time, and the pass warns ONCE, naming every endpoint it tried and why each
+    failed;
   * a checkpoint per pipe in Mongo (`scanner_state` {_id: pipe, last_block}); the first run starts
     at head − `lock_scan_blocks`. ONLY the highest CONTIGUOUS successfully-scanned block is ever
     checkpointed — a failed chunk is never skipped, it is retried next pass; a pass is bounded to
@@ -15,11 +23,11 @@ scan_debridge_orders.py, ported):
     the pass scans up to the pool head, pinned to the endpoint that reported it — "no new blocks"
     and "I cannot see the chain" must never behave the same;
   * every NewLocalMessage naming OUR pubkey is deduped by (tx, logIndex), its receipt fetched and
-    the DLN FulfilledOrder log in the same receipt decoded → orderId → the deposit / quote; if the
-    id is unknown, the metadata tag (bytes[45:50] of rawOrderMetadataHex from the DLN stats API,
-    retried because DLN indexes with delay) is matched against `quotes.metadata`;
+    the router's FulfilledOrder log in the same receipt decoded → orderId → the deposit / quote; if the
+    id is unknown, the metadata tag (bytes[45:50] of rawOrderMetadataHex from the router's stats API,
+    retried because the router indexes with delay) is matched against `quotes.metadata`;
   * a receipt with NO FulfilledOrder log is not automatically foreign: a `direct` deposit (the
-    user called the pipe themselves on Ethereum, no DLN in the story) is looked up by its own
+    user called the pipe themselves on Ethereum, no cross-chain order in the story) is looked up by its own
     registered `src_tx_hash`. Only after that fails is the lock unattributed;
   * sanity before any state change: the lock's amount == the quote's value_units, the pipe is
     the asset's pipe, and for a `direct` deposit the receipt's `from` is the wallet that asked
@@ -37,7 +45,7 @@ from typing import Any
 from eth_abi import decode
 from eth_utils import keccak
 
-from . import dln, ethpipe, tg
+from . import ethpipe, tg, xchain
 from .assets import ASSETS, Asset
 from .config import settings
 from .db import db
@@ -50,7 +58,7 @@ ORDER_TUPLE = (
 FULFILLED_SIG = f"FulfilledOrder({ORDER_TUPLE},bytes32,uint256,address,address)"
 FULFILLED_TOPIC = "0x" + keccak(text=FULFILLED_SIG).hex()
 FULFILLED_TOPIC_EXPECTED = "0xc164aca37b9805a1c9027b6f32260a069723a82926f6e9ece4926e4dd3ea8ecf"
-# where DLN keeps the 5-byte `metadata` we sent, inside rawOrderMetadataHex
+# where the router keeps the 5-byte `metadata` we sent, inside rawOrderMetadataHex
 METADATA_TAG_SLICE = (45, 50)
 ZERO_TAG = "0x0000000000"
 POOL_AHEAD_BLOCKS = 50
@@ -65,6 +73,40 @@ RETRY_BACKOFF_S = 120.0
 RETRY_BACKOFF_MAX_S = 3600.0
 RETRY_MAX_TRIES = 12
 DEPOSIT_HASH_INDEX = "uniq_src_tx_hash"
+# an endpoint whose logs lag its own head is skipped for this long (prod: flashbots, every pass)
+ENDPOINT_COOLDOWN_S = 300.0
+_endpoints: dict[str, Any] = {"bad": {}, "sticky": None}
+
+
+def reset_endpoint_state() -> None:
+    """Forget which endpoints lagged (process state; tests and a restart start clean)."""
+    _endpoints["bad"] = {}
+    _endpoints["sticky"] = None
+
+
+def demote_endpoint(url: str | None, why: str) -> None:
+    if not url:
+        return
+    _endpoints["bad"][url] = time.time() + ENDPOINT_COOLDOWN_S
+    if _endpoints["sticky"] == url:
+        _endpoints["sticky"] = None
+
+
+def endpoint_candidates(rpc: ethpipe.Rpc) -> list[str]:
+    """The order to TRY endpoints in: the one that served last time first, then the rest, then
+    the demoted ones (a cooling endpoint is a last resort, never a dead one — a pass with no
+    healthy endpoint left must still try rather than skip the chain)."""
+    urls = list(getattr(rpc, "urls", None) or [])
+    if not urls:
+        return []
+    now = time.time()
+    bad = _endpoints["bad"]
+    fresh = [u for u in urls if bad.get(u, 0.0) <= now]
+    cooling = [u for u in urls if bad.get(u, 0.0) > now]
+    sticky = _endpoints["sticky"]
+    if sticky in fresh:
+        fresh = [sticky] + [u for u in fresh if u != sticky]
+    return fresh + cooling
 
 
 async def ensure_indexes() -> None:
@@ -148,11 +190,17 @@ def metadata_tag(raw_hex: str | None) -> str | None:
 # ----------------------------------------------------------------------------- head / checkpoint
 
 
-async def resolve_head(rpc: ethpipe.Rpc, checkpoint: int | None) -> tuple[int, str]:
-    """(head, the endpoint that vouched for it). The pool overrides a primary that reports no new
-    blocks while others are > POOL_AHEAD_BLOCKS ahead. The endpoint is never None: every read of
-    the range is pinned to whoever claimed to see it."""
-    head, endpoint = await rpc.head_from()
+async def resolve_head(
+    rpc: ethpipe.Rpc, checkpoint: int | None, prefer: str | None = None
+) -> tuple[int, str]:
+    """(head, the endpoint that vouched for it). With `prefer` the head comes from THAT endpoint
+    (pinned) — the scan then reads the range from the same node that claimed to see it. The pool
+    overrides a primary that reports no new blocks while others are > POOL_AHEAD_BLOCKS ahead.
+    The endpoint is never None: every read of the range is pinned to whoever claimed to see it."""
+    if prefer:
+        head, endpoint = await rpc.block_number(prefer=prefer, pin=True), prefer
+    else:
+        head, endpoint = await rpc.head_from()
     if checkpoint is not None and head <= checkpoint:
         heads = await rpc.pool_heads()
         if heads:
@@ -179,56 +227,118 @@ async def known_pubkeys(asset: Asset) -> set[str]:
 async def scan_pipe(
     asset: Asset, rpc: ethpipe.Rpc, max_chunks: int = MAX_CHUNKS_PER_PASS
 ) -> dict[str, Any]:
+    """One pass over one pipe. Bounded by max_chunks and by the number of endpoints: a chunk the
+    vouching endpoint cannot serve moves the pass to the NEXT endpoint at the same block, never
+    past it, and only an exhausted endpoint list ends the pass — with one warning that names
+    every endpoint tried and what it said."""
     pubkeys = await known_pubkeys(asset)
     if not pubkeys:
         return {"asset": asset.key, "skipped": "no pubkey configured"}
     st = await db().scanner_state.find_one({"_id": asset.pipe})
     checkpoint = int(st["last_block"]) if st else None
-    head, endpoint = await resolve_head(rpc, checkpoint)
-    start = checkpoint + 1 if checkpoint is not None else max(0, head - settings.lock_scan_blocks)
+    chunk = max(1, settings.lock_scan_chunk)
     stats: dict[str, Any] = {
         "asset": asset.key,
-        "from": start,
-        "head": head,
+        "from": None,
+        "head": None,
         "chunks": 0,
         "logs": 0,
         "locked": 0,
         "unattributed": 0,
         "failed": None,
-        "prefer": endpoint,
+        "prefer": None,
+        "unserved": [],
     }
-    cur = start
-    chunk = max(1, settings.lock_scan_chunk)
-    while cur <= head and stats["chunks"] < max_chunks:
-        end = min(cur + chunk - 1, head)
+    cur: int | None = None
+    end = 0
+    for candidate in endpoint_candidates(rpc) or [None]:
         try:
-            logs = await rpc.logs(
-                asset.pipe, [ethpipe.NEWLOCAL_TOPIC], cur, end, prefer=endpoint, pin=True
-            )
-            # the answer counts only if the endpoint that gave it actually has the blocks: a
-            # lagging node's empty answer must never become a checkpoint
-            seen_head = await rpc.block_number(prefer=endpoint, pin=True)
-            if seen_head < end:
-                raise ethpipe.RpcError(
-                    f"{endpoint} answered [{cur}, {end}] but its head is {seen_head} — "
-                    "the range is not readable there yet"
+            head, endpoint = await resolve_head(rpc, checkpoint, prefer=candidate)
+        except Exception as e:  # noqa: BLE001 — an endpoint that cannot even give a head is out
+            demote_endpoint(candidate, f"eth_blockNumber: {e}")
+            stats["unserved"].append({"url": candidate, "error": f"{type(e).__name__}: {e}"[:200]})
+            continue
+        stats["head"], stats["prefer"] = head, endpoint
+        if cur is None:
+            cur = checkpoint + 1 if checkpoint is not None else max(0, head - settings.lock_scan_blocks)
+            stats["from"] = cur
+        lagged = False
+        while cur <= head and stats["chunks"] < max_chunks:
+            end = min(cur + chunk - 1, head)
+            try:
+                # the endpoint that vouched for the head answers the range, or nothing does
+                logs = await rpc.logs(
+                    asset.pipe, [ethpipe.NEWLOCAL_TOPIC], cur, end, prefer=endpoint, pin=True
                 )
-            for lg in logs:
-                res = await handle_log(lg, asset, pubkeys, rpc, prefer=endpoint)
-                if res in ("locked", "unattributed"):
-                    stats[res] += 1
-        except Exception as e:  # noqa: BLE001 — a chunk that cannot be read is retried next pass, never skipped
-            stats["failed"] = {"from": cur, "to": end, "error": f"{type(e).__name__}: {e}"}
-            log.warning("scan %s [%d, %d] failed: %s", asset.key, cur, end, e)
+                # ... and the answer counts only if it still has the blocks: a lagging node's
+                # empty answer must never become a checkpoint
+                seen_head = await rpc.block_number(prefer=endpoint, pin=True)
+                if seen_head < end:
+                    raise ethpipe.RpcError(
+                        f"{endpoint} answered [{cur}, {end}] but its head is {seen_head} — "
+                        "the range is not readable there yet",
+                        url=endpoint,
+                        code=-32602,
+                    )
+            except Exception as e:  # noqa: BLE001 — WHY it failed decides what happens next
+                if ethpipe.cannot_serve(e):
+                    # this endpoint will not serve the range (its logs are behind the head it
+                    # just claimed, or it caps the range, or the blocks are behind a plan wall):
+                    # try the next one FROM THIS VERY BLOCK. Nothing skipped, nothing
+                    # checkpointed, and the failure is never read as "no locks".
+                    demote_endpoint(endpoint, str(e))
+                    stats["unserved"].append(
+                        {"url": endpoint, "error": f"{type(e).__name__}: {e}"[:200]}
+                    )
+                    lagged = True
+                    break
+                stats["failed"] = {"from": cur, "to": end, "error": f"{type(e).__name__}: {e}"}
+                break
+            try:
+                for lg in logs:
+                    res = await handle_log(lg, asset, pubkeys, rpc, prefer=endpoint)
+                    if res in ("locked", "unattributed"):
+                        stats[res] += 1
+            except Exception as e:  # noqa: BLE001 — a chunk that cannot be read is retried next pass, never skipped
+                stats["failed"] = {"from": cur, "to": end, "error": f"{type(e).__name__}: {e}"}
+                break
+            await db().scanner_state.update_one(
+                {"_id": asset.pipe},
+                {"$set": {"last_block": end, "at": time.time(), "asset": asset.key}},
+                upsert=True,
+            )
+            _endpoints["sticky"] = endpoint  # start here next time
+            stats["chunks"] += 1
+            stats["logs"] += len(logs)
+            cur = end + 1
+        if not lagged:
             break
-        await db().scanner_state.update_one(
-            {"_id": asset.pipe},
-            {"$set": {"last_block": end, "at": time.time(), "asset": asset.key}},
-            upsert=True,
+    else:
+        # no endpoint would serve the range (lag, a cap, a plan wall, or no head at all)
+        if stats["unserved"]:
+            why = "; ".join(f"{r['url']}: {r['error']}" for r in stats["unserved"])
+            stats["failed"] = {
+                "from": cur if cur is not None else checkpoint,
+                "to": end,
+                "error": f"no endpoint could serve the range — {why}",
+            }
+    if stats["failed"]:  # ONE line per pass, naming what was tried
+        log.warning(
+            "scan %s [%s, %s] failed on %s: %s",
+            asset.key,
+            stats["failed"]["from"],
+            stats["failed"]["to"],
+            stats["prefer"] or "no endpoint",
+            stats["failed"]["error"],
         )
-        stats["chunks"] += 1
-        stats["logs"] += len(logs)
-        cur = end + 1
+    elif stats["unserved"]:
+        log.info(
+            "scan %s served by %s after %d endpoint(s) refused the range: %s",
+            asset.key,
+            stats["prefer"],
+            len(stats["unserved"]),
+            "; ".join(r["url"] or "?" for r in stats["unserved"]),
+        )
     stats["checkpoint"] = cur - 1 if stats["chunks"] else checkpoint
     return stats
 
@@ -280,7 +390,7 @@ async def attribute(
     """→ (doc, 'deposit'|'quote', reason). doc is None when nothing can be attributed."""
     d = db()
     if not fulfilled:
-        # No DLN fill in this receipt. A `direct` deposit IS the pipe call, so the transaction the
+        # No cross-chain fill in this receipt. A `direct` deposit IS the pipe call, so the transaction the
         # client registered is the transaction we are looking at — that hash plus the sender is
         # the whole claim.
         dep = await d.deposits.find_one(
@@ -291,7 +401,7 @@ async def attribute(
                 dep, int(dep["eth"]["value_units"]), m, asset
             )
             return (None, "deposit", why) if why else (dep, "deposit", "")
-        return None, "", "no FulfilledOrder log in the receipt (not a DLN fill)"
+        return None, "", "no FulfilledOrder log in the receipt (not a cross-chain fill)"
     order_ids = [f["order_id"] for f in fulfilled]
     for oid in order_ids:
         dep = await d.deposits.find_one({"order_id": oid})
@@ -304,7 +414,7 @@ async def attribute(
             return (None, "quote", why) if why else (q, "quote", "")
     for attempt in range(max(1, retries)):
         for oid in order_ids:
-            lm = await dln.lite_model(oid)
+            lm = await xchain.lite_model(oid)
             tag = metadata_tag((lm or {}).get("rawOrderMetadataHex"))
             if not tag or tag == ZERO_TAG:
                 continue
@@ -478,7 +588,7 @@ async def retry_unattributed(
     page: int = RETRY_PAGE,
     max_rows: int = RETRY_MAX_ROWS,
 ) -> int:
-    """Re-attempt open unattributed locks (DLN's indexing lag is the usual cause), OLDEST FIRST
+    """Re-attempt open unattributed locks (the router's indexing lag is the usual cause), OLDEST FIRST
     and backed off per row, paging until the due rows run out. An un-sorted, un-aged window of
     20 could be filled forever by rows that will never attribute, and starve a recoverable one.
     No sleeps here."""

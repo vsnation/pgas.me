@@ -1,4 +1,10 @@
-/* Pgas.me — design tokens and layout. Light and dark via prefers-color-scheme. */
+/* Pgas.me — design tokens and layout.
+ *
+ * Light is the base palette on bare `:root`. Dark is stated TWICE on purpose:
+ *   1. under `prefers-color-scheme`, guarded by `:not([data-theme='light'])`, so the page is right
+ *      in the milliseconds before lib/theme.ts runs and an explicit Light choice still wins;
+ *   2. under `[data-theme='dark']`, which is what the header's sun/moon switch actually sets.
+ * Never give a colour its only definition inside one of those blocks. */
 :root {
   --bg: #f4f6fa;
   --surface: #ffffff;
@@ -27,7 +33,7 @@
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme='light']) {
     --bg: #0f1319;
     --surface: #161b24;
     --surface-2: #1c2230;
@@ -48,6 +54,27 @@
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px -12px rgba(0, 0, 0, 0.6);
     color-scheme: dark;
   }
+}
+:root[data-theme='dark'] {
+  --bg: #0f1319;
+  --surface: #161b24;
+  --surface-2: #1c2230;
+  --ink: #e8ecf3;
+  --muted: #9aa5b8;
+  --line: #2a3342;
+  --teal: #3fc4b8;
+  --teal-ink: #0f1319;
+  --teal-soft: rgba(63, 196, 184, 0.14);
+  --indigo: #8296ff;
+  --indigo-soft: rgba(130, 150, 255, 0.14);
+  --magenta: #e06ac4;
+  --magenta-soft: rgba(224, 106, 196, 0.14);
+  --amber: #e5a04a;
+  --amber-soft: rgba(229, 160, 74, 0.16);
+  --red: #ef6b6d;
+  --red-soft: rgba(239, 107, 109, 0.14);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px -12px rgba(0, 0, 0, 0.6);
+  color-scheme: dark;
 }
 
 * {
@@ -197,9 +224,14 @@ textarea {
 }
 @media (max-width: 560px) {
   .grid-2,
-  .grid-3,
-  .grid-4 {
+  .grid-3 {
     grid-template-columns: 1fr;
+  }
+  /* the four balance tiles stay two-up on a phone: one-up pushed the timeline a whole screen
+     down, and the numbers are short enough to share a row */
+  .grid-4 {
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
   }
 }
 .stack {
@@ -292,35 +324,23 @@ textarea {
   gap: 8px;
 }
 @media (max-width: 860px) {
-  /* static on small screens: three rows would eat a quarter of the viewport if they stuck */
-  .header {
-    position: static;
-  }
+  /* One row on a phone: the logo, the theme switch and the account pill. The tabs move to the
+     bottom bar, where a thumb reaches them, so the header can stay sticky without eating the
+     screen (it used to wrap into three rows and did not stick at all). */
   .header-inner {
-    flex-wrap: wrap;
-    padding: 10px 0 6px;
-    gap: 8px 10px;
+    min-height: 56px;
+    gap: 10px;
   }
   .brand {
     flex: 1;
+    font-size: 18px;
   }
-  .header-right {
-    flex-basis: 100%;
-    flex-wrap: wrap;
-    justify-content: flex-start;
-    margin-left: 0;
+  .brand-logo {
+    width: 30px;
+    height: 30px;
   }
   .nav {
-    order: 3;
-    width: 100%;
-    margin-left: 0;
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-  }
-  .nav-tab {
-    white-space: nowrap;
-    padding: 7px 9px;
-    font-size: 14px;
+    display: none;
   }
 }
 
@@ -385,6 +405,12 @@ textarea {
   border-color: var(--line);
   background: transparent;
 }
+/* the muted line(s) under a status pill: a deposit note, a payout hold reason, a progress hint */
+.status-sub {
+  white-space: normal;
+  max-width: 260px;
+  margin-top: 3px;
+}
 
 /* ---------- buttons ---------- */
 .btn {
@@ -414,6 +440,15 @@ textarea {
 .btn:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+/* A primary button at 55 % opacity still reads as a solid, pressable teal on the dark theme's dark
+   ground — the Schedule button looked live while it was refusing every click. Mixing it INTO the
+   surface (rather than fading it) says "not now" in both themes. */
+.btn-primary:disabled {
+  opacity: 1;
+  background: color-mix(in srgb, var(--teal) 32%, var(--surface));
+  border-color: color-mix(in srgb, var(--teal) 32%, var(--surface));
+  color: var(--muted);
 }
 .btn-primary {
   background: var(--teal);
@@ -1098,45 +1133,13 @@ table.data th.num {
   color: var(--muted);
 }
 
-/* ---------- key box (generated wallet) ---------- */
-.key-box {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 8px;
-  align-items: start;
-  padding: 10px 12px;
-  border: 1px dashed var(--line);
-  border-radius: var(--radius-sm);
-  background: var(--surface-2);
-  font-family: var(--font-mono);
-  font-size: 13px;
-  overflow-wrap: anywhere;
-}
-
-/* ---------- stats footer ---------- */
+/* ---------- footer ---------- */
 .footer {
   border-top: 1px solid var(--line);
   background: var(--surface);
   padding: 16px 0 24px;
   font-size: 13px;
   color: var(--muted);
-}
-.stats-strip {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 24px;
-  align-items: center;
-}
-.stat {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
-}
-.stat b {
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-  color: var(--ink);
-  font-weight: 500;
 }
 .footer-note {
   margin-top: 10px;
@@ -1194,36 +1197,73 @@ details.plain summary {
   font-size: 13px;
   overflow-wrap: anywhere;
 }
-.badge-kind {
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  padding: 2px 7px;
-  border-radius: 6px;
+
+/* ---------- schedule rows ---------- */
+/* One order per row. The address gets a line of its own — it is 42 characters and the thing most
+   likely to be wrong — with the remove button beside it; amount and delivery time share the next
+   line; the "to the bridge at …" hint spans underneath. Narrow screens stack amount and time. */
+.sched-row {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr) 36px;
+  gap: 8px 12px;
+  align-items: start;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
 }
-.kind-connected {
-  background: var(--indigo-soft);
-  color: var(--indigo);
+.sched-row:last-child {
+  border-bottom: 0;
 }
-.kind-proven {
-  background: var(--amber-soft);
-  color: var(--amber);
+.sched-row .sched-addr {
+  grid-column: 1 / 3;
+  grid-row: 1;
 }
-.kind-generated {
-  background: var(--teal-soft);
-  color: var(--teal);
+.sched-row .sched-rm {
+  grid-column: 3;
+  grid-row: 1;
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 4px;
 }
-.bal-line {
-  display: inline-flex;
-  gap: 6px;
-  align-items: baseline;
-  font-size: 12.5px;
+.sched-row .sched-amt {
+  grid-column: 1;
+  grid-row: 2;
 }
-.bal-line b {
+.sched-row .sched-when {
+  grid-column: 2 / 4;
+  grid-row: 2;
+}
+.sched-row .sched-foot {
+  grid-column: 1 / -1;
+}
+.sched-row .input.mono {
   font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-  font-weight: 500;
+  font-size: 13px;
+}
+.sched-row .help,
+.sched-row .error-text {
+  overflow-wrap: anywhere;
+}
+@media (max-width: 640px) {
+  .sched-row {
+    grid-template-columns: minmax(0, 1fr) 36px;
+  }
+  .sched-row .sched-addr {
+    grid-column: 1;
+  }
+  .sched-row .sched-rm {
+    grid-column: 2;
+  }
+  .sched-row .sched-amt {
+    grid-column: 1 / -1;
+    grid-row: auto;
+  }
+  .sched-row .sched-when {
+    grid-column: 1 / -1;
+    grid-row: auto;
+  }
+}
+.row-new > td {
+  background: var(--teal-soft);
 }
 @media (max-width: 560px) {
   .card {
@@ -1234,5 +1274,305 @@ details.plain summary {
   }
   .tile-value {
     font-size: 22px;
+  }
+}
+
+/* ---------- theme switch ---------- */
+.theme-toggle {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  color: var(--muted);
+  flex: none;
+}
+.theme-toggle:hover:not(:disabled) {
+  color: var(--ink);
+  background: var(--surface-2);
+}
+
+/* ---------- the account pill and its menu ---------- */
+/* One control where three chips and a Disconnect button used to sit: the chain is the dot, the
+   address is the label, and everything else is one tap away. */
+.acct {
+  position: relative;
+}
+.acct-pill {
+  cursor: pointer;
+  max-width: 190px;
+}
+.acct-pill .mono {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.acct-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 40;
+  min-width: 230px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+/* ---------- bottom tab bar (phones) ---------- */
+.tabbar {
+  display: none;
+}
+@media (max-width: 860px) {
+  .tabbar {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 4px;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 30;
+    background: color-mix(in srgb, var(--bg) 94%, transparent);
+    backdrop-filter: blur(10px);
+    border-top: 1px solid var(--line);
+    padding: 6px 10px calc(6px + env(safe-area-inset-bottom));
+  }
+  .tabbar-tab {
+    border: 0;
+    background: transparent;
+    padding: 9px 6px;
+    border-radius: var(--radius-sm);
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .tabbar-tab.active {
+    color: var(--teal);
+    background: var(--teal-soft);
+  }
+  /* the bar is fixed, so the last thing on the page needs room to clear it */
+  .footer {
+    padding-bottom: calc(70px + env(safe-area-inset-bottom));
+  }
+  /* and the page ends above BOTH fixed things: the tab bar, and the totals bar floating over it */
+  .main {
+    padding-bottom: calc(112px + env(safe-area-inset-bottom));
+  }
+}
+
+/* ---------- how it works ---------- */
+.steps {
+  margin: 0;
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 14px;
+}
+.steps li::marker {
+  color: var(--teal);
+  font-weight: 700;
+}
+
+/* ---------- balance tiles / timeline ---------- */
+.tile-usd {
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  color: var(--muted);
+}
+.timeline-table .tl-row {
+  cursor: pointer;
+}
+.timeline-table .tl-row:hover > td,
+.timeline-table .tl-row.open > td {
+  background: var(--surface-2);
+}
+.timeline-table .tl-row:focus-visible {
+  outline: 2px solid var(--indigo);
+  outline-offset: -2px;
+}
+.timeline-table .tl-detail > td {
+  background: var(--surface-2);
+  white-space: normal;
+  padding: 12px 14px;
+}
+
+/* ---------- "Pay with": one picker, chain badge and all ---------- */
+.pay-with-btn {
+  min-height: 46px;
+}
+.pay-with-btn .pw-icons {
+  position: relative;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+}
+.pay-with-btn .pw-icons img,
+.pay-with-btn .pw-icons .logo-fallback {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+}
+.pay-with-btn .pw-chain-badge {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--bg);
+  border: 1.5px solid var(--surface);
+  box-sizing: content-box;
+}
+.pw-on {
+  margin-left: auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pw-chains {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+  scrollbar-width: thin;
+}
+.pw-chain {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: inherit;
+  font-size: 12.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.pw-chain img {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+}
+.pw-chain.active {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+  color: var(--teal);
+  font-weight: 600;
+}
+
+/* ---------- schedule: the totals a phone keeps in view ---------- */
+.sticky-totals {
+  display: none;
+}
+@media (max-width: 860px) {
+  /* Off while the Totals card is on screen: the bar is that card's numbers, and drawing it over
+     them is how it came to sit on top of "Total debited" (screen review 2026-09-10). */
+  .sticky-totals.sticky-totals-off {
+    display: none;
+  }
+  .sticky-totals {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    position: sticky;
+    bottom: calc(64px + env(safe-area-inset-bottom));
+    z-index: 10;
+    padding: 10px 14px;
+    font-size: 13px;
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow);
+  }
+}
+
+/* ---------- "Paste a list" (Schedule) ---------- */
+/* The preview is a table in list clothing: one line per pasted entry, its mark first so a run of
+   ✓ reads as a column and the one ✗ in the middle of it cannot be missed. */
+.paste-actions {
+  gap: 8px;
+  padding: 0 14px 4px;
+}
+.paste-panel {
+  padding: 0 14px 12px;
+}
+.paste-panel .textarea {
+  font-size: 13px;
+  min-height: 120px;
+  resize: vertical;
+}
+.paste-head {
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.paste-replace {
+  gap: 6px;
+  align-items: center;
+  cursor: pointer;
+  color: var(--muted);
+}
+.paste-lines {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 320px;
+  /* x hidden explicitly: `overflow-y: auto` alone computes overflow-x to `auto`, which let the
+     status column scroll off the right edge instead of wrapping ("duplicate address · below the"). */
+  overflow: hidden auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.paste-lines li {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1.3fr) auto minmax(0, 1fr);
+  gap: 4px 8px;
+  align-items: baseline;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.paste-lines li > span {
+  overflow-wrap: anywhere;
+}
+.paste-lines li:last-child {
+  border-bottom: 0;
+}
+.paste-lines li[data-status='error'] {
+  background: var(--red-soft);
+}
+.paste-lines li[data-status='warn'] {
+  background: var(--amber-soft);
+}
+.paste-addr {
+  overflow-wrap: anywhere;
+}
+.paste-mark {
+  font-weight: 700;
+}
+.paste-mark.paste-ok {
+  color: var(--teal);
+}
+.paste-mark.paste-warn {
+  color: var(--amber);
+}
+.paste-mark.paste-error {
+  color: var(--red);
+}
+@media (max-width: 640px) {
+  .paste-lines li {
+    grid-template-columns: 18px minmax(0, 1fr) auto;
+  }
+  .paste-lines li > :last-child {
+    grid-column: 2 / -1;
   }
 }

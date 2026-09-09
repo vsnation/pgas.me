@@ -1,7 +1,7 @@
 """The bridgeable target assets, their pipes, and their USD prices.
 
 Mainnet addresses verified 2026-09-09 from the founder's live bridge code. A deposit lands on
-Ethereum as one of these and the DLN hook calls THAT asset's pipe; the balance is kept per
+Ethereum as one of these and the cross-chain hook calls THAT asset's pipe; the balance is kept per
 asset (bETH / bDAI / bWBTC), 8 decimals on Beam. USDT is deliberately not offered (Tether
 blacklist risk on the pipe). Prices (CoinGecko, cached 5 min) serve ONLY the minimum-deposit
 comparison; a price failure raises PriceError and the caller decides (the quote route allows

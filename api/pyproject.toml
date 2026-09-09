@@ -1,7 +1,7 @@
 [project]
 name = "pgasme-api"
 version = "0.1.0"
-description = "Pgas.me backend — sign-in with Ethereum, destinations, deBridge ingress into the Beam bridge, custodial balance ledger"
+description = "Pgas.me backend — sign-in with Ethereum, destinations, ingress into the Beam bridge, custodial balance ledger"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115,<1",

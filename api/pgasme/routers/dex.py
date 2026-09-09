@@ -1,4 +1,4 @@
-"""Public proxies of deBridge (chains, tokens) and our own asset table.
+"""Public proxies of the cross-chain order router (chains, tokens) and our own asset table.
 
 Balances are read CLIENT-SIDE (batch-balance view contracts, §6.0b); the backend only tells the
 client which contract to call on which chain."""
@@ -7,8 +7,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
-from .. import dln
+from .. import xchain
 from ..assets import ASSETS
+from ..config import LEGACY_CHAIN_ID_FIELD
 
 router = APIRouter(tags=["dex"])
 
@@ -25,7 +26,7 @@ BATCH_BALANCE = {
     59144: "0x0e4AdD4DC86Ae1Aa0FA43Bd7e6a9fB8Be2d5504d",
 }
 
-# DLN does not return the native symbol; a small table for the EVM chains we know
+# the router does not return the native symbol; a small table for the EVM chains we know
 NATIVE_SYMBOL = {
     1: "ETH",
     10: "ETH",
@@ -48,16 +49,16 @@ NATIVE_SYMBOL = {
 }
 
 
-def _dln_error(e: dln.DlnError) -> HTTPException:
-    return HTTPException(400 if e.status and 400 <= e.status < 500 else 502, f"deBridge: {e}")
+def _xchain_error(e: xchain.XchainError) -> HTTPException:
+    return HTTPException(400 if e.status and 400 <= e.status < 500 else 502, f"cross-chain router: {e}")
 
 
 @router.get("/v1/dex/chains")
 async def chains():
     try:
-        rows = await dln.supported_chains()
-    except dln.DlnError as e:
-        raise _dln_error(e) from e
+        rows = await xchain.supported_chains()
+    except xchain.XchainError as e:
+        raise _xchain_error(e) from e
     out = []
     for c in rows:
         try:
@@ -67,7 +68,10 @@ async def chains():
             continue
         row = {
             "chain_id": evm,
-            "dln_chain_id": internal,
+            "route_chain_id": internal,
+            # the field's older name, emitted alongside for one release so a client built
+            # before the rename keeps resolving chains. `route_chain_id` is the one of record.
+            LEGACY_CHAIN_ID_FIELD: internal,
             "name": c.get("chainName") or str(evm),
             "native_symbol": NATIVE_SYMBOL.get(evm, ""),
         }
@@ -80,10 +84,10 @@ async def chains():
 @router.get("/v1/dex/tokens")
 async def tokens(chain_id: int = Query(..., description="EVM (original) chain id")):
     try:
-        internal = await dln.dln_chain_id(chain_id)
-        rows = await dln.token_list(internal)
-    except dln.DlnError as e:
-        raise _dln_error(e) from e
+        internal = await xchain.route_chain_id(chain_id)
+        rows = await xchain.token_list(internal)
+    except xchain.XchainError as e:
+        raise _xchain_error(e) from e
     out = []
     for t in rows:
         addr = t.get("address")

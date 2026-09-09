@@ -1,47 +1,53 @@
-// Wraps the locked pages: renders children once signed in, otherwise the connect / sign-in step.
+// Wraps the locked pages: renders children once signed in, otherwise the smallest true thing.
+//
+// Screen review 2026-09-09: signing in now happens by itself the moment the wallet connects, so
+// this is no longer a step in the normal path — it is what is left when there is no wallet yet (one
+// line, and the header's Connect button is the only Connect button on the screen), while the
+// signature is being waited for (one line), or when the user said no (the card, with the retry).
 import type { ReactNode } from 'react';
 import { shortAddr } from '../lib/format';
 import { useStore } from '../state/store';
 
-export function SignInGate({ children, what = 'this page' }: { children: ReactNode; what?: string }) {
+export function SignInGate({
+  children,
+  what = 'this page',
+  verb = 'see',
+}: {
+  children: ReactNode;
+  what?: string;
+  /** "…to <verb> <what>": get a quote, see your balance, schedule payouts. */
+  verb?: string;
+}) {
   const { wallet, session } = useStore();
   if (session.session) return <>{children}</>;
-  const What = what[0].toUpperCase() + what.slice(1);
+
+  if (!wallet.address) {
+    return (
+      <p className="muted small" data-testid="sign-in-gate">
+        Connect your wallet to {verb} {what}.
+      </p>
+    );
+  }
+  if (session.signingIn) {
+    return (
+      <p className="muted small" data-testid="sign-in-gate">
+        Waiting for your signature in the wallet…
+      </p>
+    );
+  }
   return (
     <div className="card" data-testid="sign-in-gate">
       <div className="stack">
-        <h2>{wallet.address ? 'Sign in with wallet' : 'Connect a wallet'}</h2>
-        {session.expired && (
-          <div className="banner banner-warn" role="status">
-            Your session expired. Sign in again to continue.
-            <button type="button" className="link-btn" onClick={session.dismissExpired}>
-              Dismiss
-            </button>
-          </div>
-        )}
-        <p className="muted">
-          {wallet.address
-            ? `${What} belongs to the signed-in wallet. Sign a message with ${shortAddr(wallet.address)} — it costs nothing and moves nothing.`
-            : `Connect an injected wallet to see ${what}. The account is the wallet: no seed phrase, no email.`}
-        </p>
+        <h2>
+          Sign in to {verb} {what}
+        </h2>
+        <p className="muted">Sign a message with {shortAddr(wallet.address)}. It is free and moves nothing.</p>
         <div className="row">
-          {wallet.address ? (
-            <button
-              type="button"
-              className="btn btn-primary"
-              disabled={session.signingIn}
-              onClick={() => session.signIn().catch(() => undefined)}
-            >
-              {session.signingIn ? 'Waiting for the signature…' : 'Sign in with wallet'}
-            </button>
-          ) : (
-            <button type="button" className="btn btn-primary" onClick={wallet.openPicker}>
-              Connect wallet
-            </button>
-          )}
+          <button type="button" className="btn btn-primary" onClick={() => session.signIn().catch(() => undefined)}>
+            Sign in with wallet
+          </button>
         </div>
         {session.signInError && <p className="error-text">{session.signInError}</p>}
-        {wallet.error && !wallet.address && <p className="error-text">{wallet.error}</p>}
       </div>
     </div>
   );

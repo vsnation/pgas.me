@@ -20,11 +20,17 @@ from typing import Any
 from pymongo.errors import DuplicateKeyError
 
 from .assets import ASSETS
-from .db import db
+from .db import _ensure, db
 
 KINDS = ("credit", "schedule", "release", "fee", "cancel", "refund", "adjust")
 # one credit per ref, enforced by the database and not by a read-then-write
 CREDIT_REF_INDEX = "uniq_credit_ref"
+# …and one `release` and one `fee` per ref, for the same reason: the release path was a
+# read-then-write with no database guard at all, so two processors that both saw the payout
+# unbooked would both debit the account for it. ONE INDEX PER KIND — see ensure_indexes().
+RELEASE_REF_INDEX = "uniq_release_ref"
+FEE_REF_INDEX = "uniq_fee_ref"
+RELEASE_KINDS = ("release", "fee")
 
 
 class AlreadyCredited(RuntimeError):
@@ -39,12 +45,44 @@ class AlreadyRefunded(RuntimeError):
 async def ensure_indexes() -> None:
     """The ledger's own guarantees. Called at worker start (db.ensure_indexes owns the rest):
     a second `credit` for one ref is refused by the DATABASE, so two racing writers cannot both
-    pass a has_credit() read and both append."""
-    await db().entries.create_index(
+    pass a has_credit() read and both append.
+
+    ⛔ **A partial index filter is not a query.** `partialFilterExpression` accepts only
+    equality, `$exists: true`, `$type`, the range operators and a top-level `$and`; **`$in` is
+    supported only from MongoDB 6.0** and PRODUCTION RUNS 5.0, which answers
+    `CannotCreateIndex (67) … unsupported expression in partial index` — proved on mongod
+    5.0.29. This function runs at worker start and its failure is reported through
+    `/v1/health.indexes_ok`, which `deploy.sh` refuses a deploy on: one `$in` here is a boot
+    failure and a blocked deploy, not a slow query.
+
+    So `release` and `fee` get ONE INDEX EACH with an equality filter. The two also carry
+    DIFFERENT key patterns — 5.0.29 does accept two partial indexes on one key pattern that
+    differ only by their filter, but the documented restriction says it may not, and the fee
+    guard loses nothing by indexing `ref` alone: its filter already pins the kind, so
+    "unique on ref within kind=fee" IS "one fee per ref".
+
+    Created here with db._ensure, the one implementation that repairs an index whose options
+    changed (IndexOptionsConflict 85 / IndexKeySpecsConflict 86) instead of raising at boot."""
+    await _ensure(
+        db().entries,
         [("kind", 1), ("ref", 1)],
         unique=True,
         partialFilterExpression={"kind": "credit"},
         name=CREDIT_REF_INDEX,
+    )
+    await _ensure(
+        db().entries,
+        [("ref", 1), ("kind", 1)],
+        unique=True,
+        partialFilterExpression={"kind": "release"},
+        name=RELEASE_REF_INDEX,
+    )
+    await _ensure(
+        db().entries,
+        [("ref", 1)],
+        unique=True,
+        partialFilterExpression={"kind": "fee"},
+        name=FEE_REF_INDEX,
     )
 
 
@@ -112,10 +150,29 @@ async def schedule(
 async def release(
     account_id: str, asset: str, groth: int, fee_groth: int, ref: str, note: str = ""
 ) -> list[dict[str, Any]]:
-    """A payout went out: Scheduled -= amount + fee; Sent += amount; the fee leaves the account."""
-    a = await _append(account_id, asset, "release", groth, 0, -groth, groth, ref, note)
-    f = await _append(account_id, asset, "fee", fee_groth, 0, -fee_groth, 0, ref, "2% at unlock")
-    return [a, f]
+    """A payout went out: Scheduled -= amount + fee; Sent += amount; the fee leaves the account.
+
+    ⛔ ONE UNIT, EVEN THOUGH IT IS TWO ENTRIES. These were two unguarded appends and the caller
+    guarded on the first alone: when the `fee` append failed (a Mongo blip, a step-down) the
+    `release` entry existed, every later pass short-circuited on it, and the 2% sat in the
+    account's Scheduled bucket forever — money the user could neither spend nor get back.
+
+    So each half carries its own database guard (`RELEASE_REF_INDEX` · `FEE_REF_INDEX`) and it is
+    idempotent PER KIND: it appends whichever half is missing and refuses a second of either.
+    A partial write is repaired by the next call instead of being declared finished."""
+    out: list[dict[str, Any]] = []
+    halves = (
+        ("release", int(groth), -int(groth), int(groth), note),
+        ("fee", int(fee_groth), -int(fee_groth), 0, "2% at unlock"),
+    )
+    for kind, amount, d_sched, d_sent, why in halves:
+        if await find_entry(kind, ref):
+            continue
+        try:
+            out.append(await _append(account_id, asset, kind, amount, 0, d_sched, d_sent, ref, why))
+        except DuplicateKeyError:
+            continue  # another writer got there first; the entry exists, which is what matters
+    return out
 
 
 async def cancel(

@@ -1,90 +1,109 @@
 # Pgas.me
 
-**Private gas funding for fresh EVM wallets, settled on Beam.**
+**Private gas for fresh EVM wallets, settled on Beam.**
 
-On a public ledger every wallet is permanently linked to the wallet that funded it. There are
-two ways to put gas into a new address today: send from a wallet you already control (links the
-two forever) or withdraw from an exchange (ties the address to a KYC identity). Pgas.me is the
-third way: pay any token on any chain once, and later — whenever you choose — fund fresh wallets
-with ETH that has no on-chain path back to the source.
+On a public ledger a new wallet is tied forever to whatever funded it. There are two ordinary ways
+to put gas into one: send from a wallet you already control (links the two permanently) or withdraw
+from an exchange (ties the address to a KYC identity). Pgas.me is a third way: pay once with a token
+you already hold, then have ETH show up in any set of fresh wallets, at the times you choose, with
+no on-chain path back to what you paid with.
 
-The value crosses into **Beam** (Mimblewimble: no addresses on-chain, blinded amounts,
-confidential assets) through the Beam ⇄ Ethereum bridge, is shielded there, and comes back out
-through the same bridge into the wallets you tick.
+The value crosses into **Beam** — Mimblewimble: no addresses on chain, blinded amounts, confidential
+assets — through the Beam ⇄ Ethereum bridge, is shielded there, and comes back out through the same
+bridge into the wallets you listed.
 
-Built for a hackathon. Status: **the site, wallet sign-in, portfolio, wallet manager and the
-deposit/withdraw flows are live; deposits open once the first small real bridge crossings have
-been validated; payouts run from a bridge-funded float.**
+Built for a hackathon. Status: the site, wallet sign-in, portfolio, balance and the scheduler are
+live; the Uniswap V4 hook ingress is the build in progress. Every money-moving path stays behind an
+explicit arm flag until it has been proven with tiny real amounts.
 
 ## How it works
 
-### One deposit, end to end
+![One deposit, end to end](docs/scheme-topology.png)
 
-![Topology](docs/scheme-topology.png)
+1. **Connect a wallet and sign in.** The account *is* the wallet (Sign-In with Ethereum) — no seed
+   phrase, no email, no password. The app reads your portfolio on every EVM chain it supports, one
+   batch-balance call per chain, and shows your top holdings as tap-to-pay chips.
+2. **Deposit: pay any token on Ethereum.** One **Uniswap V4** swap whose **Pgas hook** locks the
+   output into the Beam bridge in the same transaction — ETH by default, DAI or WBTC if you would
+   rather bring those. One signature, one transaction: the hook forwards the swap output into the
+   bridge pipe itself, so nothing is ever left sitting in an intermediate address, and a hook that
+   reverts reverts the whole swap.
+3. **The bridge relayer mints the confidential asset on Beam.** Pgas.me claims it into its
+   BeamPay-managed wallet, shields it into the Lelantus pool as max-privacy outputs, and credits
+   your balance: **Arriving · Available · Scheduled · Paid out**.
+4. **Schedule the payouts.** Paste the wallets and amounts — one per line, or Disperse-style
+   `address:amount;address:amount` — and pick when each one should arrive. Pgas.me hands each order
+   to the Beam bridge 66 minutes ahead of the time you asked for, so the ETH is there when you said,
+   not whenever a queue drains.
+5. **Each wallet is paid from the bridge.** Its first inbound comes from the Beam bridge contract,
+   not from you and not from an exchange.
 
-1. **Connect a wallet and sign in.** The account *is* the wallet (Sign-In with Ethereum). No seed
-   phrase, no email. The app shows your portfolio across every supported chain — one batch
-   balance call per chain.
-2. **Pay any asset.** A [deBridge DLN](https://debridge.com) order moves it to Ethereum as the
-   target asset (ETH by default; DAI or WBTC to bring liquidity). The order carries a **hook**
-   that calls the Beam bridge contract of that asset in the same transaction, so the ETH is
-   locked in the bridge the moment the solver fills the order. If the hook ever fails, deBridge
-   delivers to your own wallet — never to us.
-3. **The bridge relayer mints the confidential asset on Beam**; Pgas.me claims it and credits your
-   balance. You see *Pending · Available · Scheduled · Sent* at all times.
-4. **Register the wallets you want to fund**: generate fresh ones in the browser (the key is shown
-   once and never stored by Pgas.me) or prove control of existing ones by signing a message —
-   an off-chain signature, so a wallet with zero gas can sign.
-5. **Withdraw whenever you want.** Tick wallets, set an amount per wallet, pick a window. In
-   *direct* mode the Beam bridge pays each wallet itself (one crossing per wallet); in *instant*
-   mode a bridge-funded distributor pays within a minute. The 2% fee is charged at unlock, so the
-   payout is always a whole amount.
+The fee is **2 %**, taken from your balance. The bridge fee is paid by Pgas.me, so each wallet
+receives exactly the amount you typed.
 
-### What the user does
+## What the user does
 
-![User steps](docs/scheme-user-steps.png)
+![What the user does, step by step](docs/scheme-user-steps.png)
 
-### What the platform does
+Destinations are just addresses. There is **no wallet generation** and **no signature to prove a
+destination** — you paste an address, and the only check is its EIP-55 checksum, which catches the
+one class of typo a checksum can actually catch. Every wallet you list becomes its own order with
+its own status: `scheduled → releasing → bridging → delivering → sent`.
 
-![Platform sequence](docs/scheme-platform-sequence.png)
+## What the platform does
 
-### The balance you see
+![What the platform does, step by step](docs/scheme-platform-sequence.png)
 
-![Balance model](docs/scheme-balance.png)
+Deposits are watched on chain, not trusted from the client: the pipe's own lock event is matched to
+the swap that produced it in the same receipt, and the checkpoint never advances past a chunk that
+failed. Balances are **sums over an append-only ledger**, never stored numbers. Every step emits a
+Telegram event, and an independent watchdog runs outside the API process, so a stuck worker is
+noticed by something that is not the stuck worker.
 
-## Honest privacy
+## Balance model
+
+![The balance the user sees](docs/scheme-balance.png)
+
+Four states, always visible, named for what the money is doing rather than which bucket it sits in.
+Custodial in this version: the platform's Beam wallet holds the asset behind a BeamPay ledger with
+one address per deposit, and the account that sums its own entries is the wallet you signed in with —
+so the same balance appears on any device you connect that wallet from.
+
+## Who sees what
 
 Pgas.me does not claim privacy it cannot deliver. This is what each observer can link, stage by
-stage — including Pgas.me itself, which in this version is custodial and sees the pairing until
-settlement (then deletes it):
+stage — including Pgas.me itself, which in this version is custodial and knows the pairing until
+settlement, then nulls it:
 
-![Who sees what](docs/scheme-who-sees-what.png)
+![Who can see what](docs/scheme-who-sees-what.png)
 
 The bridge is operated by the Beam team's relayer (one key), Beam's shielded pool is small today,
-and the largest anonymity sets on Ethereum belong to other tools. The roadmap moves custody to
-the user step by step:
+and the largest anonymity sets on Ethereum belong to other tools. Saying that plainly is part of the
+product.
+
+## Trust ladder
 
 ![Trust ladder](docs/scheme-trust-ladder.png)
 
+Each version hands a little more custody back to the user, until the last one needs no operator at
+all.
+
 ## Stack
 
-- **web/** — React 18 + Vite + TypeScript + ethers v6. Injected wallets (EIP-6963 + legacy
-  `window.ethereum`), SIWE, cross-chain portfolio via batch-balance contracts, deposit / balance /
-  wallets / withdraw / activity pages. Playwright e2e with a mock wallet.
-- **api/** — FastAPI + MongoDB (Python 3.12). SIWE sessions, destination proofs
-  (`personal_sign`, signature verified then discarded), deBridge DLN two-step quote with the
-  `dlnHook` that calls the target asset's Beam pipe, on-chain deposit watcher (pipe
-  `NewLocalMessage` logs matched to DLN `FulfilledOrder` in the same receipt, checkpoint never
-  advanced past a failed chunk), append-only per-asset ledger (balances are sums), withdrawals,
-  stats, Telegram alerts (default-deny), stuck-service monitor.
-- **Beam side** — the public Beam ⇄ Ethereum bridge (`EthPipe` `0xB1d7FF9D3aCaf30e282c5F6eb1F2A6503f516a96`
-  for ETH; ERC-20 pipes for DAI and WBTC), a dedicated Beam wallet, Lelantus-MW shielding of the
-  treasury, one bridge crossing per payout in direct mode.
+- **web/** — React 18 + Vite + TypeScript + ethers v6. Injected wallets (EIP-6963 and legacy
+  `window.ethereum`), Sign-In with Ethereum, cross-chain portfolio through batch-balance contracts,
+  deposit / balance / schedule / activity screens. Playwright end-to-end tests against a mock wallet.
+- **api/** — FastAPI + MongoDB (Python 3.12). SIWE sessions, quotes, the on-chain deposit watcher,
+  an append-only per-asset ledger, the scheduler and the payout workers, stats, Telegram events
+  (default-deny) and the stuck-service watchdog.
+- **Beam side** — a Beam node plus `wallet-api` and **BeamPay** as the only interface to the wallet's
+  money, the public Beam ⇄ Ethereum bridge pipes (`EthPipe`
+  `0xB1d7FF9D3aCaf30e282c5F6eb1F2A6503f516a96` for ETH, ERC-20 pipes for DAI and WBTC), and
+  Lelantus max-privacy shielding of the treasury.
+- **Solidity** — the Pgas hook (`afterSwap`) that forwards a Uniswap V4 swap's output into the bridge
+  pipe. Hook contract: in progress.
 
-Every money-moving path is behind an explicit arm flag and stays dark until it has been
-validated with real, tiny amounts.
-
-## Run it locally
+## Running it
 
 ```bash
 # API (Python 3.12+, MongoDB on localhost)
@@ -95,7 +114,7 @@ cp .env.example .env            # fill in what you need; nothing is armed by def
 
 # Web
 cd web && npm ci && npm run dev  # proxies /api → http://127.0.0.1:8300
-npx playwright test              # e2e against a mock wallet
+npx playwright test              # end-to-end against a mock wallet
 ```
 
 ## License

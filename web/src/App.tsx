@@ -1,21 +1,153 @@
-// App chrome — header (brand, tabs, network chip, connect), notices, the wallet picker dialog, the
-// stats footer — and the tab switch. Page bodies live in pages/.
+// App chrome — header (brand, tabs on desktop, theme switch, one account control), the mobile tab
+// bar, notices, the wallet picker dialog, the one-line footer — and the tab switch. Page bodies
+// live in pages/.
 import { useEffect, useRef, useState } from 'react';
+import { Modal } from './components/Modal';
 import { errorText } from './lib/api';
 import { chainName } from './lib/chains';
-import { fmtAgo, fmtNumber, shortAddr } from './lib/format';
+import { shortAddr } from './lib/format';
 import type { WalletOption } from './lib/wallet';
-import { ActivityPage } from './pages/Activity';
 import { BalancePage } from './pages/Balance';
 import { DepositPage } from './pages/Deposit';
-import { WalletsPage } from './pages/Wallets';
-import { WithdrawPage } from './pages/Withdraw';
-import { StoreProvider, TABS, useStore } from './state/store';
+import { SchedulePage } from './pages/Schedule';
+import { StoreProvider, TABS, useStore, type Tab } from './state/store';
+
+/** Sun and moon, drawn rather than fetched: two paths beat a webfont for one icon. */
+function ThemeIcon({ dark }: { dark: boolean }) {
+  return dark ? (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4" />
+    </svg>
+  ) : (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+      <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z" />
+    </svg>
+  );
+}
+
+function ThemeToggle() {
+  const { theme } = useStore();
+  const dark = theme.theme === 'dark';
+  const next = dark ? 'light' : 'dark';
+  return (
+    <button
+      type="button"
+      className="btn btn-sm btn-ghost theme-toggle"
+      data-testid="theme-toggle"
+      data-theme-now={theme.theme}
+      aria-label={`Switch to the ${next} theme`}
+      title={theme.fromSystem ? `Following your system (${theme.theme}) — switch to ${next}` : `Switch to the ${next} theme`}
+      onClick={theme.toggle}
+    >
+      <ThemeIcon dark={dark} />
+    </button>
+  );
+}
+
+function TabButtons({ where }: { where: 'header' | 'bar' }) {
+  const { route } = useStore();
+  const cls = where === 'header' ? 'nav-tab' : 'tabbar-tab';
+  return (
+    <>
+      {TABS.map((t) => (
+        <button
+          key={t.id}
+          type="button"
+          data-tab={t.id}
+          className={`${cls}${route.tab === t.id ? ' active' : ''}`}
+          aria-current={route.tab === t.id ? 'page' : undefined}
+          onClick={() => route.navigate(t.id)}
+        >
+          {t.label}
+        </button>
+      ))}
+    </>
+  );
+}
+
+/**
+ * The one account control: a pill carrying the chain dot and the address, with everything else
+ * (the chain's name, whether the signature landed, Disconnect) inside its menu. It replaced three
+ * header chips plus a Disconnect button, which wrapped onto a second row on a phone and left the
+ * screen with two Connect buttons — one here and one in whichever card was locked.
+ */
+function AccountControl() {
+  const { wallet, session, data } = useStore();
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (root.current && !root.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setOpen(false);
+    document.addEventListener('mousedown', onDoc);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDoc);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  if (!wallet.address) {
+    return (
+      <button type="button" className="btn btn-primary" onClick={wallet.openPicker} data-testid="connect-btn">
+        Connect wallet
+      </button>
+    );
+  }
+
+  const supported = wallet.chainId !== null && data.chains.some((c) => c.chain_id === wallet.chainId);
+  const chain = chainName(wallet.chainId, data.chains);
+  const signedIn = !!session.session;
+  return (
+    <div className="acct" ref={root}>
+      <button
+        type="button"
+        className={`chip chip-net acct-pill ${supported ? 'ok' : 'warn'}`}
+        data-testid="connected-address"
+        data-signed-in={signedIn ? 'yes' : 'no'}
+        title={`${chain} · ${wallet.address}`}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+      >
+        <span className="dot" />
+        {wallet.option?.icon && <img src={wallet.option.icon} alt="" width={16} height={16} style={{ borderRadius: 4 }} />}
+        <span className="mono">{shortAddr(wallet.address)}</span>
+      </button>
+      {open && (
+        <div className="acct-menu" role="menu" data-testid="account-menu">
+          <div className="mono tiny wrap" data-testid="account-menu-address">
+            {wallet.address}
+          </div>
+          <div className="tiny muted">
+            {chain}
+            {!supported && wallet.chainId !== null && data.chains.length > 0 ? ' · not supported' : ''}
+          </div>
+          <div className="tiny muted" data-testid="account-menu-session">
+            {signedIn ? 'Signed in' : session.signingIn ? 'Waiting for your signature…' : 'Not signed in'}
+          </div>
+          <button
+            type="button"
+            className="btn btn-sm btn-block"
+            onClick={() => {
+              setOpen(false);
+              wallet.disconnect();
+            }}
+          >
+            Disconnect
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function Header() {
-  const { wallet, session, data, route } = useStore();
-  const supported = wallet.chainId !== null && data.chains.some((c) => c.chain_id === wallet.chainId);
-  const signedInElsewhere = !!session.session && !!wallet.address && session.session.address.toLowerCase() !== wallet.address.toLowerCase();
+  const { route } = useStore();
   return (
     <header className="header">
       <div className="container header-inner">
@@ -31,50 +163,23 @@ function Header() {
           <span>Pgas.me</span>
         </a>
         <nav className="nav" aria-label="Sections">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              type="button"
-              className={`nav-tab${route.tab === t.id ? ' active' : ''}`}
-              aria-current={route.tab === t.id ? 'page' : undefined}
-              onClick={() => route.navigate(t.id)}
-            >
-              {t.label}
-            </button>
-          ))}
+          <TabButtons where="header" />
         </nav>
         <div className="header-right">
-          {wallet.address && (
-            <span className={`chip chip-net ${supported ? 'ok' : 'warn'}`} title={`Wallet chain id ${wallet.chainId ?? '?'}`}>
-              <span className="dot" />
-              {chainName(wallet.chainId, data.chains)}
-              {!supported && wallet.chainId !== null && data.chains.length > 0 ? ' · not supported' : ''}
-            </span>
-          )}
-          {session.session && (
-            <span className="chip ok" title={`Signed in as ${session.session.address}`}>
-              <span className="dot" />
-              {signedInElsewhere ? `Signed in: ${shortAddr(session.session.address)}` : 'Signed in'}
-            </span>
-          )}
-          {wallet.address ? (
-            <>
-              <span className="chip mono" title={wallet.address} data-testid="connected-address">
-                {wallet.option?.icon && <img src={wallet.option.icon} alt="" width={16} height={16} style={{ borderRadius: 4 }} />}
-                {shortAddr(wallet.address)}
-              </span>
-              <button type="button" className="btn btn-sm" onClick={wallet.disconnect}>
-                Disconnect
-              </button>
-            </>
-          ) : (
-            <button type="button" className="btn btn-primary" onClick={wallet.openPicker}>
-              Connect wallet
-            </button>
-          )}
+          <ThemeToggle />
+          <AccountControl />
         </div>
       </div>
     </header>
+  );
+}
+
+/** Phones get the three tabs where a thumb reaches them; CSS hides this above 860 px. */
+function TabBar() {
+  return (
+    <nav className="tabbar" aria-label="Sections" data-testid="tabbar">
+      <TabButtons where="bar" />
+    </nav>
   );
 }
 
@@ -82,15 +187,7 @@ function WalletPicker() {
   const { wallet } = useStore();
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const dialog = useRef<HTMLDivElement>(null);
   const { pickerOpen, closePicker } = wallet;
-  useEffect(() => {
-    if (!pickerOpen) return;
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && closePicker();
-    document.addEventListener('keydown', onKey);
-    dialog.current?.querySelector<HTMLElement>('button')?.focus();
-    return () => document.removeEventListener('keydown', onKey);
-  }, [pickerOpen, closePicker]);
   if (!pickerOpen) return null;
   const pick = async (o: WalletOption) => {
     setBusy(o.id);
@@ -103,40 +200,41 @@ function WalletPicker() {
       setBusy(null);
     }
   };
+  /**
+   * Only what the user can act on. "browser extension or in-app browser" told a person who is
+   * looking at their own wallet's name what kind of software it is; the WalletConnect row without a
+   * project id offered a button that could only refuse. What is left: the wallet is busy, or (for
+   * WalletConnect, when it IS configured) what tapping it will do.
+   */
   const subtitle = (o: WalletOption) => {
     if (busy === o.id) return o.source === 'walletconnect' ? 'Loading WalletConnect…' : 'Waiting for the wallet…';
-    if (o.disabledReason) return o.disabledReason;
-    if (o.hint) return o.hint;
-    return o.source === 'farcaster' ? 'Farcaster mini app' : 'browser extension or in-app browser';
+    return o.source === 'walletconnect' ? (o.hint ?? null) : null;
   };
-  const detected = wallet.options.filter((o) => o.source !== 'walletconnect');
+  const options = wallet.options.filter((o) => !o.disabledReason);
+  const detected = options.filter((o) => o.source !== 'walletconnect');
   return (
-    <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && closePicker()}>
-      <div className="modal" role="dialog" aria-modal="true" aria-label="Connect a wallet" ref={dialog}>
-        <div className="modal-head">
-          <h2>Connect a wallet</h2>
-          <button type="button" className="btn btn-ghost btn-sm" onClick={closePicker}>
-            Close
-          </button>
-        </div>
-        <div className="stack">
-          {detected.length === 0 && (
-            <p className="small muted">
-              No browser wallet was detected on this page. Install one (MetaMask, Rabby, Coinbase Wallet, Zerion, Trust, OKX, Coin98…), open
-              pgas.me from your wallet's in-app browser, or scan with WalletConnect below.
-            </p>
-          )}
-          <div className="wallet-list" role="list">
-            {wallet.options.map((o) => (
+    <Modal title="Connect a wallet" onClose={closePicker} testId="wallet-picker">
+      <div className="stack">
+        {detected.length === 0 && (
+          <p className="small muted">
+            No wallet was detected in this browser. Install one (MetaMask, Rabby, Coinbase Wallet, Zerion, Trust, OKX, Coin98…) or open
+            pgas.me from your wallet's own browser.
+          </p>
+        )}
+        <div className="wallet-list" role="list">
+          {options.map((o) => {
+            const sub = subtitle(o);
+            return (
               <button
                 key={o.id}
                 type="button"
                 className="wallet-row"
                 onClick={() => pick(o)}
-                disabled={busy !== null || !!o.disabledReason}
-                aria-disabled={!!o.disabledReason}
+                disabled={busy !== null}
                 role="listitem"
                 data-wallet-id={o.id}
+                data-wallet-source={o.source}
+                data-inapp={o.inApp ? 'yes' : undefined}
               >
                 <img src={o.icon} alt="" />
                 <span className="stack-sm" style={{ gap: 0, minWidth: 0 }}>
@@ -144,18 +242,16 @@ function WalletPicker() {
                     <span className="w-name">{o.name}</span>
                     {(o.source === 'injected' || o.source === 'eip6963') && <span className="pill pill-teal">Detected</span>}
                   </span>
-                  <span className="w-src">{subtitle(o)}</span>
+                  {sub && <span className="w-src">{sub}</span>}
                 </span>
               </button>
-            ))}
-          </div>
-          {err && <p className="error-text">{err}</p>}
-          <p className="tiny muted">
-            The account is the wallet. Signing in costs nothing and moves nothing; whoever controls the wallet controls the balance.
-          </p>
+            );
+          })}
         </div>
+        {err && <p className="error-text">{err}</p>}
+        <p className="tiny muted">Signing in is free and moves nothing.</p>
       </div>
-    </div>
+    </Modal>
   );
 }
 
@@ -183,54 +279,16 @@ function Notices() {
   );
 }
 
-function ArmedChip({ on, label }: { on: boolean; label: string }) {
-  return (
-    <span className={`chip ${on ? 'ok' : 'warn'}`}>
-      <span className="dot" />
-      {label}
-    </span>
-  );
-}
-
-function StatsFooter() {
-  const { data } = useStore();
-  const { stats, statsError } = data;
+/**
+ * One line. The stats strip (deposits 24 h/7 d, payouts, shielded outputs, Beam height) and the
+ * Ingress/Direct/Instant chips were operator telemetry on a depositor's screen: nothing there is
+ * something a user acts on, and an unarmed ingress already says so in the quote panel itself. With
+ * the strip gone the app stopped fetching `GET /v1/stats` at all (2026-09-09).
+ */
+function Footer() {
   return (
     <footer className="footer">
       <div className="container">
-        {stats ? (
-          <div className="stats-strip" data-testid="stats-strip">
-            <span className="stat">
-              Deposits 24 h <b>{fmtNumber(stats.deposits_24h)}</b>
-            </span>
-            <span className="stat">
-              7 d <b>{fmtNumber(stats.deposits_7d)}</b>
-            </span>
-            <span className="stat">
-              Payouts 24 h <b>{fmtNumber(stats.payouts_24h)}</b>
-            </span>
-            <span className="stat">
-              Shielded outputs <b>{fmtNumber(stats.pool?.shielded_outputs_total ?? 0)}</b>
-              <span className="tiny">total</span>
-            </span>
-            <span className="stat">
-              <b>{fmtNumber(stats.pool?.shielded_outputs_per_24h ?? 0)}</b>
-              <span className="tiny">per 24 h</span>
-            </span>
-            <span className="stat">
-              Beam height <b>{fmtNumber(stats.pool?.height ?? 0)}</b>
-              {stats.pool?.at ? <span className="tiny">{fmtAgo(stats.pool.at)}</span> : null}
-            </span>
-            <span className="spacer" />
-            <ArmedChip on={!!stats.armed?.ingress} label={`Ingress ${stats.armed?.ingress ? 'armed' : 'not armed'}`} />
-            <ArmedChip on={!!stats.armed?.direct} label={`Direct ${stats.armed?.direct ? 'on' : 'off'}`} />
-            <ArmedChip on={!!stats.armed?.instant} label={`Instant ${stats.armed?.instant ? 'on' : 'off'}`} />
-          </div>
-        ) : (
-          <div className="stats-strip">
-            <span>{statsError ? `Stats unavailable: ${statsError}` : 'Loading stats…'}</span>
-          </div>
-        )}
         <div className="footer-note">
           <span>Settled on Beam — a confidential ledger: no addresses on-chain, blinded amounts.</span>
         </div>
@@ -241,15 +299,12 @@ function StatsFooter() {
 
 function Page() {
   const { route } = useStore();
-  switch (route.tab) {
+  const tab: Tab = route.tab;
+  switch (tab) {
     case 'balance':
       return <BalancePage />;
-    case 'wallets':
-      return <WalletsPage />;
-    case 'withdraw':
-      return <WithdrawPage />;
-    case 'activity':
-      return <ActivityPage />;
+    case 'schedule':
+      return <SchedulePage />;
     default:
       return <DepositPage />;
   }
@@ -266,7 +321,8 @@ export default function App() {
             <Page />
           </div>
         </main>
-        <StatsFooter />
+        <Footer />
+        <TabBar />
         <WalletPicker />
       </div>
     </StoreProvider>

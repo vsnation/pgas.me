@@ -1,6 +1,7 @@
-// Portfolio scanner — the buybeam.my mechanism, widened to every EVM chain deBridge lists. For each
-// chain in parallel: a health-checked public RPC (the wallet's own provider only as a last resort);
-// the native balance via getBalance; the top-300 ERC-20s of the DLN token list in chunks of 150,
+// Portfolio scanner — the buybeam.my mechanism, widened to every EVM chain the cross-chain order
+// router lists. For each chain in parallel: a health-checked public RPC (the wallet's own provider
+// only as a last resort); the native balance via getBalance; the top-300 ERC-20s of that chain's
+// token list in chunks of 150,
 // through the chain's batch-balance contract where one exists and Multicall3 everywhere else;
 // non-zero holdings priced via CoinGecko and sorted by USD. Chains finish independently and are
 // reported one by one, so a slow chain never holds up the chips.
@@ -12,6 +13,7 @@ import {
   COINGECKO_PLATFORMS,
   MULTICALL3,
   NATIVE_ADDRESS,
+  chainIconUrl,
   fallbackUrls,
   getFallbackProvider,
   invalidateFallback,
@@ -19,13 +21,13 @@ import {
   isNonEvmChain,
   withTimeout,
 } from './chains';
-import type { Chain, Token } from './types';
+import { routeChainId, type Chain, type Token } from './types';
 import type { Eip1193Provider } from './wallet';
 
 export interface Holding {
   key: string;
   chainId: number;
-  dlnChainId: number;
+  routeChainId: number;
   chainName: string;
   address: string;
   symbol: string;
@@ -44,7 +46,7 @@ export interface ChainScan {
   chainId: number;
   name: string;
   via: ScanVia;
-  /** deBridge lists Solana and Tron; there is no eth_* RPC to ask, so they are skipped, not failed. */
+  /** The router lists Solana and Tron; there is no eth_* RPC to ask, so they are skipped, not failed. */
   nonEvm?: boolean;
   holdings: Holding[];
   errors: string[];
@@ -71,7 +73,7 @@ const MULTICALL3_IFACE = new Interface([
 ]);
 const ERC20_IFACE = new Interface(['function balanceOf(address owner) view returns (uint256)']);
 
-const TOP_N = 300; // DLN orders its token list by relevance; the head is what a wallet actually holds
+const TOP_N = 300; // the list is ordered by relevance; the head is what a wallet actually holds
 const CHUNK = 150; // tokens per batch-balance / aggregate3 call
 const PER_TOKEN_N = 60; // last resort when neither aggregate helper answers
 const PER_TOKEN_BATCH = 50; // JSON-RPC batch size for that fallback
@@ -88,7 +90,7 @@ function short(e: unknown): string {
   return t.length > 120 ? t.slice(0, 120) + '…' : t;
 }
 
-// ---------- token lists (DLN via the API), cached ----------
+// ---------- token lists (from the API), cached ----------
 const tokenMem = new Map<number, Promise<Token[]>>();
 
 export function loadTokens(chainId: number): Promise<Token[]> {
@@ -230,16 +232,36 @@ async function viaPerToken(p: Provider, tokens: Token[], account: string): Promi
 }
 
 // ---------- one chain ----------
-function nativeHolding(chain: Chain, raw: bigint): Holding {
+/** Passthrough fields the API does not promise but a token list may still carry. */
+interface TokenListExtras {
+  logoURI?: string;
+  isNative?: boolean;
+}
+
+/**
+ * The native coin's logo. The token list carries a native entry with its own `logo` URL
+ * (`GET /v1/dex/tokens?chain_id=56` → BNB with a logo on whatever host the list names — the host is
+ * data, never something this client spells out), and that list is already loaded for the ERC-20
+ * batch, so this costs no extra request. A chain whose list has no native entry falls back to this
+ * app's own chain icon — a monogram is the last resort, not the default it used to be.
+ */
+function nativeLogo(chainId: number, tokens: Token[]): string | undefined {
+  const entry = tokens.find((t) => isNativeToken(t?.address) || (t as Token & TokenListExtras)?.isNative);
+  const logo = entry?.logo || (entry as (Token & TokenListExtras) | undefined)?.logoURI;
+  return logo || chainIconUrl(chainId) || undefined;
+}
+
+function nativeHolding(chain: Chain, raw: bigint, tokens: Token[]): Holding {
   return {
     key: `${chain.chain_id}:native`,
     chainId: chain.chain_id,
-    dlnChainId: chain.dln_chain_id,
+    routeChainId: routeChainId(chain),
     chainName: chain.name,
     address: NATIVE_ADDRESS,
     symbol: chain.native_symbol,
     name: chain.native_symbol,
     decimals: 18,
+    logo: nativeLogo(chain.chain_id, tokens),
     raw,
     amount: Number(formatUnits(raw, 18)),
     native: true,
@@ -277,13 +299,19 @@ async function scanChain(chain: Chain, address: string, wallet: ScanWallet | nul
     }
   }
   if (!provider || native === null) return result;
-  if (native > 0n) result.holdings.push(nativeHolding(chain, native));
 
-  let tokens: Token[];
+  // The token list comes first because the native holding takes its logo from the list's own native
+  // entry; a list that fails to load still leaves the native holding (with the chain-icon fallback).
+  let tokens: Token[] = [];
+  let tokensError: string | null = null;
   try {
     tokens = await loadTokens(chain.chain_id);
   } catch (e) {
-    result.errors.push(`token list: ${short(e)}`);
+    tokensError = short(e);
+  }
+  if (native > 0n) result.holdings.push(nativeHolding(chain, native, tokens));
+  if (tokensError !== null) {
+    result.errors.push(`token list: ${tokensError}`);
     return result;
   }
   const erc20 = tokens.filter((t) => typeof t?.address === 'string' && !isNativeToken(t.address)).slice(0, TOP_N);
@@ -321,7 +349,7 @@ async function scanChain(chain: Chain, address: string, wallet: ScanWallet | nul
           result.holdings.push({
             key: `${chain.chain_id}:${r.token.address.toLowerCase()}`,
             chainId: chain.chain_id,
-            dlnChainId: chain.dln_chain_id,
+            routeChainId: routeChainId(chain),
             chainName: chain.name,
             address: r.token.address,
             symbol: r.token.symbol,
@@ -442,6 +470,45 @@ async function priceHoldings(hs: Holding[]): Promise<boolean> {
     } else h.usd = undefined;
   }
   return any;
+}
+
+/**
+ * USD per ONE unit of the Beam-side assets (ETH, DAI, WBTC), off the same five-minute cache the
+ * chips use, so the Balance tiles can show what the numbers are worth. Their Ethereum token address
+ * is the price key — `0x0…0` means native ether. Never throws: an asset nobody could price is
+ * simply absent from the result, and the tile then shows no dollar line rather than a wrong one.
+ */
+export async function assetPricesUsd(assets: { key: string; token: string }[]): Promise<Record<string, number>> {
+  const cache = loadPriceCache();
+  const now = Date.now();
+  const keyOf = (token: string) => (isNativeToken(token) ? `native:ethereum` : `ethereum:${token.toLowerCase()}`);
+  const missingTokens = new Set<string>();
+  let missingNative = false;
+  for (const a of assets) {
+    const k = keyOf(a.token);
+    if (cache[k] && now - cache[k].at < PRICES_TTL_MS) continue;
+    if (k === 'native:ethereum') missingNative = true;
+    else missingTokens.add(k.slice('ethereum:'.length));
+  }
+  if (missingNative) {
+    const j = await fetchPrices(`${COINGECKO}/simple/price?ids=ethereum&vs_currencies=usd`);
+    if (j) cache['native:ethereum'] = { usd: typeof j.ethereum?.usd === 'number' ? j.ethereum.usd : null, at: now };
+  }
+  if (missingTokens.size) {
+    const list = [...missingTokens];
+    const j = await fetchPrices(`${COINGECKO}/simple/token_price/ethereum?contract_addresses=${list.join(',')}&vs_currencies=usd`);
+    if (j) {
+      const lower = Object.fromEntries(Object.entries(j).map(([k, v]) => [k.toLowerCase(), v]));
+      for (const a of list) cache[`ethereum:${a}`] = { usd: typeof lower[a]?.usd === 'number' ? lower[a].usd! : null, at: now };
+    }
+  }
+  savePriceCache(cache);
+  const out: Record<string, number> = {};
+  for (const a of assets) {
+    const usd = cache[keyOf(a.token)]?.usd;
+    if (typeof usd === 'number') out[a.key] = usd;
+  }
+  return out;
 }
 
 function sortHoldings(hs: Holding[]): Holding[] {

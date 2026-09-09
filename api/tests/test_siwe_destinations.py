@@ -1,4 +1,10 @@
-"""Sign-in with a real key and a real EIP-4361 message; destination proofs."""
+"""Sign-in with a real key and a real EIP-4361 message; the passive destination list.
+
+The signed proof flow and its nonce route were REMOVED on 2026-09-09: a payout names any
+address the user types (routers/withdrawals.py checks the checksum and the chain), so there is
+nothing left for a destination to prove. What remains is the list the account page shows, the
+signed-in wallet auto-added to it at SIWE, and removal.
+"""
 
 from __future__ import annotations
 
@@ -69,34 +75,29 @@ async def test_connected_wallet_is_a_destination(client, user):
     assert [(d["address"], d["kind"]) for d in rows] == [(user["address"], "connected")]
 
 
-async def test_proven_destination_accepted(client, user):
+async def test_there_is_no_proof_route_to_call_any_more(client, user):
+    """Both halves of the old flow are gone — not disabled, gone."""
+    r = await client.get("/v1/destinations/nonce", headers=user["headers"])
+    # 405: nothing serves GET on that path any more (only DELETE /{address} matches its shape)
+    assert r.status_code in (404, 405)
     dest = EthAccount.create()
-    r = await add_destination(client, user, dest)
-    assert r.status_code == 200, r.text
-    assert r.json()["address"] == dest.address and r.json()["kind"] == "proven"
-    rows = (await client.get("/v1/destinations", headers=user["headers"])).json()["destinations"]
-    assert {d["address"] for d in rows} == {user["address"], dest.address}
-    assert all("signature" not in d for d in rows)
-
-
-async def test_destination_proof_by_wrong_signer_rejected(client, user):
-    dest, impostor = EthAccount.create(), EthAccount.create()
-    r = await add_destination(client, user, dest, signer=impostor)
-    assert r.status_code == 401
-
-
-async def test_destination_nonce_single_use(client, user):
-    nonce = (await client.get("/v1/destinations/nonce", headers=user["headers"])).json()["nonce"]
-    assert (
-        await add_destination(client, user, EthAccount.create(), nonce=nonce)
-    ).status_code == 200
-    r = await add_destination(client, user, EthAccount.create(), nonce=nonce)
-    assert r.status_code == 400 and "nonce" in r.json()["detail"]
+    r = await client.post(
+        "/v1/destinations",
+        json={
+            "address": dest.address,
+            "kind": "proven",
+            "nonce": "x" * 16,
+            "issued": "2026-09-09T00:00:00Z",
+            "signature": "0x" + "11" * 65,
+        },
+        headers=user["headers"],
+    )
+    assert r.status_code == 405
 
 
 async def test_destination_delete_refused_while_a_payout_targets_it(client, user, mock_db):
     dest = EthAccount.create()
-    assert (await add_destination(client, user, dest)).status_code == 200
+    await add_destination(client, user, dest)
     await mock_db["pgasme_test"].payout_requests.insert_one(
         {"_id": "r1", "account_id": user["account_id"], "W": dest.address, "status": "scheduled"}
     )

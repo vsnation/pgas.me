@@ -25,9 +25,25 @@ export interface Balance {
 
 export type DepositStatus = 'submitted' | 'order_seen' | 'fallback_pending' | 'locked' | 'confirming' | 'credited' | 'failed' | 'expired';
 
+/**
+ * Operator-side sweep of an already-credited deposit (claim off the pipe, then shield into the
+ * Lelantus pool). It is a SUB-status: `status` stays `credited` throughout, the user's balance
+ * never waits for it, and it is never rendered as a status pill — see components/Status.tsx.
+ */
+export type TreasuryStatus = 'claiming' | 'claimed' | 'shielding' | 'shielded';
+
+/**
+ * The quote mode that produced the deposit; `swap` is never registered, so it cannot appear.
+ * The only thing the client branches on is `uniswap`, and only to name the steps of that route's
+ * own timeline (there is no order to fill); an older API build still sending the router's own name
+ * for `xchain` cannot change what is rendered.
+ */
+export type DepositMode = 'uniswap' | 'xchain' | 'direct';
+
 export interface Deposit {
   _id: string;
   asset: AssetKey;
+  mode?: DepositMode;
   status: DepositStatus;
   src: { chain_id: number; token: string; amount: string };
   quote_id: string;
@@ -44,9 +60,30 @@ export interface Deposit {
   created_at: number | string;
   updated_at: number | string;
   note?: string;
+  /** the registered hash was proven to belong to this quote */
+  verified?: boolean;
+  /** the wallet the quote was issued to */
+  address?: string;
+  treasury?: TreasuryStatus;
+  claim_txid?: string;
+  shield_txids?: string[];
 }
 
-export type RequestStatus = 'scheduled' | 'bridging' | 'sent' | 'failed' | 'cancelled';
+/**
+ * The 2026-09-09 payout order machine (API_CONTRACT.md):
+ * `scheduled → releasing → bridging → delivering → sent | failed`, plus `cancelled`.
+ * The last two are the designed-but-dark any-asset branch and only appear on rows with `dark`.
+ */
+export type RequestStatus =
+  | 'scheduled'
+  | 'releasing'
+  | 'bridging'
+  | 'delivering'
+  | 'sent'
+  | 'failed'
+  | 'cancelled'
+  | 'waiting_for_dep_eth'
+  | 'waiting_for_swap_to_target_asset';
 export type PayoutMode = 'direct' | 'instant';
 
 export interface PayoutRequest {
@@ -56,12 +93,24 @@ export interface PayoutRequest {
   W: string;
   amount_groth: number;
   fee_groth: number;
-  window_s: number;
+  /** when the user asked for the ETH to be in `W` (unix seconds) */
+  deliver_at: number | string;
+  /** when the order goes to the bridge: `max(now, deliver_at − bridge_eta_s)` */
   release_at: number | string;
   status: RequestStatus;
   beam_txid?: string;
   msg_id?: string | number;
   eth_tx?: string;
+  /** what the treasury paid the bridge relayer for this crossing */
+  relayer_fee_groth?: number;
+  /** Beam confirmations on the bridge message so far, out of BEAM_CONFIRMATIONS */
+  beam_confirmations?: number;
+  /** the Ethereum block the delivery landed in */
+  eth_block?: number;
+  /** plain English, operator-written: why the order is parked instead of progressing */
+  hold_reason?: string;
+  /** the row came from the dark any-asset branch */
+  dark?: boolean;
   created_at: number | string;
 }
 
@@ -85,41 +134,37 @@ export interface Account {
   fee_bps: number;
   denominations: number[];
   min_payout_groth: number;
-  modes: { direct: boolean; instant: boolean };
-  ingress: { armed: boolean; near: boolean };
+  modes: { direct: boolean; instant: boolean; ingress?: { uniswap?: boolean; xchain?: boolean } };
+  /** `armed` is the Beam side being ready; `uniswap`/`xchain` are the paths, read via lib/ingress */
+  ingress: { armed: boolean; near: boolean; uniswap?: boolean; xchain?: boolean };
   deposits: Deposit[];
   requests: PayoutRequest[];
   destinations: number;
   history: HistoryEntry[];
 }
 
-export type DestinationKind = 'connected' | 'proven' | 'generated';
-
-export interface Destination {
-  address: string;
-  kind: DestinationKind;
-  verified_at: number | string;
-  label?: string;
-  created_at?: number | string;
-}
-
-export interface AddDestinationBody {
-  address: string;
-  kind: 'proven' | 'generated';
-  nonce: string;
-  issued: string;
-  signature: string;
-  label?: string;
-}
-
 export interface Chain {
   /** EVM/original id — used for wallets and RPC */
   chain_id: number;
-  /** deBridge internal id — used for the API */
-  dln_chain_id: number;
+  /** the cross-chain order router's own id — used for the API */
+  route_chain_id?: number;
   name: string;
   native_symbol: string;
   batch_balance?: string;
+}
+
+/**
+ * The router's own id for a chain, which differs from the EVM id on a few of them (Story is 1514
+ * on chain and another number to the router). The API sends it as `route_chain_id`; an older build
+ * sent the same number under its own vendor-prefixed key, so any other `*_chain_id` number on the
+ * row is read as the same fact. A row carrying neither is its own EVM id.
+ */
+export function routeChainId(c: Chain): number {
+  if (typeof c.route_chain_id === 'number') return c.route_chain_id;
+  for (const [k, v] of Object.entries(c)) {
+    if (k !== 'chain_id' && k.endsWith('_chain_id') && typeof v === 'number') return v;
+  }
+  return c.chain_id;
 }
 
 export interface Token {
@@ -128,6 +173,21 @@ export interface Token {
   name: string;
   decimals: number;
   logo?: string;
+}
+
+/** `GET /v1/assets` — the assets, plus (2026-09-10) the ingress flags; see lib/ingress.ts. */
+export interface AssetsResponse {
+  assets: Asset[];
+  ingress?: Record<string, unknown>;
+}
+
+/** `GET /v1/health` — public, and the second place the ingress flags are published. */
+export interface HealthResponse {
+  ok?: boolean;
+  version?: string;
+  ingress_armed?: boolean;
+  paused?: boolean;
+  ingress?: Record<string, unknown>;
 }
 
 export interface Asset {
@@ -147,33 +207,72 @@ export interface QuoteBody {
   amount: string;
   target_asset: AssetKey;
   sender: string;
+  /**
+   * Which ingress to quote. Sent as `"uniswap"` only when the API says that path is open and the
+   * pair is one it takes; left off otherwise, and the API picks (`"auto"`: uniswap → direct →
+   * cross-chain). An API build that has never heard of the field ignores it and answers as before.
+   */
+  route?: 'uniswap' | 'auto';
 }
 
 /**
- * `dln` — a cross-chain DLN order. `direct` — chain 1 and the source token already IS the target
- * asset, so the tx goes straight to the pipe. `swap` — chain 1, any other token: a single-chain DLN
- * swap into the user's OWN wallet, then a fresh `direct` quote for what actually arrived.
+ * `uniswap` — the primary ingress: one transaction on Ethereum into the Pgas gateway pool, whose
+ * hook swaps on the canonical pool and locks the output in the Beam bridge in the same transaction.
+ * `xchain` — a cross-chain order. `direct` — chain 1 and the source token already IS the target
+ * asset, so the tx goes straight to the pipe. `swap` — chain 1, any other token: a single-chain
+ * swap through the router into the user's OWN wallet, then a fresh `direct` quote for what
+ * actually arrived.
  */
-export type QuoteMode = 'dln' | 'direct' | 'swap';
+export type QuoteMode = 'uniswap' | 'xchain' | 'direct' | 'swap';
+
+/**
+ * The mode, normalised. `uniswap`, `direct` and `swap` are the three on-Ethereum shapes and every
+ * API build names them the same; anything else — the neutral `xchain`, the router's own older name
+ * for it, or no field at all — is the cross-chain order and renders exactly the same UI.
+ */
+export function quoteMode(q: { mode?: string } | null | undefined): QuoteMode {
+  const m = q?.mode;
+  return m === 'uniswap' || m === 'direct' || m === 'swap' ? m : 'xchain';
+}
+
+/** `mode:"uniswap"` — where the deposit goes, echoed for the record; nothing here is rendered. */
+export interface UniswapRoute {
+  hook: string;
+  router: string;
+  gateway_pool_id: string;
+  inner_pool_id: string;
+  token_in: string;
+  token_out: string;
+}
 
 export interface Quote {
   quote_id: string;
   target_asset: AssetKey;
+  /** read it through `quoteMode()`: an older API build sends the router's own name for `xchain` */
   mode: QuoteMode;
   armed: boolean;
   expires_at: string | number;
   estimate: {
     src: { chain_id: number; token: string; symbol: string; decimals: number; amount: string };
     out_units: string;
+    /** `uniswap` only: `out_units × (1 − slippage)`, the bound the hook itself reverts below */
+    min_out_units?: string;
     out_groth: number;
     value_units?: string;
     relayer_fee_units?: string;
     usd?: number;
     eta_s: number;
-    dln_fees?: Record<string, unknown>;
+    /** `uniswap` only: what this size costs on the inner pool, in basis points */
+    price_impact_bps?: number;
+    /** the router's own fee breakdown, passed straight through; nothing renders it */
+    route_fees?: Record<string, unknown>;
   };
+  /** `uniswap` only: the id the hook emits on `PgasDeposit`, which ties the receipt to this quote */
+  deposit_ref?: string;
+  /** `uniswap` only: the hook, the router the tx goes to, and the two pools behind it */
+  route?: UniswapRoute;
   tx?: { chain_id: number; to: string; data: string; value: string };
-  /** `swap` only: the single-chain DLN swap the user signs; never registered as a deposit. */
+  /** `swap` only: the single-chain swap the user signs; never registered as a deposit. */
   swap_tx?: { chain_id: number; to: string; data: string; value: string };
   approval?: { chain_id: number; token: string; spender: string; amount: string };
   /** `swap` only: the quote to ask for once the swap lands (amount = what actually arrived). */
@@ -182,31 +281,48 @@ export interface Quote {
   note?: string;
 }
 
+/**
+ * `POST /v1/quote/{id}/arm` (2026-09-09): for a cross-chain quote the estimate above costs ONE
+ * router call and carries no `tx`; the hook-carrying order is built only when the user clicks
+ * Deposit. `estimate` is the final one — it may differ from the estimate the user was shown.
+ */
+export interface ArmedQuote {
+  quote_id: string;
+  tx: { chain_id: number; to: string; data: string; value: string };
+  approval?: { chain_id: number; token: string; spender: string; amount: string };
+  order_id?: string;
+  estimate: Quote['estimate'];
+  expires_at: string | number;
+}
+
+/** One scheduled order: an address the user typed, an amount, and when it should be there. */
+export interface WithdrawalItem {
+  W: string;
+  amount_groth: number;
+  /** unix seconds — when the ETH should be IN `W` (the UI converts local time → unix) */
+  deliver_at: number;
+}
+
 export interface WithdrawalBody {
   asset: AssetKey;
-  items: { W: string; amount_groth: number }[];
+  items: WithdrawalItem[];
   mode: PayoutMode;
-  window_s: number;
 }
 
 export interface WithdrawalResponse {
   request_ids: string[];
   fee_groth: number;
   total_debited_groth: number;
-  eta: { min_s: number; max_s: number };
-  privacy_grade: 'weak' | 'ok' | 'good';
+  relayer_fee_groth_estimate?: number;
+  min_amount_groth?: number;
+  items: { request_id: string; W: string; amount_groth: number; deliver_at: number; release_at: number }[];
 }
 
-export interface Stats {
-  deposits_24h: number;
-  deposits_7d: number;
-  payouts_24h: number;
-  pool: {
-    shielded_outputs_total: number;
-    shielded_outputs_per_24h: number;
-    height: number;
-    at: number | string;
-  };
-  float: Record<string, { active_distributors: number; wei: string | number }>;
-  armed: { ingress: boolean; direct: boolean; instant: boolean };
+/** `GET /v1/withdrawals/fees?asset=ETH` — read before rendering the form. */
+export interface WithdrawalFees {
+  fee_bps: number;
+  relayer_fee_groth_now: number;
+  min_amount_groth: number;
+  /** how long the bridge takes; the order is released this far ahead of `deliver_at` */
+  bridge_eta_s: number;
 }

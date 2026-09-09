@@ -29,14 +29,22 @@ NONCE_TTL_MULT: dict[str, int] = {"siwe_nonces": 1, "dest_nonces": 2}
 # Written only by ensure_indexes(); read by /v1/health.
 INDEX_ERRORS: list[str] = []
 
-# Two unique indexes are ALSO created by the modules that depend on them at worker start
-# (scanner.DEPOSIT_HASH_INDEX, ledger.CREDIT_REF_INDEX). Mongo answers IndexOptionsConflict
-# (85) "Index already exists with a different name" when the same spec is created twice under
-# two names, so these names must stay byte-identical to theirs — an identical create is a
-# silent no-op, a renamed one pages the operator with "the unique guards are NOT in place"
-# every boot. tests/test_review_auth.py pins the agreement.
+# Four unique indexes are ALSO created by the modules that depend on them at worker start
+# (scanner.DEPOSIT_HASH_INDEX, ledger.CREDIT_REF_INDEX / RELEASE_REF_INDEX / FEE_REF_INDEX).
+# Mongo answers IndexOptionsConflict (85) "Index already exists with a different name" when the
+# same spec is created twice under two names, so these names must stay byte-identical to
+# theirs — an identical create is a silent no-op, a renamed one pages the operator with "the
+# unique guards are NOT in place" every boot. tests/test_review_auth.py pins the agreement.
 DEPOSIT_HASH_INDEX = "uniq_src_tx_hash"
 CREDIT_REF_INDEX = "uniq_credit_ref"
+RELEASE_REF_INDEX = "uniq_release_ref"
+FEE_REF_INDEX = "uniq_fee_ref"
+# The build before this one guarded both kinds with ONE index whose filter was
+# `{"kind": {"$in": ["release", "fee"]}}`. MongoDB supports `$in` inside a
+# partialFilterExpression only from 6.0; PRODUCTION RUNS 5.0 and answers CannotCreateIndex
+# (67), so that index exists nowhere on prod — but it may exist on a 6.0+ development box,
+# where it would be a second writer of the same fact. Dropped by name.
+LEGACY_RELEASE_FEE_INDEX = "uniq_release_fee_ref"
 
 
 def set_client(client: Any, name: str = "pgasme") -> None:
@@ -120,7 +128,7 @@ async def ensure_indexes() -> list[str]:
         _ensure(d.rate_limits, "at", expireAfterSeconds=2 * settings.rate_window_s),
     )
 
-    # quotes: NO TTL. A DLN fill can be indexed hours late and the scanner resolves it through
+    # quotes: NO TTL. A cross-chain fill can be indexed hours late and the scanner resolves it through
     # quotes.order_id / quotes.metadata; expiring the quote would orphan the deposit.
     # prune_quotes() (wired into the monitor loop) does the housekeeping instead.
     await step("quotes.at TTL drop", _drop_if_present(d.quotes, "at_1"))
@@ -142,6 +150,33 @@ async def ensure_indexes() -> list[str]:
             unique=True,
             partialFilterExpression={"kind": "credit"},
             name=CREDIT_REF_INDEX,
+        ),
+    )
+    # one `release` and one `fee` per ref. ⛔ ONE EQUALITY FILTER PER INDEX and a key pattern
+    # each: `$in` inside a partialFilterExpression is a MongoDB 6.0 feature and prod runs 5.0
+    # (see ledger.ensure_indexes for the whole argument). Same specs and same names as there.
+    await step(
+        "entries release/fee legacy drop",
+        _drop_if_present(d.entries, LEGACY_RELEASE_FEE_INDEX),
+    )
+    await step(
+        "entries release/ref unique",
+        _ensure(
+            d.entries,
+            [("ref", 1), ("kind", 1)],
+            unique=True,
+            partialFilterExpression={"kind": "release"},
+            name=RELEASE_REF_INDEX,
+        ),
+    )
+    await step(
+        "entries fee/ref unique",
+        _ensure(
+            d.entries,
+            [("ref", 1)],
+            unique=True,
+            partialFilterExpression={"kind": "fee"},
+            name=FEE_REF_INDEX,
         ),
     )
 

@@ -215,13 +215,15 @@ async def test_ensure_indexes_creates_what_the_scanner_queries():
 
 
 def test_the_index_names_agree_with_the_modules_that_also_create_them():
-    """scanner.py and ledger.py create the SAME two unique indexes at worker start. Mongo
+    """scanner.py and ledger.py create the SAME four unique indexes at worker start. Mongo
     refuses an identical spec under a second name (IndexOptionsConflict 85), so a rename on
     either side must fail here, not in production at 03:00."""
     from pgasme import ledger, scanner
 
     assert dbmod.DEPOSIT_HASH_INDEX == scanner.DEPOSIT_HASH_INDEX
     assert dbmod.CREDIT_REF_INDEX == ledger.CREDIT_REF_INDEX
+    assert dbmod.RELEASE_REF_INDEX == ledger.RELEASE_REF_INDEX
+    assert dbmod.FEE_REF_INDEX == ledger.FEE_REF_INDEX
 
 
 async def test_quotes_carry_no_ttl_and_an_old_one_is_dropped():
@@ -301,7 +303,7 @@ async def test_the_cap_counts_per_ip_not_globally(client, monkeypatch):
 # ── 6. destination removal without the address in the URL ─────────────────────────────────
 async def test_remove_by_body_is_the_documented_route(client, user):
     dest = EthAccount.create()
-    assert (await add_destination(client, user, dest)).status_code == 200
+    await add_destination(client, user, dest)
     r = await client.post(
         "/v1/destinations/remove", json={"address": dest.address}, headers=user["headers"]
     )
@@ -339,7 +341,7 @@ async def test_remove_by_body_is_the_documented_route(client, user):
 async def test_the_path_route_still_works_for_shipped_clients(client, wallet):
     user = await sign_in(client, wallet)
     dest = EthAccount.create()
-    assert (await add_destination(client, user, dest)).status_code == 200
+    await add_destination(client, user, dest)
     r = await client.delete(f"/v1/destinations/{dest.address}", headers=user["headers"])
     assert r.status_code == 200 and r.json()["removed"] == dest.address
 

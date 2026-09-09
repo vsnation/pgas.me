@@ -1,6 +1,6 @@
 """POST /v1/quote when the source chain IS Ethereum: mode "direct" (the deposit is the pipe call
-itself) and mode "swap" (DLN's single-chain endpoints into the user's own wallet), plus what
-/v1/deposits does with each. DLN's order API must never be reached from chain 1 — that is the
+itself) and mode "swap" (the router's single-chain endpoints into the user's own wallet), plus what
+/v1/deposits does with each. The router's order API must never be reached from chain 1 — that is the
 SAME_SOURCE_AND_DESTINATION_CHAINS refusal this whole path exists to avoid."""
 
 from __future__ import annotations
@@ -9,9 +9,9 @@ import copy
 from typing import Any
 
 import pytest
-from conftest import DLN_SWAP_ESTIMATION, DLN_SWAP_TX, PUBKEY, USDC_ETH
+from conftest import PUBKEY, USDC_ETH, XCHAIN_SWAP_ESTIMATION, XCHAIN_SWAP_TX
 
-from pgasme import assets, dln, ethpipe
+from pgasme import assets, ethpipe, xchain
 from pgasme.assets import ASSETS
 from pgasme.config import settings
 
@@ -44,20 +44,20 @@ def prices(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def no_dln_orders(monkeypatch):
+def no_router_orders(monkeypatch):
     """create-tx is the endpoint that refuses same-chain quotes; a call from here is the bug."""
 
     async def boom(params: dict[str, Any]) -> dict[str, Any]:
         raise AssertionError(
-            f"the DLN ORDER api must not be called for a same-chain quote: {params}"
+            f"the router's ORDER api must not be called for a same-chain quote: {params}"
         )
 
-    monkeypatch.setattr(dln, "create_tx", boom)
+    monkeypatch.setattr(xchain, "create_tx", boom)
     return boom
 
 
 class FakeSwap:
-    """dln.chain_estimation / chain_transaction answering with the recorded live bodies."""
+    """xchain.chain_estimation / chain_transaction answering with the recorded live bodies."""
 
     def __init__(self) -> None:
         self.est_calls: list[dict[str, Any]] = []
@@ -65,18 +65,18 @@ class FakeSwap:
 
     async def estimation(self, params: dict[str, Any]) -> dict[str, Any]:
         self.est_calls.append(params)
-        return copy.deepcopy(DLN_SWAP_ESTIMATION["estimation"])
+        return copy.deepcopy(XCHAIN_SWAP_ESTIMATION["estimation"])
 
     async def transaction(self, params: dict[str, Any]) -> dict[str, Any]:
         self.tx_calls.append(params)
-        return copy.deepcopy(DLN_SWAP_TX)
+        return copy.deepcopy(XCHAIN_SWAP_TX)
 
 
 @pytest.fixture
 def fake_swap(monkeypatch):
     f = FakeSwap()
-    monkeypatch.setattr(dln, "chain_estimation", f.estimation)
-    monkeypatch.setattr(dln, "chain_transaction", f.transaction)
+    monkeypatch.setattr(xchain, "chain_estimation", f.estimation)
+    monkeypatch.setattr(xchain, "chain_transaction", f.transaction)
     return f
 
 
@@ -87,7 +87,7 @@ def armed_dai(monkeypatch):
     return "02" + "dd" * 32
 
 
-# ----------------------------------------------------------------------------- the DLN client
+# -------------------------------------------------------------------------- the router client
 
 
 async def test_single_chain_client_reads_the_recorded_shapes(monkeypatch):
@@ -95,32 +95,32 @@ async def test_single_chain_client_reads_the_recorded_shapes(monkeypatch):
 
     async def get(path: str, params: dict[str, Any] | None = None, **kw: Any) -> Any:
         seen.append((path, params or {}))
-        return copy.deepcopy(DLN_SWAP_ESTIMATION if path == "chain/estimation" else DLN_SWAP_TX)
+        return copy.deepcopy(XCHAIN_SWAP_ESTIMATION if path == "chain/estimation" else XCHAIN_SWAP_TX)
 
-    monkeypatch.setattr(dln, "_get", get)
-    est = await dln.chain_estimation({"chainId": 1})
-    assert dln.swap_out_amount(est) == 1999122712146377 and est["protocolFee"] == "1600578632623"
-    body = await dln.chain_transaction({"chainId": 1})
+    monkeypatch.setattr(xchain, "_get", get)
+    est = await xchain.chain_estimation({"chainId": 1})
+    assert xchain.swap_out_amount(est) == 1999122712146377 and est["protocolFee"] == "1600578632623"
+    body = await xchain.chain_transaction({"chainId": 1})
     assert (
-        body["tx"]["to"] == DLN_SWAP_TX["tx"]["to"]
-        and dln.swap_out_amount(body) == 1999122712146377
+        body["tx"]["to"] == XCHAIN_SWAP_TX["tx"]["to"]
+        and xchain.swap_out_amount(body) == 1999122712146377
     )
     assert [p for p, _ in seen] == ["chain/estimation", "chain/transaction"]
 
     async def empty(path: str, params: dict[str, Any] | None = None, **kw: Any) -> Any:
         return {"estimation": {}} if path == "chain/estimation" else {"orderId": "0x00"}
 
-    monkeypatch.setattr(dln, "_get", empty)
-    with pytest.raises(dln.DlnError):
-        await dln.chain_estimation({})
-    with pytest.raises(dln.DlnError):  # "no transaction" is an error, never an empty result
-        await dln.chain_transaction({})
+    monkeypatch.setattr(xchain, "_get", empty)
+    with pytest.raises(xchain.XchainError):
+        await xchain.chain_estimation({})
+    with pytest.raises(xchain.XchainError):  # "no transaction" is an error, never an empty result
+        await xchain.chain_transaction({})
 
 
 # ----------------------------------------------------------------------------- mode "direct"
 
 
-async def test_direct_eth_unarmed_is_an_estimate_and_calls_no_dln(client, user, mock_db):
+async def test_direct_eth_unarmed_is_an_estimate_and_calls_no_router(client, user, mock_db):
     r = await client.post("/v1/quote", json=direct(), headers=user["headers"])
     assert r.status_code == 200, r.text
     body = r.json()
@@ -139,7 +139,7 @@ async def test_direct_eth_unarmed_is_an_estimate_and_calls_no_dln(client, user, 
         "amount": str(HALF_ETH_TENTH),
     }
     assert est["usd"] == pytest.approx(0.05 * PRICES["ETH"])
-    assert est["eta_s"] == settings.lock_confirmations * 12 + 120 and "dln_fees" not in est
+    assert est["eta_s"] == settings.lock_confirmations * 12 + 120 and "route_fees" not in est
     q = await mock_db["pgasme_test"].quotes.find_one({"_id": body["quote_id"]})
     assert q["mode"] == "direct" and q["armed"] is False and q.get("order_id") is None
     assert q["src"]["chain_id"] == 1 and q["value_groth"] == est["out_groth"]
@@ -228,15 +228,15 @@ async def test_swap_usdc_to_eth_returns_a_swap_tx_and_the_next_quote(
     assert "tx" not in body and "order_id" not in body
     assert body["swap_tx"] == {
         "chain_id": 1,
-        "to": DLN_SWAP_TX["tx"]["to"],
-        "data": DLN_SWAP_TX["tx"]["data"],
+        "to": XCHAIN_SWAP_TX["tx"]["to"],
+        "data": XCHAIN_SWAP_TX["tx"]["data"],
         "value": "0",
     }
     # no allowanceTarget came back: approve the swap target itself, for the input amount
     assert body["approval"] == {
         "chain_id": 1,
         "token": USDC_ETH,
-        "spender": DLN_SWAP_TX["tx"]["to"],
+        "spender": XCHAIN_SWAP_TX["tx"]["to"],
         "amount": "5000000",
     }
     assert body["next"] == {"src_chain_id": 1, "src_token": ZERO, "amount": "1999122712146377"}
@@ -245,10 +245,10 @@ async def test_swap_usdc_to_eth_returns_a_swap_tx_and_the_next_quote(
     assert int(est["value_units"]) + int(est["relayer_fee_units"]) == 1999122712146377
     assert int(est["value_units"]) % 10**10 == 0
     assert est["usd"] == 4.991652 and est["eta_s"] == 120 + settings.lock_confirmations * 12 + 120
-    assert est["dln_fees"]["protocol_fee"] == "1600578632623"
-    assert est["dln_fees"]["estimated_tx_fee"] == "439326826112330"
-    assert est["dln_fees"]["min_out_units"] == "1993120542274040"
-    assert [c["type"] for c in est["dln_fees"]["costs"]] == [
+    assert est["route_fees"]["protocol_fee"] == "1600578632623"
+    assert est["route_fees"]["estimated_tx_fee"] == "439326826112330"
+    assert est["route_fees"]["min_out_units"] == "1993120542274040"
+    assert [c["type"] for c in est["route_fees"]["costs"]] == [
         "SingleChainSwapProtocolFee",
         "SingleChainSwapEstimatedSlippage",
     ]
@@ -258,7 +258,7 @@ async def test_swap_usdc_to_eth_returns_a_swap_tx_and_the_next_quote(
     assert e["chainId"] == 1 and e["tokenIn"] == USDC_ETH and e["tokenInAmount"] == "5000000"
     assert e["tokenOut"] == ZERO and e["tokenOutAmount"] == "auto" and "tokenOutRecipient" not in e
     assert t["tokenOutRecipient"] == user["address"] == t["senderAddress"]
-    assert t["tokenOut"] == ZERO and t["referralCode"] == settings.dln_referral_code
+    assert t["tokenOut"] == ZERO and t["referralCode"] == settings.xchain_referral_code
     q = await mock_db["pgasme_test"].quotes.find_one({"_id": body["quote_id"]})
     assert q["mode"] == "swap" and q["swap_tx"] == body["swap_tx"] and q["next"] == body["next"]
 
@@ -277,11 +277,11 @@ async def test_swap_from_native_eth_needs_no_approval(client, user, fake_swap, a
     assert body["armed"] is False and "no Beam pipe pubkey configured for DAI" in body["note"]
 
 
-async def test_swap_refusal_from_dln_is_reported(client, user, monkeypatch):
+async def test_swap_refusal_from_the_router_is_reported(client, user, monkeypatch):
     async def refused(params: dict[str, Any]) -> dict[str, Any]:
-        raise dln.DlnError("SOME_ERROR: no route", status=400)
+        raise xchain.XchainError("SOME_ERROR: no route", status=400)
 
-    monkeypatch.setattr(dln, "chain_estimation", refused)
+    monkeypatch.setattr(xchain, "chain_estimation", refused)
     r = await client.post(
         "/v1/quote", json=direct(src_token=USDC_ETH, amount="5000000"), headers=user["headers"]
     )
@@ -334,7 +334,7 @@ async def test_a_swap_quote_is_not_a_deposit(client, user, fake_swap):
     )
 
 
-async def test_a_deposit_written_before_modes_existed_reads_as_dln(client, user, mock_db):
+async def test_a_deposit_written_before_modes_existed_reads_as_xchain(client, user, mock_db):
     await mock_db["pgasme_test"].deposits.insert_one(
         {
             "_id": "old1",
@@ -350,4 +350,4 @@ async def test_a_deposit_written_before_modes_existed_reads_as_dln(client, user,
         }
     )
     d = (await client.get("/v1/deposits/old1", headers=user["headers"])).json()
-    assert d["mode"] == "dln"
+    assert d["mode"] == "xchain"

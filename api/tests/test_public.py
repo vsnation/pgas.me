@@ -1,11 +1,12 @@
-"""Public routes: chains, tokens, assets, stats, health — DLN calls patched with recorded shapes."""
+"""Public routes: chains, tokens, assets, stats, health — router calls patched with recorded shapes."""
 
 from __future__ import annotations
 
 import time
 
-from pgasme import dln, workers
+from pgasme import workers, xchain
 from pgasme.assets import ASSETS
+from pgasme.config import LEGACY_CHAIN_ID_FIELD
 
 
 async def test_chains_map_ids_and_batch_balance(client):
@@ -13,7 +14,10 @@ async def test_chains_map_ids_and_batch_balance(client):
     by = {c["chain_id"]: c for c in rows}
     assert by[42161] == {
         "chain_id": 42161,
-        "dln_chain_id": 42161,
+        "route_chain_id": 42161,
+        # emitted for one release under the router's own older field name as well, so an SPA
+        # build that predates the rename keeps resolving chains (routers/dex)
+        LEGACY_CHAIN_ID_FIELD: 42161,
         "name": "Arbitrum",
         "native_symbol": "ETH",
         "batch_balance": "0x50188692d5549386d102642036bab916b998c814",
@@ -21,11 +25,14 @@ async def test_chains_map_ids_and_batch_balance(client):
     assert by[8453]["batch_balance"] == "0x202eF28cA6D4d2B94C4Ea0534a8E6261581c70a4"
     assert by[1514] == {
         "chain_id": 1514,
-        "dln_chain_id": 100000013,
+        "route_chain_id": 100000013,
+        LEGACY_CHAIN_ID_FIELD: 100000013,
         "name": "Story",
         "native_symbol": "IP",
     }
     assert "batch_balance" not in by[7565164]
+    # the id of record and its deprecated alias never disagree: two spellings of one fact
+    assert all(c[LEGACY_CHAIN_ID_FIELD] == c["route_chain_id"] for c in rows)
 
 
 async def test_tokens_native_first(client, monkeypatch):
@@ -54,7 +61,7 @@ async def test_tokens_native_first(client, monkeypatch):
         seen.append((path, params))
         return recorded
 
-    monkeypatch.setattr(dln, "_get", get)
+    monkeypatch.setattr(xchain, "_get", get)
     body = (await client.get("/v1/dex/tokens", params={"chain_id": 1514})).json()
     assert seen == [("token-list", {"chainId": 100000013})]
     assert [t["symbol"] for t in body["tokens"]] == ["ETH", "USDC"]
@@ -70,11 +77,11 @@ async def test_tokens_native_first(client, monkeypatch):
     assert (await client.get("/v1/dex/tokens", params={"chain_id": 4242})).status_code == 400
 
 
-async def test_dln_errors_surface_as_502_with_the_upstream_message(client, monkeypatch):
+async def test_xchain_errors_surface_as_502_with_the_upstream_message(client, monkeypatch):
     async def chains(force=False):
-        raise dln.DlnError("https://dln.debridge.finance/v1.0/supported-chains-info: ConnectError")
+        raise xchain.XchainError("https://router.example/v1.0/supported-chains-info: ConnectError")
 
-    monkeypatch.setattr(dln, "supported_chains", chains)
+    monkeypatch.setattr(xchain, "supported_chains", chains)
     r = await client.get("/v1/dex/chains")
     assert r.status_code == 502 and "ConnectError" in r.json()["detail"]
 

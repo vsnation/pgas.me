@@ -1,7 +1,7 @@
 // Chain constants for the client-side scanner and wallet chain switching, plus the health-checked
 // public RPC fallbacks. Ported from buybeam.my: batch-balance contracts, ordered public endpoints
 // (the first entry takes every health check, so the most tolerant goes first), CoinGecko ids and
-// deBridge's chain icons.
+// this app's own chain icons.
 import { JsonRpcProvider, Network } from 'ethers';
 
 export const NATIVE_ADDRESS = '0x0000000000000000000000000000000000000000';
@@ -16,8 +16,8 @@ export function isNativeToken(address: string | undefined | null): boolean {
 }
 
 /**
- * deBridge lists two non-EVM chains. They are not errors and not "unreachable" — there is simply no
- * eth_* RPC to ask, so the scanner skips them and says so.
+ * The cross-chain order router lists two non-EVM chains. They are not errors and not "unreachable"
+ * — there is simply no eth_* RPC to ask, so the scanner skips them and says so.
  */
 export const NON_EVM_CHAINS = new Set([7565164 /* Solana */, 728126428 /* Tron */]);
 
@@ -42,19 +42,19 @@ export const BATCH_BALANCE_CONTRACTS: Record<number, string> = {
 
 /**
  * Multicall3, same address on every chain that has it. Verified with eth_getCode on 2026-09-09 to
- * carry 3,808 bytes of code on every DLN chain without a batch-balance contract (4663, 1514, 25,
+ * carry 3,808 bytes of code on every listed chain without a batch-balance contract (4663, 1514, 25,
  * 999, 1776, 143, 4326). The scanner uses it for ERC-20 balances there; if the call ever fails it
  * falls back to per-token balanceOf.
  */
 export const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
 
 // Verified 2026-09-09, twice per URL: (a) curl eth_chainId returns this chain's id, (b) fetch() from
-// a page on http://127.0.0.1:4173 succeeds (CORS). Only URLs passing BOTH are listed. Every DLN EVM
-// chain has at least two. Dropped for CORS: eth.merkle.io (1), op-pokt.nodies.app (10). Dropped for
+// a page on http://127.0.0.1:4173 succeeds (CORS). Only URLs passing BOTH are listed. Every EVM
+// chain on the list has at least two. Dropped for CORS: eth.merkle.io (1), op-pokt.nodies.app (10). Dropped for
 // auth/rate limits: rpc.ankr.com/*, *.llamarpc.com, bsc.drpc.org, polygon-rpc.com, story.drpc.org,
 // injective.drpc.org, monad-rpc.publicnode.com, rpc.arrowrpc.com.
 const FALLBACK_RPCS: Record<number, string[]> = {
-  // ---- the 15 EVM chains deBridge/DLN offers today ----
+  // ---- the 15 EVM chains the cross-chain order router offers today ----
   // rpc.flashbots.net is NOT here: it answers eth_chainId and eth_getCode and then refuses eth_call
   // with "rpc method is not whitelisted" — it is a transaction relay, not a reader.
   1: [
@@ -103,7 +103,7 @@ const FALLBACK_RPCS: Record<number, string[]> = {
   1776: ['https://sentry.evm-rpc.injective.network', 'https://injectiveevm-rpc.polkachu.com'],
   143: ['https://rpc.monad.xyz', 'https://monad.drpc.org'],
   4326: ['https://mainnet.megaeth.com/rpc', 'https://megaeth.rpc.thirdweb.com', 'https://megaeth.drpc.org'],
-  // ---- not on the DLN list today: kept so a chain deBridge adds later is not blind (unverified) ----
+  // ---- not on the list today: kept so a chain added later is not blind (unverified) ----
   250: ['https://rpc.ftm.tools', 'https://fantom-rpc.publicnode.com'],
   100: ['https://rpc.gnosischain.com', 'https://gnosis-rpc.publicnode.com'],
   324: ['https://mainnet.era.zksync.io'],
@@ -120,7 +120,7 @@ const FALLBACK_RPCS: Record<number, string[]> = {
 };
 
 // CoinGecko asset-platform ids, read from GET /api/v3/asset_platforms by chain_identifier
-// (2026-09-09): every DLN EVM chain has one.
+// (2026-09-09): every EVM chain on the list has one.
 export const COINGECKO_PLATFORMS: Record<number, string> = {
   1: 'ethereum',
   10: 'optimistic-ethereum',
@@ -169,30 +169,15 @@ export const COINGECKO_NATIVE_IDS: Record<number, string> = {
   2741: 'ethereum',
 };
 
-// buybeam.my's CHAIN_ICON_NAMES + getChainIcon, verified 2026-09-09 (every name below answers 200
-// image/svg+xml). Story has no chain asset on the CDN, so its badge is simply not shown.
-const CHAIN_ICON_NAMES: Record<number, string> = {
-  1: 'eth',
-  10: 'optimism',
-  56: 'bsc',
-  137: 'polygon',
-  250: 'fantom',
-  4663: 'robinhood',
-  8453: 'base',
-  42161: 'arbitrum',
-  43114: 'avalanche',
-  59144: 'linea',
-  25: 'cronos',
-  999: 'hyperliquid',
-  1776: 'injective',
-  143: 'monad',
-  4326: 'mega-eth',
-};
+// Chain icons are this app's own files, not a third party's CDN: one SVG per chain under
+// web/public/chains/, fetched once on 2026-09-09 and committed, so a badge cannot depend on someone
+// else's uptime or tell them who is looking. These are the 15 EVM chains the router offers; Story
+// (1514) has no icon, so its badge is simply not shown — a chip without one is not an error.
+const CHAIN_ICONS = new Set([1, 10, 25, 56, 137, 143, 250, 999, 1776, 4326, 4663, 8453, 42161, 43114, 59144]);
 
-/** deBridge's chain icon, or null when the CDN has none (the chip then shows no badge). */
+/** This app's chain icon, or null when there is no file for the chain (the chip then shows no badge). */
 export function chainIconUrl(chainId: number): string | null {
-  const name = CHAIN_ICON_NAMES[chainId];
-  return name ? `https://app.debridge.com/assets/images/chain/${name}.svg` : null;
+  return CHAIN_ICONS.has(chainId) ? `/chains/${chainId}.svg` : null;
 }
 
 export interface ChainMeta {
