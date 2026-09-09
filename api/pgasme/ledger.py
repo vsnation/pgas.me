@@ -17,10 +17,35 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from pymongo.errors import DuplicateKeyError
+
 from .assets import ASSETS
 from .db import db
 
 KINDS = ("credit", "schedule", "release", "fee", "cancel", "refund", "adjust")
+# one credit per ref, enforced by the database and not by a read-then-write
+CREDIT_REF_INDEX = "uniq_credit_ref"
+
+
+class AlreadyCredited(RuntimeError):
+    """The (credit, ref) unique index refused a second credit for the same deposit. The money is
+    already in the balance; the caller must treat this as success, never as a failure."""
+
+
+class AlreadyRefunded(RuntimeError):
+    """A cancel entry for this ref already exists — the money is already back in Available."""
+
+
+async def ensure_indexes() -> None:
+    """The ledger's own guarantees. Called at worker start (db.ensure_indexes owns the rest):
+    a second `credit` for one ref is refused by the DATABASE, so two racing writers cannot both
+    pass a has_credit() read and both append."""
+    await db().entries.create_index(
+        [("kind", 1), ("ref", 1)],
+        unique=True,
+        partialFilterExpression={"kind": "credit"},
+        name=CREDIT_REF_INDEX,
+    )
 
 
 def _asset(asset: str) -> str:
@@ -40,6 +65,7 @@ async def _append(
     d_sent: int,
     ref: str,
     note: str = "",
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if kind not in KINDS:
         raise ValueError(f"unknown ledger kind {kind}")
@@ -54,6 +80,7 @@ async def _append(
         "ref": ref,
         "note": note,
         "at": time.time(),
+        **(extra or {}),
     }
     await db().entries.insert_one(doc)
     doc.pop("_id", None)
@@ -63,8 +90,14 @@ async def _append(
 async def credit(
     account_id: str, asset: str, groth: int, ref: str, note: str = ""
 ) -> dict[str, Any]:
-    """A deposit landed: Available += groth. No fee at deposit (founder rule)."""
-    return await _append(account_id, asset, "credit", groth, groth, 0, 0, ref, note)
+    """A deposit landed: Available += groth. No fee at deposit (founder rule).
+
+    Raises AlreadyCredited when the unique (credit, ref) index refuses the row — the deposit is
+    already paid for and nothing more is owed."""
+    try:
+        return await _append(account_id, asset, "credit", groth, groth, 0, 0, ref, note)
+    except DuplicateKeyError as e:
+        raise AlreadyCredited(f"credit for {ref} already exists") from e
 
 
 async def schedule(
@@ -86,11 +119,31 @@ async def release(
 
 
 async def cancel(
-    account_id: str, asset: str, groth_incl_fee: int, ref: str, note: str = ""
+    account_id: str,
+    asset: str,
+    groth_incl_fee: int,
+    ref: str,
+    note: str = "",
+    refund_of: str | None = None,
 ) -> dict[str, Any]:
-    """A scheduled request cancelled before release: money back to Available."""
+    """A scheduled request cancelled before release: money back to Available.
+
+    `refund_of` names the entry this reverses (the schedule row that actually debited the
+    account). A second cancel for the same ref is refused: a refund is only ever the mirror of
+    a debit that landed, and only once."""
+    if await find_entry("cancel", ref):
+        raise AlreadyRefunded(f"{ref} was already refunded")
     return await _append(
-        account_id, asset, "cancel", groth_incl_fee, groth_incl_fee, -groth_incl_fee, 0, ref, note
+        account_id,
+        asset,
+        "cancel",
+        groth_incl_fee,
+        groth_incl_fee,
+        -groth_incl_fee,
+        0,
+        ref,
+        note,
+        {"refund_of": refund_of} if refund_of else None,
     )
 
 
@@ -133,6 +186,11 @@ async def balance(account_id: str, asset: str) -> dict[str, int]:
 async def history(account_id: str, limit: int = 100) -> list[dict[str, Any]]:
     cur = db().entries.find({"account_id": account_id}, {"_id": 0}).sort("at", -1).limit(limit)
     return await cur.to_list(length=limit)
+
+
+async def find_entry(kind: str, ref: str) -> dict[str, Any] | None:
+    """The entry of this kind for this ref, or None. The evidence a refund needs."""
+    return await db().entries.find_one({"kind": kind, "ref": ref}, {"_id": 0})
 
 
 async def has_credit(ref: str) -> bool:

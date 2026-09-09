@@ -1,0 +1,30 @@
+{
+  "name": "Pgas.me",
+  "short_name": "Pgas.me",
+  "description": "Private gas funding for fresh EVM wallets, settled on Beam. Pay any token on any chain and fund new wallets with no on-chain link to the source.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0F1319",
+  "theme_color": "#0F1319",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

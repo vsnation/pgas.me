@@ -13,9 +13,9 @@ function entryDelta(e: HistoryEntry): { text: string; cls: string } {
   const avail = e.d_avail ?? 0;
   const sched = e.d_sched ?? 0;
   const sent = e.d_sent ?? 0;
-  if (avail > 0) return { text: `+${fmtGroth(avail)} available`, cls: 'grade-good' };
-  if (sched > 0) return { text: `${fmtGroth(sched)} → scheduled`, cls: 'grade-ok' };
-  if (sent > 0) return { text: `${fmtGroth(sent)} sent`, cls: 'grade-good' };
+  if (avail > 0) return { text: `+${fmtGroth(avail)} available`, cls: 'delta-in' };
+  if (sched > 0) return { text: `${fmtGroth(sched)} → scheduled`, cls: 'delta-hold' };
+  if (sent > 0) return { text: `${fmtGroth(sent)} sent`, cls: 'delta-in' };
   if (avail < 0) return { text: `−${fmtGroth(-avail)} available`, cls: '' };
   if (sched < 0) return { text: `−${fmtGroth(-sched)} scheduled`, cls: '' };
   return { text: fmtGroth(e.groth), cls: '' };

@@ -8,6 +8,9 @@ Shapes (recorded live 2026-09-09):
   GET /dln/order/create-tx?…        → {"estimation":{srcChainTokenIn{…},dstChainTokenOut{amount,…},costsDetails[]},
                                        "tx":{data,to,value[,allowanceTarget,allowanceValue]},"orderId","order":{…},
                                        "fixFee","protocolFee","estimatedTransactionFee":{…}}
+  GET /chain/estimation?…           → {"estimation":{tokenIn{…},tokenOut{amount,minAmount,…},slippage,
+                                       protocolFee,estimatedTransactionFee{…},costsDetails[]}}
+  GET /chain/transaction?…          → the same fields FLAT + {"tx":{to,data,value}}  (same-chain swaps)
   GET /dln/tx/{hash}/order-ids      → {"orderIds":["0x…"]}
   GET /dln/order/{id}/status        → {"status":"Fulfilled","orderId":"0x…"}   (400 UNKNOWN_ORDER when unknown)
   GET stats-api /Orders/{id}/liteModel → {state, rawOrderMetadataHex, orderFulfilledTransactionHash, …}
@@ -172,8 +175,51 @@ async def create_tx(params: dict[str, Any]) -> dict[str, Any]:
     return body
 
 
-async def order_ids_by_tx(tx_hash: str) -> list[str]:
-    body = await _get(f"dln/tx/{tx_hash}/order-ids")
+# --------------------------------------------------------------- single-chain (same-chain) swaps
+# DLN's ORDER api refuses an order whose source and destination chain are the same
+# (SAME_SOURCE_AND_DESTINATION_CHAINS) and points at these two endpoints instead. They take NO
+# hook parameter: the swap lands in tokenOutRecipient's OWN wallet and the pipe deposit is a
+# second transaction the user signs afterwards (API_CONTRACT.md, mode "swap").
+# Recorded live 2026-09-09 on dln.debridge.finance, mainnet 5 USDC -> ETH:
+#   GET /chain/estimation  -> {"estimation":{tokenIn{symbol,decimals,amount,approximateUsdValue},
+#                              tokenOut{amount,minAmount,approximateUsdValue,...},slippage,
+#                              recommendedSlippage,protocolFee,estimatedTransactionFee{total,...},
+#                              comparedAggregators[],costsDetails[]}}
+#   GET /chain/transaction -> the SAME fields FLAT (no "estimation" wrapper) plus {"tx":{to,data,value}}.
+#                             No allowanceTarget/allowanceValue was returned for the ERC-20 input.
+
+
+async def chain_estimation(params: dict[str, Any]) -> dict[str, Any]:
+    """GET /chain/estimation → the inner `estimation` object (tokenIn, tokenOut, fees, costs)."""
+    body = await _get("chain/estimation", params)
+    est = body.get("estimation") if isinstance(body, dict) else None
+    if not isinstance(est, dict) or not isinstance(est.get("tokenOut"), dict):
+        raise DlnError(f"chain/estimation: malformed answer {str(body)[:200]}")
+    return est
+
+
+async def chain_transaction(params: dict[str, Any]) -> dict[str, Any]:
+    """GET /chain/transaction → the whole body; `tx` is the swap the USER signs, into their own
+    wallet. A body without a usable tx is an error, never an empty result."""
+    body = await _get("chain/transaction", params)
+    tx = body.get("tx") if isinstance(body, dict) else None
+    if not isinstance(tx, dict) or not (tx.get("to") and tx.get("data")):
+        raise DlnError(f"chain/transaction: no transaction in the answer {str(body)[:200]}")
+    return body
+
+
+def swap_out_amount(body: dict[str, Any]) -> int:
+    """tokenOut.amount of a single-chain estimation (or transaction) answer, as int."""
+    try:
+        return int(body["tokenOut"]["amount"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise DlnError(f"single-chain swap: no tokenOut.amount ({e})") from e
+
+
+async def order_ids_by_tx(tx_hash: str, timeout: float | None = None) -> list[str]:
+    """The DLN orders created by one source transaction. Raises DlnError when the API cannot
+    answer — an unreadable answer is not "this transaction created no orders"."""
+    body = await _get(f"dln/tx/{tx_hash}/order-ids", timeout=timeout)
     ids = body.get("orderIds") if isinstance(body, dict) else None
     if not isinstance(ids, list):
         raise DlnError(f"order-ids {tx_hash}: malformed answer {str(body)[:200]}")

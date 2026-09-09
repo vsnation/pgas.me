@@ -1,4 +1,9 @@
-"""POST /v1/dev/credit — seed a balance for UI / e2e tests. Mounted ONLY when PGAS_DEV_ENDPOINTS=1."""
+"""POST /v1/dev/credit — seed a balance for UI / e2e tests.
+
+Mounted only when settings.dev_endpoints_active (PGAS_DEV_ENDPOINTS=1 AND env != prod), and
+guarded again here at the level it protects: a router mounted by hand still cannot mint
+balance on a production process.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from .. import auth, ledger
 from ..assets import ASSETS
+from ..config import settings
 
 router = APIRouter(prefix="/v1/dev", tags=["dev"])
 
@@ -20,6 +26,8 @@ class CreditIn(BaseModel):
 
 @router.post("/credit")
 async def credit(body: CreditIn, acct=auth.Account):
+    if not settings.dev_endpoints_active:
+        raise HTTPException(404, "not found")
     asset = body.asset.upper()
     if asset not in ASSETS:
         raise HTTPException(400, f"unknown asset {body.asset!r}")

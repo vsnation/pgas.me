@@ -20,6 +20,7 @@ def public_deposit(d: dict) -> dict:
     d = dict(d)
     d.pop("account_id", None)
     d.pop("pubkey", None)
+    d.setdefault("mode", "dln")  # rows written before the same-chain modes existed
     return d
 
 

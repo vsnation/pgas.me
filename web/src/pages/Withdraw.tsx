@@ -1,7 +1,6 @@
 // Withdraw: tick destinations, set an amount per wallet, choose Direct/Instant and a window.
 import { useEffect, useMemo, useState } from 'react';
 import { SignInGate } from '../components/SignInGate';
-import { GradeText } from '../components/Status';
 import { api, errorText } from '../lib/api';
 import { GROTH, fmtDuration, fmtGroth, parseGroth, shortAddr } from '../lib/format';
 import type { AssetKey, Destination, PayoutMode, WithdrawalResponse } from '../lib/types';
@@ -299,7 +298,7 @@ export function WithdrawPage() {
                   </div>
                 )}
                 <span className="help">
-                  Each wallet's release time is drawn independently inside the window. Longer windows read better on the privacy grade.
+                  Each wallet's release time is drawn independently inside the window. Longer windows spread the payouts out further.
                 </span>
               </div>
             </section>
@@ -367,7 +366,6 @@ export function WithdrawPage() {
                   <span>
                     ETA {fmtDuration(result.eta?.min_s)} – {fmtDuration(result.eta?.max_s)}.
                   </span>
-                  <GradeText grade={result.privacy_grade} text={`Privacy grade for this withdrawal: ${result.privacy_grade}`} />
                   <span className="tiny mono wrap">{result.request_ids.join(', ')}</span>
                 </div>
               )}

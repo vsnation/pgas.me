@@ -53,6 +53,19 @@ def low_floor(monkeypatch):
     monkeypatch.setattr(settings, "min_deposit_wei", 10**15)
 
 
+@pytest.fixture(autouse=True)
+def dln_index_offline(monkeypatch):
+    """POST /v1/deposits resolves the hash against DLN's index. No test may reach the live API
+    for that: the default answer here is "not indexed yet", which is what a freshly signed
+    transaction really looks like."""
+
+    async def order_ids(tx_hash: str, timeout: float | None = None) -> list[str]:
+        return []
+
+    monkeypatch.setattr(dln, "order_ids_by_tx", order_ids)
+    return order_ids
+
+
 @pytest.fixture
 def fake_dln(monkeypatch):
     f = FakeDln()
@@ -64,6 +77,7 @@ async def test_unarmed_quote_is_an_estimate_only(client, user, fake_dln, mock_db
     r = await client.post("/v1/quote", json=Q, headers=user["headers"])
     assert r.status_code == 200, r.text
     body = r.json()
+    assert body["mode"] == "dln"  # a cross-chain quote is unchanged by the same-chain modes
     assert (
         body["armed"] is False
         and "tx" not in body
@@ -107,6 +121,7 @@ async def test_armed_quote_carries_tx_approval_and_a_hook_for_our_pubkey(
     r = await client.post("/v1/quote", json=Q, headers=user["headers"])
     assert r.status_code == 200, r.text
     body = r.json()
+    assert body["mode"] == "dln" and "swap_tx" not in body and "next" not in body
     assert body["armed"] is True and body["order_id"] == "0x" + "77" * 32 and "note" not in body
     assert body["tx"] == {
         "chain_id": 42161,
@@ -297,6 +312,7 @@ async def test_deposit_from_an_armed_quote(client, user, fake_dln, armed_eth, mo
     assert again.json()["deposit_id"] == dep_id  # idempotent on the hash
     d = (await client.get(f"/v1/deposits/{dep_id}", headers=h)).json()
     assert d["asset"] == "ETH" and d["status"] == "submitted" and d["order_id"] == quote["order_id"]
+    assert d["mode"] == "dln"
     assert d["src"] == {"chain_id": 42161, "token": USDC_ARB, "amount": "10000000"}
     assert (
         d["eth"]["value_units"] == quote["estimate"]["value_units"]

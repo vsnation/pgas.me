@@ -284,3 +284,68 @@ async def test_late_attribution_resolves_an_open_unattributed_lock(
     d = mock_db["pgasme_test"]
     assert (await d.deposits.find_one({"_id": "dep1"}))["status"] == "locked"
     assert (await d.unattributed_locks.find_one({}))["status"] == "resolved"
+
+
+# ------------------------------------------------------- direct deposits (no DLN in the story)
+
+
+async def test_a_direct_lock_is_attributed_by_its_own_registered_tx_hash(mock_db, our_key, rpc):
+    """The user called the pipe themselves on Ethereum: the receipt holds NO FulfilledOrder, and
+    the hash they registered is the whole claim."""
+    fee = 112_168_855_201
+    await _deposit(
+        mock_db,
+        mode="direct",
+        order_id=None,
+        src_tx_hash=TX,
+        src={"chain_id": 1, "token": "0x" + "00" * 20, "amount": str(VALUE + fee)},
+    )
+    rpc.logs_.append(lock_log(ETH.pipe, 42, VALUE, fee, PUBKEY, 1500, TX, 0))
+    rpc.receipts[TX] = {"logs": [rpc.logs_[0]]}
+    st = await scanner.scan_pipe(ETH, rpc)
+    assert st["locked"] == 1 and st["unattributed"] == 0
+    d = mock_db["pgasme_test"]
+    dep = await d.deposits.find_one({"_id": "dep1"})
+    assert dep["status"] == "locked" and dep["eth"]["tx"] == TX and dep["eth"]["msg_id"] == 42
+    assert dep["order_id"] is None and "fill_units" not in dep["eth"]
+    assert await d.unattributed_locks.count_documents({}) == 0
+    await workers.confirm_locked(head=1511)  # and it credits like any other deposit
+    assert (await d.deposits.find_one({"_id": "dep1"}))["status"] == "credited"
+    assert (await ledger.balance("acct1", "ETH"))["available"] == VALUE // 10**10
+
+
+async def test_a_lock_with_no_dln_fill_matches_only_a_direct_deposit(mock_db, our_key, rpc):
+    """Same hash, but the deposit is a cross-chain one: its lock has to arrive with a DLN fill,
+    so this is still unattributed and nobody is credited."""
+    await _deposit(mock_db, src_tx_hash=TX)  # no `mode` at all: an old cross-chain row
+    rpc.logs_.append(lock_log(ETH.pipe, 43, VALUE, 1, PUBKEY, 1500, TX, 0))
+    rpc.receipts[TX] = {"logs": [rpc.logs_[0]]}
+    st = await scanner.scan_pipe(ETH, rpc)
+    assert st["unattributed"] == 1 and st["locked"] == 0
+    d = mock_db["pgasme_test"]
+    assert (await d.deposits.find_one({"_id": "dep1"}))["status"] == "submitted"
+    assert "not a DLN fill" in (await d.unattributed_locks.find_one({}))["reason"]
+    assert await d.entries.count_documents({}) == 0
+
+
+async def test_a_direct_lock_for_the_wrong_amount_is_unattributed(mock_db, our_key, rpc):
+    await _deposit(mock_db, mode="direct", order_id=None, src_tx_hash=TX)
+    rpc.logs_.append(lock_log(ETH.pipe, 44, VALUE + 10**10, 1, PUBKEY, 1500, TX, 0))
+    rpc.receipts[TX] = {"logs": [rpc.logs_[0]]}
+    st = await scanner.scan_pipe(ETH, rpc)
+    assert st["unattributed"] == 1
+    d = mock_db["pgasme_test"]
+    assert (await d.deposits.find_one({"_id": "dep1"}))["status"] == "submitted"
+    assert "amount mismatch" in (await d.unattributed_locks.find_one({}))["reason"]
+
+
+async def test_the_dln_secondary_pass_never_asks_about_a_direct_deposit(mock_db, monkeypatch):
+    async def boom(tx_hash: str):
+        raise AssertionError(f"a direct deposit has no DLN order to look up ({tx_hash})")
+
+    monkeypatch.setattr(dln, "order_ids_by_tx", boom)
+    await _deposit(mock_db, mode="direct", order_id=None, src_tx_hash=TX, created_at=0.0)
+    assert await workers.dln_secondary() == 0
+    assert (await mock_db["pgasme_test"].deposits.find_one({"_id": "dep1"}))[
+        "status"
+    ] == "submitted"

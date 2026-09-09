@@ -1,10 +1,14 @@
 // Deposit: portfolio → target asset + source chain/token/amount → quote → (armed) approve/deposit
 // → status timeline. When the Beam wallet is not armed the quote is a preview and nothing is sent.
+//
+// Three quote modes (API_CONTRACT.md): `dln` is the cross-chain order; `direct` skips deBridge and
+// pays the pipe itself; `swap` is a single-chain DLN swap into the user's OWN wallet, after which we
+// re-quote what actually arrived and continue as `direct`. A swap tx is never registered as a deposit.
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { BrowserProvider, Interface, formatUnits } from 'ethers';
 import { Portfolio } from '../components/Portfolio';
 import { SignInGate } from '../components/SignInGate';
-import { GradeText, anonymityGrade, depositStatusLabel } from '../components/Status';
+import { depositStatusLabel } from '../components/Status';
 import { api, errorText } from '../lib/api';
 import { NATIVE_ADDRESS, getFallbackProvider, isNativeToken } from '../lib/chains';
 import { explorerTx, fmtDuration, fmtUnits, fmtUsd, parseAmount, toDate } from '../lib/format';
@@ -16,7 +20,28 @@ const QUOTE_DEBOUNCE_MS = 500;
 const QUOTE_TTL_FALLBACK_S = 30; // DLN quotes live ~30 s; used when the API sends no expires_at
 const MIN_ETH_GROTH = 2_000_000; // 0.02 ETH-equivalent product minimum
 
-type Stage = 'idle' | 'approving' | 'approved' | 'sending' | 'registering' | 'tracking';
+type Stage = 'idle' | 'approving' | 'approved' | 'swapping' | 'swap-wait' | 'sending' | 'registering' | 'tracking';
+
+const ERC20 = new Interface(['function balanceOf(address owner) view returns (uint256)']);
+
+/** A read-only provider for Ethereum: the wallet when it is already there, else a public RPC. */
+async function ethereumProvider(provider: unknown, chainId: number | null) {
+  if (provider && chainId === 1) return new BrowserProvider(provider as never, 1);
+  return await getFallbackProvider(1);
+}
+
+/** The wallet's balance of the swap's target token, or null when nothing could read it. */
+async function readBalanceOnEthereum(token: string, owner: string, provider: unknown, chainId: number | null): Promise<bigint | null> {
+  try {
+    const p = await ethereumProvider(provider, chainId);
+    if (!p) return null;
+    if (isNativeToken(token)) return await p.getBalance(owner);
+    const res = await p.call({ to: token, data: ERC20.encodeFunctionData('balanceOf', [owner]) });
+    return res && res !== '0x' ? BigInt(ERC20.decodeFunctionResult('balanceOf', res)[0] as bigint) : null;
+  } catch {
+    return null; // an unreadable balance is not evidence of anything — the caller uses `next.amount`
+  }
+}
 
 function assetDecimals(assets: Asset[], key: AssetKey): number {
   return assets.find((a) => a.key === key)?.decimals ?? (key === 'WBTC' ? 8 : 18);
@@ -30,7 +55,7 @@ function expiresInSeconds(q: Quote, receivedAt: number): number {
 
 export function DepositPage() {
   const { wallet, session, data } = useStore();
-  const { chains, assets, stats } = data;
+  const { chains, assets } = data;
 
   const [target, setTarget] = useState<AssetKey>('ETH');
   const [chainId, setChainId] = useState<number | null>(null);
@@ -54,6 +79,8 @@ export function DepositPage() {
   const [approveHash, setApproveHash] = useState<string | null>(null);
   const [txHash, setTxHash] = useState<string | null>(null);
   const [depositId, setDepositId] = useState<string | null>(null);
+  const [swapHash, setSwapHash] = useState<string | null>(null);
+  const [swapDone, setSwapDone] = useState<{ from: string; to: string; amount: string } | null>(null);
 
   const sortedChains = useMemo(
     () => [...chains].sort((a, b) => (a.chain_id === 1 ? -1 : b.chain_id === 1 ? 1 : a.name.localeCompare(b.name))),
@@ -62,7 +89,8 @@ export function DepositPage() {
   const chain: Chain | undefined = useMemo(() => chains.find((c) => c.chain_id === chainId), [chains, chainId]);
   const targetAsset = assets.find((a) => a.key === target);
   const outDecimals = assetDecimals(assets, target);
-  const busy = stage === 'approving' || stage === 'sending' || stage === 'registering';
+  const busy = stage === 'approving' || stage === 'sending' || stage === 'registering' || stage === 'swapping' || stage === 'swap-wait';
+  const mode = quote?.mode ?? 'dln';
   const rawAmount = token ? parseAmount(amount, token.decimals) : null;
 
   const resetFlow = useCallback(() => {
@@ -71,6 +99,8 @@ export function DepositPage() {
     setApproveHash(null);
     setTxHash(null);
     setDepositId(null);
+    setSwapHash(null);
+    setSwapDone(null);
   }, []);
 
   // default chain: the wallet's if supported, else Ethereum
@@ -232,6 +262,44 @@ export function DepositPage() {
     }
   };
 
+  // ---- swap (mode "swap"): one DLN swap into the user's own wallet, then a fresh `direct` quote ----
+  const runSwap = async () => {
+    if (!quote?.swap_tx || !quote.next || !targetAsset || !sender) return;
+    const nextToken = quote.next.src_token;
+    const fromSymbol = quote.estimate.src.symbol;
+    setFlowError(null);
+    const before = await readBalanceOnEthereum(nextToken, sender, wallet.provider, wallet.chainId);
+    let hash: string | null = null;
+    try {
+      setStage('swapping');
+      hash = await wallet.sendTransaction({
+        to: quote.swap_tx.to,
+        data: quote.swap_tx.data,
+        value: quote.swap_tx.value,
+        chainId: data.resolveEvmChainId(quote.swap_tx.chain_id),
+      });
+      setSwapHash(hash);
+      setStage('swap-wait');
+      const p = await ethereumProvider(wallet.provider, 1);
+      if (p) await p.waitForTransaction(hash, 1, 180_000);
+      // what actually arrived beats what was estimated; when nothing can read it, take `next.amount`
+      const after = await readBalanceOnEthereum(nextToken, sender, wallet.provider, 1);
+      let received = BigInt(quote.next.amount);
+      if (before !== null && after !== null && after > before) received = after - before;
+      setChainId(1);
+      setSelectedKey(null);
+      setToken({ address: nextToken, symbol: targetAsset.symbol, name: targetAsset.symbol, decimals: targetAsset.decimals });
+      setAmount(formatUnits(received, targetAsset.decimals));
+      setMaxRaw(received);
+      setApproveHash(null);
+      setSwapDone({ from: fromSymbol, to: targetAsset.symbol, amount: formatUnits(received, targetAsset.decimals) });
+      setStage('idle');
+    } catch (e) {
+      setFlowError(errorText(e));
+      setStage(hash ? 'swap-wait' : quote.approval ? 'approved' : 'idle');
+    }
+  };
+
   const retryRegister = async () => {
     if (!quote || !txHash) return;
     setFlowError(null);
@@ -247,7 +315,6 @@ export function DepositPage() {
     [session.account, depositId, txHash],
   );
 
-  const grade = anonymityGrade(stats);
   const needsApproval = !!quote?.approval && (stage === 'idle' || stage === 'approving');
   const belowMin = !!quote && target === 'ETH' && quote.estimate.out_groth > 0 && quote.estimate.out_groth < MIN_ETH_GROTH;
   const txChainName = quote?.tx ? (data.chainById(data.resolveEvmChainId(quote.tx.chain_id))?.name ?? `chain ${quote.tx.chain_id}`) : '';
@@ -262,7 +329,6 @@ export function DepositPage() {
             bridge. The credit lands as a balance held for this wallet — no fee at deposit, 2% when you withdraw.
           </p>
         </div>
-        <GradeText grade={grade.grade} text={grade.text} />
       </div>
 
       {wallet.address ? (
@@ -436,6 +502,16 @@ export function DepositPage() {
                         {quoteLoading ? ' · refreshing…' : ''}
                       </div>
                     </div>
+                    {mode === 'direct' && (
+                      <div className="banner banner-ok" data-testid="direct-note">
+                        Direct deposit — your {quote.target_asset} goes straight into the Beam bridge, no deBridge fee.
+                      </div>
+                    )}
+                    {swapDone && (
+                      <div className="banner banner-ok" data-testid="swap-done">
+                        Swapped {swapDone.from} → {swapDone.amount} {swapDone.to}. Step 2: deposit it below.
+                      </div>
+                    )}
                     <dl className="kv">
                       <dt>Paying</dt>
                       <dd className="num">
@@ -459,7 +535,69 @@ export function DepositPage() {
                       <div className="banner banner-warn">Below the 0.02 ETH minimum — credited, but ingress costs dominate.</div>
                     )}
 
-                    {!quote.armed || !quote.tx ? (
+                    {mode === 'swap' && quote.swap_tx ? (
+                      <div className="stack-sm" data-testid="swap-panel">
+                        <div className="banner banner-warn">
+                          <span>
+                            {quote.estimate.src.symbol} is not {quote.target_asset}. Step 1 swaps it in your own wallet through deBridge;
+                            the {quote.target_asset} lands in your wallet, never ours.
+                          </span>
+                        </div>
+                        <span className="strong">
+                          Step 1 — Swap {quote.estimate.src.symbol} → {quote.target_asset} in your wallet (deBridge)
+                        </span>
+                        {quote.approval && (
+                          <div className="row">
+                            <button
+                              type="button"
+                              className="btn btn-indigo"
+                              disabled={!needsApproval || busy || expiresIn <= 0}
+                              onClick={approve}
+                              data-testid="approve-btn"
+                            >
+                              {stage === 'approving'
+                                ? 'Waiting for approval…'
+                                : needsApproval
+                                  ? `Approve ${quote.estimate.src.symbol}`
+                                  : 'Approved'}
+                            </button>
+                            {approveHash && (
+                              <a
+                                href={explorerTx(data.resolveEvmChainId(quote.approval.chain_id), approveHash)}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="small"
+                              >
+                                approval tx
+                              </a>
+                            )}
+                          </div>
+                        )}
+                        <div className="row">
+                          <button
+                            type="button"
+                            className="btn btn-primary btn-lg"
+                            disabled={needsApproval || busy || expiresIn <= 0}
+                            onClick={runSwap}
+                            data-testid="swap-btn"
+                          >
+                            {stage === 'swapping'
+                              ? 'Confirm in the wallet…'
+                              : stage === 'swap-wait'
+                                ? 'Waiting for the swap…'
+                                : `Swap ${fmtUnits(quote.estimate.src.amount, quote.estimate.src.decimals)} ${quote.estimate.src.symbol}`}
+                          </button>
+                          {swapHash && (
+                            <a href={explorerTx(1, swapHash)} target="_blank" rel="noreferrer" className="small">
+                              swap tx
+                            </a>
+                          )}
+                        </div>
+                        <span className="help">
+                          Step 2 appears by itself: Pgas.me re-quotes the {quote.target_asset} that actually arrived as a direct deposit.
+                        </span>
+                      </div>
+                    ) : !quote.armed || !quote.tx ? (
                       <div className="banner banner-warn" data-testid="unarmed-banner">
                         <span>Deposits open when the Beam wallet is armed — this is a preview.</span>
                         {quote.note && <span className="small muted">{quote.note}</span>}
@@ -517,7 +655,9 @@ export function DepositPage() {
                             </span>
                           )}
                           <span className="help">
-                            The wallet switches to {txChainName} and sends one transaction to the deBridge order contract.
+                            {mode === 'direct'
+                              ? `The wallet switches to ${txChainName} and sends one transaction to the Beam bridge pipe.`
+                              : `The wallet switches to ${txChainName} and sends one transaction to the deBridge order contract.`}
                           </span>
                         </div>
                       )

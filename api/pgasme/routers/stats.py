@@ -8,7 +8,7 @@ from fastapi import APIRouter
 
 from .. import __version__, workers
 from ..config import settings
-from ..db import db
+from ..db import db, index_error_labels, indexes_ok
 
 router = APIRouter(tags=["stats"])
 
@@ -51,10 +51,18 @@ async def health() -> dict:
     except Exception:  # noqa: BLE001 — any failure means "mongo is not answering"
         mongo_ok = False
     return {
-        "ok": mongo_ok,
+        # `ok` is what the watchdog and deploy.sh page on: mongo answering AND the indexes the
+        # money path relies on being present. Weak secrets cannot reach here outside dev — the
+        # process refuses to boot on them — so they stay a separate assertable field.
+        "ok": mongo_ok and indexes_ok(),
         "version": __version__,
         "env": settings.env,
         "mongo": mongo_ok,
+        # posture a deploy can assert: real secrets, no test mint mounted, indexes present
+        "secrets_ok": settings.secrets_ok,
+        "dev_endpoints": settings.dev_endpoints_active,
+        "indexes_ok": indexes_ok(),
+        "index_errors": index_error_labels(),
         "ingress_armed": settings.ingress_ready,
         "ingress_assets": {k: settings.ingress_ready_for(k) for k in ("ETH", "DAI", "WBTC")},
         "ingress_near": settings.ingress_near_enabled,

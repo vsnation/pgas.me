@@ -38,12 +38,14 @@ async def test_tg_is_muted_without_env():
 
 
 async def test_submitted_becomes_order_seen_after_the_grace_period(mock_db, monkeypatch):
-    await _deposit(mock_db, created_at=time.time())
+    """The row's own order id has to be among the transaction's, and it is never replaced."""
+    ours = "0x" + "77" * 32
+    await _deposit(mock_db, created_at=time.time(), order_id=ours)
     calls = []
 
-    async def ids(h):
+    async def ids(h, timeout=None):
         calls.append(h)
-        return ["0x" + "77" * 32]
+        return ["0x" + "88" * 32, ours]
 
     monkeypatch.setattr(dln, "order_ids_by_tx", ids)
     await workers.dln_secondary()
@@ -59,9 +61,12 @@ async def test_submitted_becomes_order_seen_after_the_grace_period(mock_db, monk
     dep = await mock_db["pgasme_test"].deposits.find_one({"_id": "dep1"})
     assert (
         dep["status"] == "order_seen"
-        and dep["order_id"] == "0x" + "77" * 32
+        and dep["order_id"] == ours
+        and dep["verified"] is True
         and calls == ["0x" + "11" * 32]
     )
+    ev = await mock_db["pgasme_test"].events.find_one({"kind": "deposit_order_seen"})
+    assert ev and ev["deposit_id"] == "dep1"
 
 
 async def test_cancelled_order_fails_the_deposit(mock_db, monkeypatch):

@@ -10,10 +10,17 @@ and is dark in this version.
 
 from __future__ import annotations
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 GROTH_PER_WEI_GRID = 10**10  # Beam is 8 decimals; ETH is 18 → 1 groth = 1e10 wei
+
+# Secrets that ship in this file. A non-dev environment that still carries one of them is a
+# forgery kit: anyone with the repo can mint sessions (jwt_secret) or recompute every
+# account_id from an address (account_salt). Both are refused at boot below.
+PLACEHOLDER_SECRETS = frozenset({"dev-only-change-me", "dev-only-change-me-too", "change-me"})
+MIN_SECRET_CHARS = 32
+LAX_ENVS = frozenset({"dev"})  # every other env must carry real secrets
 
 
 class Settings(BaseSettings):
@@ -37,6 +44,10 @@ class Settings(BaseSettings):
     account_salt: str = "dev-only-change-me-too"
     session_ttl_s: int = 24 * 3600
     nonce_ttl_s: int = 300
+    # app-side abuse caps (nginx per-IP limits are a separate, additive layer)
+    rate_window_s: int = 600  # the fixed window every per-IP counter below is measured in
+    siwe_nonce_ip_limit: int = 30  # un-consumed /v1/siwe/nonce per IP within the nonce TTL
+    siwe_verify_ip_limit: int = 20  # /v1/siwe/verify attempts per IP per rate_window_s
 
     # deBridge DLN
     dln_base: str = "https://dln.debridge.finance/v1.0"
@@ -48,6 +59,9 @@ class Settings(BaseSettings):
     dln_slippage: float = 1.0
     dln_timeout_s: float = 25.0
     quote_ttl_s: int = 900
+    # quotes are NOT expired by a TTL index: the scanner resolves a late fill through
+    # quotes.order_id / quotes.metadata long after the quote stopped being signable.
+    quote_prune_after_s: int = 7 * 86400
 
     # Ethereum
     eth_rpcs: str = (
@@ -112,6 +126,53 @@ class Settings(BaseSettings):
         if v and (len(v) != 66 or any(c not in "0123456789abcdef" for c in v)):
             raise ValueError("a Beam pipe pubkey must be 33 bytes (66 hex chars)")
         return v
+
+    def secret_problem(self, name: str) -> str:
+        """Why this secret is not fit for a non-dev environment ('' when it is fine)."""
+        v = (getattr(self, name, "") or "").strip()
+        if not v:
+            return "is empty"
+        if v in PLACEHOLDER_SECRETS:
+            return "is still the placeholder committed in config.py"
+        if len(v) < MIN_SECRET_CHARS:
+            return f"is {len(v)} chars (minimum {MIN_SECRET_CHARS})"
+        return ""
+
+    @property
+    def secrets_ok(self) -> bool:
+        """True when jwt_secret AND account_salt are real, long enough secrets."""
+        return not any(self.secret_problem(n) for n in ("jwt_secret", "account_salt"))
+
+    @property
+    def dev_endpoints_active(self) -> bool:
+        """The single source of truth for mounting /v1/dev/* — never in prod, flag or not."""
+        return bool(self.dev_endpoints and self.env != "prod")
+
+    @model_validator(mode="after")
+    def _fail_closed(self) -> Settings:
+        """Refuse to construct (→ refuse to boot) on a posture that cannot be safe.
+
+        `dev` is the only lax environment: everything else must carry real secrets, and
+        prod additionally may never mount the /v1/dev/credit mint.
+        """
+        if self.env in LAX_ENVS:
+            return self
+        problems = [
+            f"PGAS_{n.upper()} {p}"
+            for n in ("jwt_secret", "account_salt")
+            if (p := self.secret_problem(n))
+        ]
+        if self.dev_endpoints and self.env == "prod":
+            problems.append(
+                "PGAS_DEV_ENDPOINTS=1 while PGAS_ENV=prod — /v1/dev/credit mints balance out of nothing"
+            )
+        if problems:
+            raise ValueError(
+                f"refusing to boot with PGAS_ENV={self.env!r}: "
+                + "; ".join(problems)
+                + " (set real values in /etc/pgasme.env, or run with PGAS_ENV=dev)"
+            )
+        return self
 
     def pubkey_for(self, asset_key: str) -> str:
         """The receiver pubkey for one pipe ('' when not configured)."""

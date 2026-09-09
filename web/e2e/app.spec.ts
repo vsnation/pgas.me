@@ -1,23 +1,46 @@
 import { expect, test, type Page } from '@playwright/test';
-import { MOCK_TX, MockApi, NATIVE, USDC, blockExternal, connectAndSignIn, installMockWallet, walletA, walletB } from './mocks';
+import {
+  DAI,
+  DEMO_HOLDINGS,
+  MOCK_TX,
+  MockApi,
+  MockRpc,
+  NATIVE,
+  USDC,
+  blockExternal,
+  connectAndSignIn,
+  installMockPrices,
+  installMockWallet,
+  walletA,
+  walletB,
+} from './mocks';
+
+const ETH_PIPE = '0xB1d7FF9D3aCaf30e282c5F6eb1F2A6503f516a96';
+const DAI_PIPE = '0xAcDc8f4559741a3c8CAAB0ba74c57807A9Fe2d73';
+const DLN_ORDER = '0xeF4fB24aD0916217251F553c0596F8Edc630EB66';
+const DLN_ALLOWANCE_TARGET = '0x6A000F20005980200259B80c5102003040001068';
 
 test.describe('Pgas.me web', () => {
   let api: MockApi;
   let pageErrors: string[];
 
-  async function boot(page: Page, path = '/') {
+  async function boot(page: Page, path = '/', opts: { rpc?: boolean } = {}) {
     api = new MockApi();
     pageErrors = [];
     page.on('pageerror', (e) => pageErrors.push(e.message));
     await blockExternal(page);
     await api.install(page);
+    if (opts.rpc) {
+      await new MockRpc(DEMO_HOLDINGS).install(page);
+      await installMockPrices(page);
+    }
     await installMockWallet(page);
     await page.goto(path);
   }
 
   test('connect → sign in: the SIWE message carries the nonce and host, the session sticks', async ({ page }) => {
     await boot(page);
-    await expect(page).toHaveTitle('Pgas.me');
+    await expect(page).toHaveTitle(/^Pgas\.me/); // index.html carries an SEO suffix
     await page.getByRole('button', { name: 'Connect wallet' }).first().click();
     await expect(page.getByRole('dialog', { name: 'Connect a wallet' })).toBeVisible();
     await page.locator('[data-wallet-id="6963:me.pgas.mock"]').click();
@@ -44,13 +67,47 @@ test.describe('Pgas.me web', () => {
     expect(pageErrors).toEqual([]);
   });
 
+  test('wallet picker lists every provider: two EIP-6963 wallets, a legacy Coin98 global, WalletConnect last', async ({ page }) => {
+    await boot(page);
+    await page.getByRole('button', { name: 'Connect wallet' }).first().click();
+    const rows = page.getByRole('dialog').locator('.wallet-row');
+    await expect(rows).toHaveCount(4);
+    await expect(rows.nth(0)).toHaveAttribute('data-wallet-id', '6963:me.pgas.mock');
+    await expect(rows.nth(0)).toContainText('Mock Wallet');
+    await expect(rows.nth(0).locator('.pill')).toHaveText('Detected');
+    await expect(rows.nth(1)).toHaveAttribute('data-wallet-id', '6963:me.pgas.mock2');
+    await expect(rows.nth(1)).toContainText('Mock Wallet 2');
+    await expect(rows.nth(2)).toHaveAttribute('data-wallet-id', 'inj:coin98');
+    await expect(rows.nth(2)).toContainText('Coin98');
+    await expect(rows.nth(2).locator('.pill')).toHaveText('Detected');
+    await expect(rows.nth(3)).toHaveAttribute('data-wallet-id', 'walletconnect');
+    await expect(rows.nth(3)).toContainText('WalletConnect');
+    await expect(rows.nth(3)).toContainText('not configured'); // VITE_WALLETCONNECT_PROJECT_ID is empty in this build
+    await expect(rows.nth(3)).toBeDisabled();
+    await expect(rows.nth(3).locator('.pill')).toHaveCount(0);
+
+    await rows.nth(1).click();
+    await expect(page.getByTestId('connected-address')).toContainText(walletB.address.slice(0, 6));
+    expect(await page.evaluate(() => localStorage.getItem('pgas.wallet.v1'))).toBe('6963:me.pgas.mock2');
+    await page.getByRole('button', { name: 'Disconnect' }).click();
+    await expect(page.getByTestId('connected-address')).toHaveCount(0);
+
+    await page.getByRole('button', { name: 'Connect wallet' }).first().click();
+    await page.locator('[data-wallet-id="inj:coin98"]').click();
+    await expect(page.getByTestId('connected-address')).toContainText(walletA.address.slice(0, 6));
+    await page.getByRole('button', { name: 'Sign in with wallet' }).first().click();
+    await expect(page.locator('.chip', { hasText: 'Signed in' })).toBeVisible();
+    expect(pageErrors).toEqual([]);
+  });
+
   test('portfolio degrades gracefully when RPCs fail and eth_call reverts', async ({ page }) => {
     await boot(page);
     await connectAndSignIn(page);
     const empty = page.getByTestId('portfolio-empty');
     await expect(empty).toBeVisible({ timeout: 30_000 });
     await expect(empty).toContainText('No holdings found on 1 reachable chain');
-    await expect(page.getByTestId('portfolio')).toContainText('1 of 4 chains read');
+    await expect(page.getByTestId('portfolio')).toContainText('1 of 5 chains read');
+    await expect(page.getByTestId('portfolio')).toContainText('2 not scanned (non-EVM)');
     await page.getByTestId('portfolio').locator('summary').click();
     await expect(page.getByTestId('portfolio')).toContainText('execution reverted');
     expect(pageErrors).toEqual([]);
@@ -63,7 +120,8 @@ test.describe('Pgas.me web', () => {
     await page.getByLabel('Amount (ETH)').fill('0.1');
     await expect(page.getByTestId('unarmed-banner')).toContainText('Deposits open when the Beam wallet is armed — this is a preview');
     await expect(page.getByTestId('unarmed-banner')).toContainText('ingress not armed');
-    await expect(page.getByTestId('quote-out')).toContainText('0.098');
+    await expect(page.getByTestId('quote-out')).toContainText('0.1'); // chain 1 + ETH is a direct deposit: nothing is skimmed
+    await expect(page.getByTestId('direct-note')).toContainText('straight into the Beam bridge, no deBridge fee');
     await expect(page.getByTestId('deposit-btn')).toHaveCount(0);
     const quote = api.calls.find((c) => c.path === '/quote');
     expect(quote?.body).toEqual({
@@ -74,7 +132,8 @@ test.describe('Pgas.me web', () => {
       sender: walletA.address,
     });
     await expect(page.getByText('Minimum 0.02 ETH-equivalent')).toBeVisible();
-    await expect(page.locator('[data-grade="weak"]').first()).toContainText('weak');
+    await expect(page.locator('.footer')).toContainText('Settled on Beam — a confidential ledger: no addresses on-chain, blinded amounts.');
+    await expect(page.locator('body')).not.toContainText('Anonymity');
 
     // armed, from Arbitrum: the wallet is switched to the source chain, the order tx is sent and registered
     api.armed = true;
@@ -129,6 +188,122 @@ test.describe('Pgas.me web', () => {
     await expect
       .poll(() => api.calls.filter((c) => c.path === '/quote').pop()?.body)
       .toMatchObject({ src_chain_id: 1514, src_token: USDC, amount: '300000000' });
+    expect(pageErrors).toEqual([]);
+  });
+
+  test('portfolio chips: every EVM chain answers, Multicall3 covers the ones with no batch helper, non-EVM is skipped', async ({
+    page,
+  }) => {
+    await boot(page, '/', { rpc: true });
+    await connectAndSignIn(page);
+    const chips = page.getByTestId('portfolio-chips').locator('.portfolio-chip');
+    await expect(chips.first()).toBeVisible({ timeout: 30_000 });
+    await expect(chips).toHaveCount(14); // 4 on Ethereum, 2 Arbitrum, 3 Base, 2 Story, 3 Cronos
+    const portfolio = page.getByTestId('portfolio');
+    await expect(portfolio).toContainText('5 of 5 chains read');
+    await expect(portfolio).toContainText('2 not scanned (non-EVM)');
+    await expect(portfolio).not.toContainText('unreachable');
+
+    // Story and Cronos have no batch-balance contract: their ERC-20s can only come from Multicall3
+    await expect(chips.filter({ hasText: 'IP' }).first()).toBeVisible();
+    await expect(chips.filter({ hasText: 'CRO' }).first()).toBeVisible();
+    const cronosUsdc = chips.filter({ has: page.locator('.portfolio-chip-sym', { hasText: /^USDC$/ }) });
+    await expect(cronosUsdc).toHaveCount(5); // one per chain, all five hold USDC
+
+    // sorted by USD, and buybeam's label rule: "$" + value once it is worth a cent
+    await expect(chips.first().locator('.portfolio-chip-sym')).toHaveText('IP');
+    await expect(chips.first().locator('.portfolio-chip-usd')).toHaveText('$4,800');
+    await expect(chips.first().locator('.portfolio-chip-token')).toBeVisible();
+
+    // tapping a chip selects its chain + token and prefills the whole balance
+    await chips.filter({ hasText: 'WBTC' }).first().click();
+    await expect(page.getByTestId('token-select')).toContainText('WBTC');
+    await expect(page.getByLabel('Source chain')).toHaveValue('1');
+    await expect(page.getByLabel('Amount (WBTC)')).toHaveValue('0.034');
+    await expect(chips.filter({ hasText: 'WBTC' }).first()).toHaveClass(/selected/);
+    expect(pageErrors).toEqual([]);
+  });
+
+  test('quote mode "direct": ETH on Ethereum goes straight to the pipe, DAI approves the pipe', async ({ page }) => {
+    await boot(page);
+    api.armed = true;
+    await connectAndSignIn(page);
+    await page.getByLabel('Amount (ETH)').fill('0.3');
+    await expect(page.getByTestId('direct-note')).toContainText('Direct deposit — your ETH goes straight into the Beam bridge');
+    await expect(page.getByTestId('unarmed-banner')).toHaveCount(0);
+    await expect(page.getByTestId('swap-panel')).toHaveCount(0);
+    await expect(page.getByTestId('approve-btn')).toHaveCount(0); // native ETH needs no approval
+    await expect(page.getByText('sends one transaction to the Beam bridge pipe')).toBeVisible();
+    await page.getByTestId('deposit-btn').click();
+    await expect(page.getByTestId('deposit-timeline')).toBeVisible();
+    let sent = await page.evaluate(() => (window as any).__mock.state.sent);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ from: walletA.address, to: ETH_PIPE, data: '0xdeadbeef', value: '0x429d069189e0000' });
+    const reg = api.calls.filter((c) => c.path === '/deposits' && c.method === 'POST');
+    expect(reg).toHaveLength(1);
+    expect(reg[0].body).toEqual({ quote_id: expect.stringMatching(/^q-/), src_tx_hash: MOCK_TX });
+
+    // DAI → bDAI on Ethereum is direct too, and the approval spender is the DAI pipe, not deBridge
+    await page.getByRole('radio', { name: 'DAI' }).click();
+    await page.getByTestId('token-select').click();
+    await page.getByLabel('Search tokens').fill('dai');
+    await page.getByRole('option', { name: /DAI/ }).click();
+    await page.getByLabel('Amount (DAI)').fill('100');
+    await expect(page.getByTestId('direct-note')).toContainText('your DAI goes straight into the Beam bridge');
+    await expect(page.getByTestId('approve-btn')).toContainText('Approve DAI');
+    await page.getByTestId('approve-btn').click();
+    await expect(page.getByTestId('approve-btn')).toContainText('Approved');
+    await page.getByTestId('deposit-btn').click();
+    await expect(page.getByTestId('deposit-timeline')).toBeVisible();
+    sent = await page.evaluate(() => (window as any).__mock.state.sent);
+    expect(sent).toHaveLength(3);
+    expect(sent[1]).toMatchObject({ to: DAI });
+    expect(sent[1].data.toLowerCase()).toContain(DAI_PIPE.slice(2).toLowerCase()); // approve(pipe, amount)
+    expect(sent[2]).toMatchObject({ to: DAI_PIPE, data: '0xdeadbeef' });
+    expect(sent[2].value).toBeUndefined();
+    expect(pageErrors).toEqual([]);
+  });
+
+  test('quote mode "swap": USDC on Ethereum swaps in the wallet, then re-quotes as a direct deposit', async ({ page }) => {
+    await boot(page);
+    api.armed = true;
+    await connectAndSignIn(page);
+    await page.getByTestId('token-select').click();
+    await page.getByLabel('Search tokens').fill('usdc');
+    await page.getByRole('option', { name: /USDC/ }).click();
+    await page.getByLabel('Amount (USDC)').fill('250');
+
+    const panel = page.getByTestId('swap-panel');
+    await expect(panel).toContainText('Step 1 — Swap USDC → ETH in your wallet (deBridge)');
+    await expect(page.getByTestId('deposit-btn')).toHaveCount(0); // nothing to deposit yet
+    await expect(page.getByTestId('approve-btn')).toContainText('Approve USDC');
+    await page.getByTestId('approve-btn').click();
+    await expect(page.getByTestId('approve-btn')).toContainText('Approved');
+    await expect(page.getByTestId('swap-btn')).toContainText('Swap 250 USDC');
+    await page.getByTestId('swap-btn').click();
+
+    // the swap is never registered as a deposit; the client re-quotes what arrived instead
+    await expect(page.getByTestId('swap-done')).toContainText('Swapped USDC → 0.06125 ETH');
+    expect(api.calls.filter((c) => c.path === '/deposits' && c.method === 'POST')).toHaveLength(0);
+    await expect(page.getByLabel('Amount (ETH)')).toHaveValue('0.06125');
+    await expect(page.getByTestId('direct-note')).toContainText('straight into the Beam bridge');
+    await expect(page.getByTestId('swap-panel')).toHaveCount(0);
+
+    const sentAfterSwap = await page.evaluate(() => (window as any).__mock.state.sent);
+    expect(sentAfterSwap).toHaveLength(2);
+    expect(sentAfterSwap[0]).toMatchObject({ to: USDC });
+    expect(sentAfterSwap[0].data.toLowerCase()).toContain(DLN_ALLOWANCE_TARGET.slice(2).toLowerCase());
+    expect(sentAfterSwap[1]).toMatchObject({ to: DLN_ORDER, data: '0xfeedface' });
+
+    await page.getByTestId('deposit-btn').click();
+    await expect(page.getByTestId('deposit-timeline')).toBeVisible();
+    const sent = await page.evaluate(() => (window as any).__mock.state.sent);
+    expect(sent).toHaveLength(3);
+    expect(sent[2]).toMatchObject({ to: ETH_PIPE, value: '0xd99a8cec7e2000' }); // 0.06125 ETH into the pipe
+    const reg = api.calls.filter((c) => c.path === '/deposits' && c.method === 'POST');
+    expect(reg).toHaveLength(1);
+    const quotes = api.calls.filter((c) => c.path === '/quote');
+    expect(quotes.at(-1)?.body).toMatchObject({ src_chain_id: 1, src_token: NATIVE, amount: '61250000000000000' });
     expect(pageErrors).toEqual([]);
   });
 
@@ -199,7 +374,7 @@ test.describe('Pgas.me web', () => {
     await page.getByTestId('withdraw-submit').click();
     await expect(page.getByTestId('withdraw-result')).toContainText('Scheduled 1 payout request');
     await expect(page.getByTestId('withdraw-result')).toContainText('ETA 1 h – 18 h');
-    await expect(page.getByTestId('withdraw-result').locator('[data-grade="weak"]')).toBeVisible();
+    await expect(page.getByTestId('withdraw-result')).not.toContainText('weak'); // privacy_grade is returned but never rendered
     const call = api.calls.find((c) => c.path === '/withdrawals');
     expect(call?.body).toEqual({ asset: 'ETH', items: [{ W: walletA.address, amount_groth: 10000000 }], mode: 'direct', window_s: 3600 });
 

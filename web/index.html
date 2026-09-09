@@ -3,22 +3,54 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Pgas.me</title>
+    <title>Pgas.me — Private gas for fresh EVM wallets</title>
     <meta
       name="description"
-      content="Private gas funding for fresh EVM wallets, settled on Beam. Pay any token on any chain, register destination wallets, fund them with gas."
+      content="Private gas funding for fresh EVM wallets. Pay any token on any chain; value settles through the Beam bridge and funds new wallets with ETH, DAI or WBTC."
     />
+    <link rel="canonical" href="https://pgas.me/" />
+    <meta name="robots" content="index,follow,max-image-preview:large" />
+    <meta name="application-name" content="Pgas.me" />
+    <meta name="apple-mobile-web-app-title" content="Pgas.me" />
+
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <link rel="icon" type="image/png" sizes="32x32" href="/favicon.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png" />
     <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
-    <meta property="og:title" content="Pgas.me" />
-    <meta property="og:description" content="Private gas funding for fresh EVM wallets, settled on Beam." />
+    <link rel="manifest" href="/manifest.json" />
+
+    <meta property="og:site_name" content="Pgas.me" />
+    <meta property="og:locale" content="en_US" />
     <meta property="og:type" content="website" />
     <meta property="og:url" content="https://pgas.me/" />
+    <meta property="og:title" content="Pgas.me — Private gas for fresh EVM wallets" />
+    <meta
+      property="og:description"
+      content="Private gas funding for fresh EVM wallets, settled on Beam. Pay any token on any chain; your new wallets get ETH, DAI or WBTC with no on-chain link to the source."
+    />
     <meta property="og:image" content="https://pgas.me/og-image.png" />
+    <meta property="og:image:secure_url" content="https://pgas.me/og-image.png" />
+    <meta property="og:image:type" content="image/png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
+    <meta
+      property="og:image:alt"
+      content="The Pgas.me pegasus mascot in sunglasses flying above a padlocked wallet, beside the words: Pgas.me — Private gas funding for fresh EVM wallets, settled on Beam."
+    />
+
     <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Pgas.me — Private gas for fresh EVM wallets" />
+    <meta
+      name="twitter:description"
+      content="Private gas funding for fresh EVM wallets, settled on Beam. Pay any token on any chain; your new wallets get ETH, DAI or WBTC with no on-chain link to the source."
+    />
+    <meta name="twitter:image" content="https://pgas.me/og-image.png" />
+    <meta
+      name="twitter:image:alt"
+      content="The Pgas.me pegasus mascot in sunglasses flying above a padlocked wallet, beside the words: Pgas.me — Private gas funding for fresh EVM wallets, settled on Beam."
+    />
+
     <meta name="theme-color" content="#F4F6FA" media="(prefers-color-scheme: light)" />
     <meta name="theme-color" content="#0F1319" media="(prefers-color-scheme: dark)" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -27,9 +59,58 @@
       href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
       rel="stylesheet"
     />
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "Organization",
+            "@id": "https://pgas.me/#organization",
+            "name": "Pgas.me",
+            "url": "https://pgas.me/",
+            "logo": "https://pgas.me/logo-256.png"
+          },
+          {
+            "@type": "WebSite",
+            "@id": "https://pgas.me/#website",
+            "name": "Pgas.me",
+            "url": "https://pgas.me/",
+            "inLanguage": "en-US",
+            "publisher": { "@id": "https://pgas.me/#organization" }
+          },
+          {
+            "@type": "WebApplication",
+            "@id": "https://pgas.me/#webapp",
+            "name": "Pgas.me",
+            "url": "https://pgas.me/",
+            "applicationCategory": "FinanceApplication",
+            "operatingSystem": "Web",
+            "browserRequirements": "Requires JavaScript and an EVM wallet",
+            "description": "Private gas funding for fresh EVM wallets, settled on Beam. Pay any token on any chain; the value locks into the Beam bridge and your new wallets are funded with ETH, DAI or WBTC with no on-chain link to the source.",
+            "image": "https://pgas.me/og-image.png",
+            "publisher": { "@id": "https://pgas.me/#organization" },
+            "offers": {
+              "@type": "Offer",
+              "price": "0",
+              "priceCurrency": "USD"
+            }
+          }
+        ]
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>
+    <noscript>
+      <h1>Pgas.me</h1>
+      <p>
+        Private gas funding for fresh EVM wallets, settled on Beam. Pay any token on any chain via
+        deBridge, the value locks into the Beam bridge, and your new wallets get funded with ETH,
+        DAI or WBTC with no on-chain link to the source. Pgas.me needs JavaScript and a connected
+        wallet — there are no accounts.
+      </p>
+    </noscript>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

@@ -24,7 +24,10 @@ os.environ.update(
     {
         "PGAS_WORKERS_ENABLED": "0",
         "PGAS_DEV_ENDPOINTS": "1",
+        # PGAS_ENV=test is not a lax environment: config.py refuses to boot outside `dev`
+        # with a placeholder / short secret, so the suite must pin real-shaped ones.
         "PGAS_JWT_SECRET": "test-secret-" + "x" * 32,
+        "PGAS_ACCOUNT_SALT": "test-salt-" + "y" * 32,
         "PGAS_ENV": "test",
         "PGAS_STOP_FILE": "/nonexistent/pgasme.stop",
     }
@@ -102,6 +105,78 @@ DLN_ESTIMATE: dict[str, Any] = {
     "fixFee": "1000000000000000",
     "protocolFee": "4000",
     "estimatedTransactionFee": {"total": "16640000000000"},
+}
+
+
+# GET /chain/estimation and /chain/transaction for 5 USDC → ETH on MAINNET (single-chain swap,
+# mode "swap"), recorded live 2026-09-09 on dln.debridge.finance, trimmed. The transaction answer
+# carries the same fields FLAT (no "estimation" wrapper) plus `tx`, and no allowanceTarget.
+USDC_ETH = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+SWAP_TOKEN_IN = {
+    "address": USDC_ETH.lower(),
+    "name": "USD Coin",
+    "symbol": "USDC",
+    "decimals": 6,
+    "amount": "5000000",
+    "approximateUsdValue": 5,
+}
+SWAP_TOKEN_OUT = {
+    "address": "0x0000000000000000000000000000000000000000",
+    "name": "Ethereum",
+    "symbol": "ETH",
+    "decimals": 18,
+    "minAmount": "1993120542274040",
+    "amount": "1999122712146377",
+    "approximateUsdValue": 4.991652,
+}
+SWAP_COSTS = [
+    {
+        "chain": "1",
+        "tokenIn": "0x0000000000000000000000000000000000000000",
+        "tokenOut": "0x0000000000000000000000000000000000000000",
+        "amountIn": "2000723290779000",
+        "amountOut": "1999122712146377",
+        "type": "SingleChainSwapProtocolFee",
+        "payload": {"feeAmount": "1600578632623", "feeBps": "8"},
+    },
+    {
+        "chain": "1",
+        "tokenIn": "0x0000000000000000000000000000000000000000",
+        "tokenOut": "0x0000000000000000000000000000000000000000",
+        "amountIn": "1999122712146377",
+        "amountOut": "1993120542274040",
+        "type": "SingleChainSwapEstimatedSlippage",
+        "payload": {"feeAmount": "6002169872337", "feeBps": "30"},
+    },
+]
+DLN_SWAP_ESTIMATION: dict[str, Any] = {
+    "estimation": {
+        "tokenIn": SWAP_TOKEN_IN,
+        "tokenOut": SWAP_TOKEN_OUT,
+        "slippage": 0.3,
+        "recommendedSlippage": 0.3,
+        "protocolFee": "1600578632623",
+        "protocolFeeApproximateUsdValue": 0.003993,
+        "estimatedTransactionFee": {
+            "total": "439326826112330",
+            "details": {"gasLimit": "383410", "baseFee": "145840813"},
+            "approximateUsdValue": 1.096087,
+        },
+        "costsDetails": SWAP_COSTS,
+    }
+}
+DLN_SWAP_TX: dict[str, Any] = {
+    "tx": {
+        "to": "0x663DC15D3C1aC63ff12E45Ab68FeA3F0a883C251",
+        "data": "0x258c16ee" + "00" * 64,
+        "value": "0",
+    },
+    "tokenIn": SWAP_TOKEN_IN,
+    "tokenOut": SWAP_TOKEN_OUT,
+    "slippage": 0.3,
+    "protocolFee": "1600578632623",
+    "estimatedTransactionFee": {"total": "418647754266980"},
+    "costsDetails": SWAP_COSTS,
 }
 
 
@@ -236,24 +311,40 @@ def fulfilled_log(
 
 
 class FakeRpc:
-    """An Ethereum RPC pool with a scripted head, per-endpoint heads, logs, receipts and unreadable ranges."""
+    """An Ethereum RPC pool with a scripted head, per-endpoint heads, logs, receipts, transactions
+    and unreadable ranges. `PRIMARY` is the endpoint that answers head_from(); `heads` gives a
+    per-endpoint head so a pinned read can be shown lagging behind the range it just answered."""
+
+    PRIMARY = "https://rpc.test/primary"
 
     def __init__(self, head: int = 0) -> None:
         self.head = head
         self.heads: dict[str, int] = {}
         self.logs_: list[dict[str, Any]] = []
         self.receipts: dict[str, dict[str, Any]] = {}
+        self.txs: dict[str, dict[str, Any]] = {}
         self.fail_ranges: set[tuple[int, int]] = set()
         self.calls: list[tuple[Any, ...]] = []
 
-    async def block_number(self, prefer: str | None = None) -> int:
+    async def block_number(self, prefer: str | None = None, pin: bool = False) -> int:
+        if prefer is not None and prefer in self.heads:
+            return self.heads[prefer]
         return self.head
+
+    async def head_from(self) -> tuple[int, str]:
+        return self.head, self.PRIMARY
 
     async def pool_heads(self) -> dict[str, int]:
         return dict(self.heads)
 
     async def logs(
-        self, address: str, topics: list[Any], frm: int, to: int, prefer: str | None = None
+        self,
+        address: str,
+        topics: list[Any],
+        frm: int,
+        to: int,
+        prefer: str | None = None,
+        pin: bool = False,
     ) -> list[dict[str, Any]]:
         self.calls.append(("logs", address, frm, to, prefer))
         for a, b in self.fail_ranges:
@@ -265,8 +356,15 @@ class FakeRpc:
             if lg["address"].lower() == address.lower() and frm <= int(lg["blockNumber"], 16) <= to
         ]
 
-    async def receipt(self, tx: str, prefer: str | None = None) -> dict[str, Any] | None:
+    async def receipt(
+        self, tx: str, prefer: str | None = None, pin: bool = False
+    ) -> dict[str, Any] | None:
         return self.receipts.get(tx)
+
+    async def transaction(
+        self, tx: str, prefer: str | None = None, pin: bool = False
+    ) -> dict[str, Any] | None:
+        return self.txs.get(tx)
 
 
 @pytest.fixture(autouse=True)

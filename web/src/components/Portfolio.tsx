@@ -1,14 +1,18 @@
-// Balances read client-side: the connected wallet's holdings across every supported chain (Deposit
-// page, tap-to-pay chips) and a destination's native balance per chain (Wallets page).
+// Balances read client-side: the connected wallet's holdings across every chain deBridge lists
+// (Deposit page, tap-to-pay chips) and a destination's native balance per chain (Wallets page).
+// The chip row is buybeam.my's: one horizontally scrolling line of pills, token logo with the chain
+// badge on its corner, symbol over the USD value (or the balance when nothing priced it).
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { formatEther } from 'ethers';
-import { DESTINATION_CHAINS, chainName } from '../lib/chains';
+import { DESTINATION_CHAINS, chainIconUrl, chainName } from '../lib/chains';
 import { fmtAgo, fmtNumber, fmtUsd } from '../lib/format';
 import {
   loadCachedPortfolio,
   nativeBalance,
   pricesRateLimited,
   scanPortfolio,
+  sortForDisplay,
+  type ChainScan,
   type Holding,
   type NativeRead,
   type Portfolio as PortfolioData,
@@ -17,10 +21,28 @@ import { useStore } from '../state/store';
 
 const MAX_CHIPS = 24;
 
-function HoldingLogo({ h }: { h: Holding }) {
-  const [broken, setBroken] = useState(false);
-  if (h.logo && !broken) return <img src={h.logo} alt="" onError={() => setBroken(true)} loading="lazy" />;
-  return <span className="logo-fallback">{h.symbol.slice(0, 3).toUpperCase()}</span>;
+/** buybeam's portfolioBalanceLabel: the USD value once it is worth a cent, else the raw balance. */
+function chipLabel(h: Holding): string {
+  if (h.usd !== undefined && h.usd >= 0.01) return fmtUsd(h.usd);
+  return fmtNumber(h.amount, h.amount >= 1 ? 2 : 6);
+}
+
+function ChipIcons({ h }: { h: Holding }) {
+  const [tokenBroken, setTokenBroken] = useState(false);
+  const [chainBroken, setChainBroken] = useState(false);
+  const chainIcon = chainIconUrl(h.chainId);
+  return (
+    <span className="portfolio-chip-icons">
+      {h.logo && !tokenBroken ? (
+        <img className="portfolio-chip-token" src={h.logo} alt="" loading="lazy" onError={() => setTokenBroken(true)} />
+      ) : (
+        <span className="portfolio-chip-token logo-fallback">{h.symbol.slice(0, 3).toUpperCase()}</span>
+      )}
+      {chainIcon && !chainBroken && (
+        <img className="portfolio-chip-chain" src={chainIcon} alt="" loading="lazy" onError={() => setChainBroken(true)} />
+      )}
+    </span>
+  );
 }
 
 export function Portfolio({
@@ -35,10 +57,12 @@ export function Portfolio({
   const { wallet, data } = useStore();
   const { chains, loading: chainsLoading, error: dataError } = data;
   const [portfolio, setPortfolio] = useState<PortfolioData | null>(null);
+  const [live, setLive] = useState<ChainScan[]>([]); // chains that have already answered, mid-scan
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<[number, number]>([0, 0]);
   const [error, setError] = useState<string | null>(null);
   const run = useRef(0);
+  const row = useRef<HTMLDivElement>(null);
   const { provider, chainId } = wallet;
 
   const scan = useCallback(
@@ -52,11 +76,20 @@ export function Portfolio({
       const id = ++run.current;
       setScanning(true);
       setError(null);
+      setLive([]);
       setProgress([0, chains.length]);
       try {
-        const p = await scanPortfolio(address, chains, provider ? { provider, chainId } : null, (d, t) => {
-          if (id === run.current) setProgress([d, t]);
-        });
+        const p = await scanPortfolio(
+          address,
+          chains,
+          provider ? { provider, chainId } : null,
+          (d, t) => {
+            if (id === run.current) setProgress([d, t]);
+          },
+          (s) => {
+            if (id === run.current) setLive((cur) => [...cur, s]);
+          },
+        );
         if (id === run.current) setPortfolio(p);
       } catch (e) {
         if (id === run.current) setError((e as Error)?.message ?? String(e));
@@ -72,17 +105,32 @@ export function Portfolio({
     void scan(false);
   }, [address, chains, scan]);
 
-  const reachable = portfolio ? portfolio.chains.filter((c) => c.via !== 'none').length : 0;
-  const unreachable = portfolio ? portfolio.chains.filter((c) => c.via === 'none').length : 0;
-  const chips = portfolio ? portfolio.holdings.slice(0, MAX_CHIPS) : [];
-  const totalUsd = portfolio ? portfolio.holdings.reduce((s, h) => s + (h.usd ?? 0), 0) : 0;
+  // mid-scan the chips come from the chains that already answered; when the scan lands the priced,
+  // fully sorted portfolio replaces them
+  const scans = portfolio ? portfolio.chains : live;
+  const holdings = portfolio ? portfolio.holdings : sortForDisplay(live.flatMap((s) => s.holdings));
+  const evm = scans.filter((c) => !c.nonEvm);
+  const reachable = evm.filter((c) => c.via !== 'none').length;
+  const unreachable = evm.filter((c) => c.via === 'none').length;
+  const nonEvm = scans.filter((c) => c.nonEvm).length;
+  const chips = holdings.slice(0, MAX_CHIPS);
+  const firstKey = chips[0]?.key;
+  const totalUsd = holdings.reduce((s, h) => s + (h.usd ?? 0), 0);
+  const settled = !!portfolio && !scanning;
+
+  // chains land one by one and the list re-sorts when prices arrive; Chrome keeps whatever chip was
+  // leftmost in place, which leaves the row scrolled past the biggest holdings. Whenever a new chip
+  // takes the front, put the row back at the start — a scroll the user made himself is untouched.
+  useEffect(() => {
+    if (row.current) row.current.scrollLeft = 0;
+  }, [firstKey]);
 
   return (
     <section className="card" data-testid="portfolio">
       <div className="card-head">
         <div>
           <h2>Your portfolio</h2>
-          <p className="small muted">Read client-side from every supported chain — tap a holding to pay with it.</p>
+          <p className="small muted">Read client-side from every chain deBridge supports — tap a holding to pay with it.</p>
         </div>
         <div className="row">
           {portfolio?.priced && totalUsd > 0 && (
@@ -90,7 +138,7 @@ export function Portfolio({
               {fmtUsd(totalUsd)}
             </span>
           )}
-          {portfolio && !scanning && <span className="tiny muted">as of {fmtAgo(portfolio.at)}</span>}
+          {settled && <span className="tiny muted">as of {fmtAgo(portfolio.at)}</span>}
           <button type="button" className="btn btn-sm" onClick={() => scan(true)} disabled={scanning || !chains.length}>
             {scanning ? 'Scanning…' : 'Refresh'}
           </button>
@@ -113,27 +161,22 @@ export function Portfolio({
       )}
       {error && <div className="banner banner-error">Scan failed: {error}</div>}
 
-      {portfolio && !scanning && (
+      {(chips.length > 0 || settled) && (
         <div className="stack">
           {chips.length ? (
-            <div className="chips" data-testid="portfolio-chips">
+            <div className="portfolio-chips" data-testid="portfolio-chips" ref={row}>
               {chips.map((h) => (
                 <button
                   key={h.key}
                   type="button"
-                  className={`holding${selectedKey === h.key ? ' selected' : ''}`}
+                  className={`portfolio-chip${selectedKey === h.key ? ' selected' : ''}`}
                   onClick={() => onPick(h)}
                   title={`${h.symbol} on ${h.chainName}`}
                 >
-                  <HoldingLogo h={h} />
-                  <span className="h-main">
-                    <span className="h-sym">{h.symbol}</span>
-                    <span className="h-chain">{h.chainName}</span>
-                  </span>
-                  <span className="h-amt">
-                    {fmtNumber(h.amount, h.amount >= 1000 ? 0 : h.amount >= 1 ? 3 : 5)}
-                    <br />
-                    <span className="h-usd">{h.usd !== undefined ? fmtUsd(h.usd) : 'unpriced'}</span>
+                  <ChipIcons h={h} />
+                  <span className="portfolio-chip-info">
+                    <span className="portfolio-chip-sym">{h.symbol}</span>
+                    <span className="portfolio-chip-usd">{chipLabel(h)}</span>
                   </span>
                 </button>
               ))}
@@ -147,22 +190,23 @@ export function Portfolio({
           )}
           <div className="row small muted">
             <span>
-              {reachable} of {portfolio.chains.length} chains read
-              {portfolio.chains.some((c) => c.via === 'wallet') ? ' (one through the wallet)' : ''}
+              {reachable} of {evm.length} chains read
+              {scans.some((c) => c.via === 'wallet') ? ' (one through the wallet)' : ''}
+              {nonEvm ? ` · ${nonEvm} not scanned (non-EVM)` : ''}
             </span>
-            {portfolio.holdings.length > MAX_CHIPS && (
+            {holdings.length > MAX_CHIPS && (
               <span>
-                · showing the top {MAX_CHIPS} of {portfolio.holdings.length}
+                · showing the top {MAX_CHIPS} of {holdings.length}
               </span>
             )}
-            {portfolio.holdings.length > 0 && !portfolio.priced && (
+            {settled && holdings.length > 0 && !portfolio.priced && (
               <span>· {pricesRateLimited() ? 'prices skipped (CoinGecko rate limit)' : 'prices unavailable'}</span>
             )}
-            {portfolio.chains.some((c) => c.errors.length || c.note) && (
+            {scans.some((c) => c.errors.length || c.note) && (
               <details className="plain">
                 <summary>{unreachable ? `${unreachable} unreachable` : 'notes'}</summary>
                 <ul className="tiny" style={{ margin: '6px 0 0', paddingLeft: 18 }}>
-                  {portfolio.chains
+                  {scans
                     .filter((c) => c.errors.length || c.note)
                     .map((c) => (
                       <li key={c.chainId}>

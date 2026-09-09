@@ -1,23 +1,38 @@
-// Injected wallet discovery: EIP-6963 announcements merged with the legacy window globals
-// (MetaMask, Coinbase, Zerion, Trust, Rabby, OKX) and, when embedded in a Farcaster client, the
-// mini-app provider. Connection state lives in state/store.tsx; this module only finds providers.
+// Wallet providers: EIP-6963 announcements merged with the legacy window globals (MetaMask,
+// Coinbase, Zerion, Trust, Rabby, OKX, Brave, Coin98, Binance, Phantom, Bitget, TokenPocket,
+// Rainbow), the Farcaster mini-app provider when embedded, and WalletConnect v2 (initialised
+// lazily, only when picked). Connection state lives in state/store.tsx; this module only finds
+// and creates providers.
+import { api } from './api';
+import { fallbackUrls } from './chains';
 
 export interface Eip1193Provider {
   request(args: { method: string; params?: unknown[] | Record<string, unknown> }): Promise<unknown>;
   on?(event: string, listener: (...args: unknown[]) => void): void;
   removeListener?(event: string, listener: (...args: unknown[]) => void): void;
+  /** WalletConnect: opens the QR modal and resolves once a session exists; request() refuses before that. */
+  connect?(): Promise<void>;
+  /** WalletConnect (and a few injected wallets) can end the session from our side. */
+  disconnect?(): Promise<void>;
+  /** WalletConnect: the restored session, when one exists. */
+  session?: unknown;
 }
 
-export type WalletSource = 'eip6963' | 'injected' | 'farcaster';
+export type WalletSource = 'eip6963' | 'injected' | 'farcaster' | 'walletconnect';
 
 export interface WalletOption {
   id: string;
   name: string;
   icon: string;
-  provider: Eip1193Provider;
+  /** null for WalletConnect until it is initialised */
+  provider: Eip1193Provider | null;
   source: WalletSource;
   rdns?: string;
+  hint?: string;
+  disabledReason?: string;
 }
+
+export const WALLETCONNECT_ID = 'walletconnect';
 
 interface Eip6963ProviderDetail {
   info: { uuid: string; name: string; icon: string; rdns: string };
@@ -34,6 +49,13 @@ type FlaggedProvider = Eip1193Provider & {
   isOkxWallet?: boolean;
   isOKExWallet?: boolean;
   isBraveWallet?: boolean;
+  isCoin98?: boolean;
+  isBinance?: boolean;
+  isPhantom?: boolean;
+  isBitKeep?: boolean;
+  isBitget?: boolean;
+  isTokenPocket?: boolean;
+  isRainbow?: boolean;
   providers?: FlaggedProvider[];
 };
 
@@ -45,7 +67,14 @@ const BRAND_COLORS: Record<string, string> = {
   Rabby: '#7084FF',
   'OKX Wallet': '#161A22',
   'Brave Wallet': '#FB542B',
+  Coin98: '#D9B432',
+  'Binance Web3 Wallet': '#F0B90B',
+  Phantom: '#AB9FF2',
+  'Bitget Wallet': '#1DA2B4',
+  TokenPocket: '#2980FE',
+  Rainbow: '#001E59',
   Farcaster: '#855DCD',
+  WalletConnect: '#3B99FC',
 };
 
 /** Legacy detections carry no icon; a lettered tile keeps the picker uniform. */
@@ -104,8 +133,14 @@ export function startDiscovery(): void {
 function legacyName(p: FlaggedProvider): { name: string; key: string } {
   if (p.isRabby) return { name: 'Rabby', key: 'rabby' };
   if (p.isZerion) return { name: 'Zerion', key: 'zerion' };
+  if (p.isCoin98) return { name: 'Coin98', key: 'coin98' };
   if (p.isTrust || p.isTrustWallet) return { name: 'Trust Wallet', key: 'trust' };
   if (p.isOkxWallet || p.isOKExWallet) return { name: 'OKX Wallet', key: 'okx' };
+  if (p.isBinance) return { name: 'Binance Web3 Wallet', key: 'binance' };
+  if (p.isPhantom) return { name: 'Phantom', key: 'phantom' };
+  if (p.isBitKeep || p.isBitget) return { name: 'Bitget Wallet', key: 'bitget' };
+  if (p.isTokenPocket) return { name: 'TokenPocket', key: 'tokenpocket' };
+  if (p.isRainbow) return { name: 'Rainbow', key: 'rainbow' };
   if (p.isCoinbaseWallet) return { name: 'Coinbase Wallet', key: 'coinbase' };
   if (p.isBraveWallet) return { name: 'Brave Wallet', key: 'brave' };
   if (p.isMetaMask) return { name: 'MetaMask', key: 'metamask' };
@@ -113,7 +148,7 @@ function legacyName(p: FlaggedProvider): { name: string; key: string } {
 }
 
 function legacyOptions(): WalletOption[] {
-  const w = window as unknown as Record<string, unknown>;
+  const w = window as unknown as Record<string, Record<string, unknown> | undefined>;
   const out: WalletOption[] = [];
   const seen = new Set<Eip1193Provider>();
   const push = (p: unknown, name?: string, key?: string) => {
@@ -126,17 +161,22 @@ function legacyOptions(): WalletOption[] {
     out.push({ id, name: n.name, icon: monogram(n.name), provider: prov, source: 'injected' });
   };
   const ethereum = w.ethereum as FlaggedProvider | undefined;
-  if (ethereum?.providers?.length) for (const p of ethereum.providers) push(p);
+  if (ethereum?.providers?.length)
+    for (const p of ethereum.providers) push(p); // several wallets sharing window.ethereum
   else if (ethereum) push(ethereum);
   push(w.coinbaseWalletExtension, 'Coinbase Wallet', 'coinbase');
   push(w.zerionWallet, 'Zerion', 'zerion');
   push(w.trustwallet, 'Trust Wallet', 'trust');
   push(w.okxwallet, 'OKX Wallet', 'okx');
   push(w.rabby, 'Rabby', 'rabby');
+  push(w.coin98?.provider, 'Coin98', 'coin98');
+  push(w.BinanceChain, 'Binance Web3 Wallet', 'binance');
+  push(w.phantom?.ethereum, 'Phantom', 'phantom');
+  push(w.bitkeep?.ethereum, 'Bitget Wallet', 'bitget');
   return out;
 }
 
-/** EIP-6963 first (real icons), then legacy globals not already announced, then Farcaster. */
+/** EIP-6963 first (real icons), then legacy globals not already announced, Farcaster, WalletConnect last. */
 export function getWalletOptions(): WalletOption[] {
   const list: WalletOption[] = [...announced.values()];
   const byProvider = new Set(list.map((o) => o.provider));
@@ -148,6 +188,7 @@ export function getWalletOptions(): WalletOption[] {
     list.push(o);
   }
   if (farcasterOption) list.push(farcasterOption);
+  list.push(walletConnectOption());
   return list;
 }
 
@@ -185,5 +226,76 @@ async function detectFarcaster(): Promise<void> {
     sdk.actions.ready().catch(() => undefined);
   } catch {
     // not inside a Farcaster client, or the SDK failed to load — injected wallets still work
+  }
+}
+
+// ---------- WalletConnect v2 ----------
+// The provider (and its QR modal) is a large dependency, so it is imported only when the user
+// picks WalletConnect or a remembered WalletConnect session has to be restored.
+const WC_PROJECT_ID = (import.meta.env.VITE_WALLETCONNECT_PROJECT_ID ?? '').trim();
+const WC_FALLBACK_CHAINS = [1, 42161, 8453, 10, 137, 56];
+let wcProvider: Eip1193Provider | null = null;
+let wcInit: Promise<Eip1193Provider> | null = null;
+
+function walletConnectOption(): WalletOption {
+  return {
+    id: WALLETCONNECT_ID,
+    name: 'WalletConnect',
+    icon: monogram('WalletConnect'),
+    provider: wcProvider,
+    source: 'walletconnect',
+    hint: 'scan with any mobile wallet',
+    disabledReason: WC_PROJECT_ID ? undefined : 'not configured',
+  };
+}
+
+export function initWalletConnect(): Promise<Eip1193Provider> {
+  if (wcProvider) return Promise.resolve(wcProvider);
+  if (wcInit) return wcInit;
+  wcInit = (async () => {
+    if (!WC_PROJECT_ID) throw new Error('WalletConnect is not configured on this deployment');
+    const [{ EthereumProvider }, listed] = await Promise.all([
+      import('@walletconnect/ethereum-provider'),
+      api.chains().then(
+        (r) => r.chains.map((c) => c.chain_id).filter((n) => Number.isInteger(n) && n > 0),
+        () => [] as number[],
+      ),
+    ]);
+    const chains = listed.length ? listed : WC_FALLBACK_CHAINS;
+    const rpcMap: Record<number, string> = {};
+    for (const id of chains) {
+      const url = fallbackUrls(id)[0];
+      if (url) rpcMap[id] = url;
+    }
+    const provider = await EthereumProvider.init({
+      projectId: WC_PROJECT_ID,
+      optionalChains: chains as [number, ...number[]],
+      showQrModal: true,
+      rpcMap,
+      metadata: {
+        name: 'Pgas.me',
+        description: 'Private gas funding for fresh EVM wallets, settled on Beam.',
+        url: window.location.origin,
+        icons: [`${window.location.origin}/logo-256.png`],
+      },
+    });
+    wcProvider = provider as unknown as Eip1193Provider;
+    notify();
+    return wcProvider;
+  })();
+  wcInit.catch(() => {
+    wcInit = null;
+  });
+  return wcInit;
+}
+
+/** For the remembered-wallet path on reload: the provider only when a session already exists. */
+export async function restoreWalletConnect(): Promise<Eip1193Provider | null> {
+  if (!WC_PROJECT_ID) return null;
+  try {
+    const p = await initWalletConnect();
+    return p.session ? p : null;
+  } catch {
+    return null;
   }
 }

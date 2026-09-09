@@ -149,9 +149,17 @@ export interface QuoteBody {
   sender: string;
 }
 
+/**
+ * `dln` — a cross-chain DLN order. `direct` — chain 1 and the source token already IS the target
+ * asset, so the tx goes straight to the pipe. `swap` — chain 1, any other token: a single-chain DLN
+ * swap into the user's OWN wallet, then a fresh `direct` quote for what actually arrived.
+ */
+export type QuoteMode = 'dln' | 'direct' | 'swap';
+
 export interface Quote {
   quote_id: string;
   target_asset: AssetKey;
+  mode: QuoteMode;
   armed: boolean;
   expires_at: string | number;
   estimate: {
@@ -165,7 +173,11 @@ export interface Quote {
     dln_fees?: Record<string, unknown>;
   };
   tx?: { chain_id: number; to: string; data: string; value: string };
+  /** `swap` only: the single-chain DLN swap the user signs; never registered as a deposit. */
+  swap_tx?: { chain_id: number; to: string; data: string; value: string };
   approval?: { chain_id: number; token: string; spender: string; amount: string };
+  /** `swap` only: the quote to ask for once the swap lands (amount = what actually arrived). */
+  next?: { src_chain_id: number; src_token: string; amount: string };
   order_id?: string;
   note?: string;
 }

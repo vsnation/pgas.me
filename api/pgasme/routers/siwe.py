@@ -1,10 +1,15 @@
-"""GET /v1/siwe/nonce · POST /v1/siwe/verify — the account is the wallet."""
+"""GET /v1/siwe/nonce · POST /v1/siwe/verify — the account is the wallet.
+
+Both routes are unauthenticated and /verify writes permanent rows (an account and its
+connected destination) for any wallet that can sign — a free key is free. Two app-side caps
+per IP keep that from becoming unbounded storage; nginx adds its own layer above.
+"""
 
 from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from .. import auth
@@ -20,8 +25,8 @@ class VerifyIn(BaseModel):
 
 
 @router.get("/nonce")
-async def nonce():
-    n = await auth.new_nonce()
+async def nonce(request: Request):
+    n = await auth.new_nonce_for_ip(auth.client_ip(request), limit=settings.siwe_nonce_ip_limit)
     return {
         "nonce": n,
         "statement": settings.siwe_statement,
@@ -30,7 +35,14 @@ async def nonce():
 
 
 @router.post("/verify")
-async def verify(body: VerifyIn):
+async def verify(body: VerifyIn, request: Request):
+    await auth.rate_guard(
+        "siwe_verify",
+        auth.client_ip(request),
+        settings.siwe_verify_ip_limit,
+        settings.rate_window_s,
+        "too many sign-in attempts from this address — try again shortly",
+    )
     res = await auth.verify_siwe(body.message, body.signature)
     account_id = auth.account_id_for(res["address"])
     now = time.time()

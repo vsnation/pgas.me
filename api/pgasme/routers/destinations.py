@@ -5,6 +5,10 @@ off-chain (EIP-191 personal_sign; free, works with zero gas). The server recover
 checks it is the claimed address, stores {address, kind, verified_at} and DISCARDS the
 signature. A wallet generated in the browser registers the same way (the page signs with the
 fresh key right after creating it), so the server treats both identically.
+
+Removal has two doors onto ONE implementation: `POST /v1/destinations/remove {address}` is the
+documented one (a body is not written to an access log next to the caller's IP);
+`DELETE /v1/destinations/{address}` stays for compatibility with clients already shipped.
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ import time
 from eth_account import Account as EthAccount
 from eth_account.messages import encode_defunct
 from eth_utils import is_address, to_checksum_address
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from .. import auth
@@ -44,9 +48,13 @@ class AddIn(BaseModel):
     label: str = Field(default="", max_length=64)
 
 
+class RemoveIn(BaseModel):
+    address: str = Field(min_length=40, max_length=64)
+
+
 @router.get("/nonce")
-async def nonce(acct=auth.Account):
-    n = await auth.new_nonce("dest_nonces")
+async def nonce(request: Request, acct=auth.Account):
+    n = await auth.new_nonce("dest_nonces", ip=auth.client_ip(request))
     return {"nonce": n, "template": proof_message(acct["account_id"], "<address>", n, "<issued>")}
 
 
@@ -90,8 +98,8 @@ async def add_destination(body: AddIn, acct=auth.Account):
     return {"address": address, "kind": body.kind, "verified_at": now, "label": body.label}
 
 
-@router.delete("/{address}")
-async def remove_destination(address: str, acct=auth.Account):
+async def _remove(address: str, acct: dict) -> dict:
+    """The one implementation both removal routes call."""
     if not is_address(address):
         raise HTTPException(400, "not an EVM address")
     address = to_checksum_address(address)
@@ -113,3 +121,15 @@ async def remove_destination(address: str, acct=auth.Account):
     if res.matched_count == 0:
         raise HTTPException(404, "not a destination of this account")
     return {"removed": address}
+
+
+@router.post("/remove")
+async def remove_destination(body: RemoveIn, acct=auth.Account):
+    """Documented removal: the address travels in the body, not in the URL."""
+    return await _remove(body.address, acct)
+
+
+@router.delete("/{address}")
+async def remove_destination_by_path(address: str, acct=auth.Account):
+    """Compatibility with clients that already ship the DELETE call. Same implementation."""
+    return await _remove(address, acct)

@@ -149,7 +149,8 @@ async def test_cancel_returns_the_money_and_is_final(client, user, mock_db, monk
         "request_ids"
     ][0]
     r = await client.post(f"/v1/withdrawals/{rid}/cancel", headers=user["headers"])
-    assert r.status_code == 200 and r.json() == {"cancelled": rid}
+    # the refund is the groth of the schedule entry that actually debited the account
+    assert r.status_code == 200 and r.json() == {"cancelled": rid, "refunded_groth": 1_020_000}
     assert await ledger.balance(user["account_id"], "ETH") == {
         "available": ETH,
         "scheduled": 0,

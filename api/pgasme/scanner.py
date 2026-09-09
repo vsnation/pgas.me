@@ -2,7 +2,10 @@
 scan_debridge_orders.py, ported):
 
   * eth_getLogs on each target pipe (ETH / DAI / WBTC) for NewLocalMessage, in chunks of
-    `lock_scan_chunk` blocks, endpoints tried in order per chunk;
+    `lock_scan_chunk` blocks, PINNED to the endpoint that vouched for the head: the endpoint
+    that said "the chain is at H" is the only one allowed to answer "[0, H] holds no locks",
+    and its own head is re-read and required to be ≥ the chunk's end BEFORE the chunk is
+    checkpointed. An empty answer from a lagging node is not evidence of no deposit;
   * a checkpoint per pipe in Mongo (`scanner_state` {_id: pipe, last_block}); the first run starts
     at head − `lock_scan_blocks`. ONLY the highest CONTIGUOUS successfully-scanned block is ever
     checkpointed — a failed chunk is never skipped, it is retried next pass; a pass is bounded to
@@ -15,8 +18,12 @@ scan_debridge_orders.py, ported):
     the DLN FulfilledOrder log in the same receipt decoded → orderId → the deposit / quote; if the
     id is unknown, the metadata tag (bytes[45:50] of rawOrderMetadataHex from the DLN stats API,
     retried because DLN indexes with delay) is matched against `quotes.metadata`;
-  * sanity before any state change: the lock's amount == the quote's value_units and the pipe is
-    the asset's pipe. A lock to our pubkey that nobody can be attributed to goes to
+  * a receipt with NO FulfilledOrder log is not automatically foreign: a `direct` deposit (the
+    user called the pipe themselves on Ethereum, no DLN in the story) is looked up by its own
+    registered `src_tx_hash`. Only after that fails is the lock unattributed;
+  * sanity before any state change: the lock's amount == the quote's value_units, the pipe is
+    the asset's pipe, and for a `direct` deposit the receipt's `from` is the wallet that asked
+    for the quote (the hash alone is public — the sender is what makes it the user's). A lock to our pubkey that nobody can be attributed to goes to
     `unattributed_locks` and pages the operator — it is never credited to anyone.
 """
 
@@ -51,6 +58,25 @@ MAX_CHUNKS_PER_PASS = 40
 LITE_RETRIES = 5
 LITE_RETRY_SLEEP_S = 5.0
 CLAIMABLE = ("submitted", "order_seen", "fallback_pending")
+# retry_unattributed: oldest first, backed off, and abandoned rather than retried forever
+RETRY_PAGE = 20
+RETRY_MAX_ROWS = 200
+RETRY_BACKOFF_S = 120.0
+RETRY_BACKOFF_MAX_S = 3600.0
+RETRY_MAX_TRIES = 12
+DEPOSIT_HASH_INDEX = "uniq_src_tx_hash"
+
+
+async def ensure_indexes() -> None:
+    """The scanner's own guarantee, called at worker start: ONE deposit per source transaction.
+    Partial, because the scanner legitimately creates rows with no hash at all (a lock seen
+    before the user registered theirs) and many nulls are not a collision."""
+    await db().deposits.create_index(
+        "src_tx_hash",
+        unique=True,
+        partialFilterExpression={"src_tx_hash": {"$type": "string"}},
+        name=DEPOSIT_HASH_INDEX,
+    )
 
 
 # ----------------------------------------------------------------------------- decoding
@@ -122,10 +148,11 @@ def metadata_tag(raw_hex: str | None) -> str | None:
 # ----------------------------------------------------------------------------- head / checkpoint
 
 
-async def resolve_head(rpc: ethpipe.Rpc, checkpoint: int | None) -> tuple[int, str | None]:
-    """(head, preferred endpoint). The pool overrides a primary that reports no new blocks while
-    others are > POOL_AHEAD_BLOCKS ahead."""
-    head = await rpc.block_number()
+async def resolve_head(rpc: ethpipe.Rpc, checkpoint: int | None) -> tuple[int, str]:
+    """(head, the endpoint that vouched for it). The pool overrides a primary that reports no new
+    blocks while others are > POOL_AHEAD_BLOCKS ahead. The endpoint is never None: every read of
+    the range is pinned to whoever claimed to see it."""
+    head, endpoint = await rpc.head_from()
     if checkpoint is not None and head <= checkpoint:
         heads = await rpc.pool_heads()
         if heads:
@@ -133,7 +160,7 @@ async def resolve_head(rpc: ethpipe.Rpc, checkpoint: int | None) -> tuple[int, s
             if best > head + POOL_AHEAD_BLOCKS:
                 log.warning("primary head %d is stalled; pool head %d via %s", head, best, best_url)
                 return best, best_url
-    return head, None
+    return head, endpoint
 
 
 async def known_pubkeys(asset: Asset) -> set[str]:
@@ -157,7 +184,7 @@ async def scan_pipe(
         return {"asset": asset.key, "skipped": "no pubkey configured"}
     st = await db().scanner_state.find_one({"_id": asset.pipe})
     checkpoint = int(st["last_block"]) if st else None
-    head, prefer = await resolve_head(rpc, checkpoint)
+    head, endpoint = await resolve_head(rpc, checkpoint)
     start = checkpoint + 1 if checkpoint is not None else max(0, head - settings.lock_scan_blocks)
     stats: dict[str, Any] = {
         "asset": asset.key,
@@ -168,16 +195,26 @@ async def scan_pipe(
         "locked": 0,
         "unattributed": 0,
         "failed": None,
-        "prefer": prefer,
+        "prefer": endpoint,
     }
     cur = start
     chunk = max(1, settings.lock_scan_chunk)
     while cur <= head and stats["chunks"] < max_chunks:
         end = min(cur + chunk - 1, head)
         try:
-            logs = await rpc.logs(asset.pipe, [ethpipe.NEWLOCAL_TOPIC], cur, end, prefer=prefer)
+            logs = await rpc.logs(
+                asset.pipe, [ethpipe.NEWLOCAL_TOPIC], cur, end, prefer=endpoint, pin=True
+            )
+            # the answer counts only if the endpoint that gave it actually has the blocks: a
+            # lagging node's empty answer must never become a checkpoint
+            seen_head = await rpc.block_number(prefer=endpoint, pin=True)
+            if seen_head < end:
+                raise ethpipe.RpcError(
+                    f"{endpoint} answered [{cur}, {end}] but its head is {seen_head} — "
+                    "the range is not readable there yet"
+                )
             for lg in logs:
-                res = await handle_log(lg, asset, pubkeys, rpc, prefer=prefer)
+                res = await handle_log(lg, asset, pubkeys, rpc, prefer=endpoint)
                 if res in ("locked", "unattributed"):
                     stats[res] += 1
         except Exception as e:  # noqa: BLE001 — a chunk that cannot be read is retried next pass, never skipped
@@ -219,12 +256,41 @@ def _sane(doc: dict[str, Any], value_units: int, m: dict[str, Any], asset: Asset
     return None
 
 
+def _direct_sender_ok(dep: dict[str, Any], receipt: dict[str, Any] | None) -> str | None:
+    """A registered hash is public information. For a `direct` deposit the claim is only the
+    user's if the transaction was SENT by the wallet that asked for the quote."""
+    want = (dep.get("address") or "").lower()
+    if not want:
+        return None  # a row written before the address was stored: the amount check still holds
+    got = ((receipt or {}).get("from") or "").lower()
+    if not got:
+        return "cannot check the sender: the receipt carries no `from`"
+    if got != want:
+        return "sender mismatch: the pipe call was not sent by the wallet that asked for the quote"
+    return None
+
+
 async def attribute(
-    m: dict[str, Any], asset: Asset, fulfilled: list[dict[str, Any]], retries: int = LITE_RETRIES
+    m: dict[str, Any],
+    asset: Asset,
+    fulfilled: list[dict[str, Any]],
+    retries: int = LITE_RETRIES,
+    receipt: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str, str]:
     """→ (doc, 'deposit'|'quote', reason). doc is None when nothing can be attributed."""
     d = db()
     if not fulfilled:
+        # No DLN fill in this receipt. A `direct` deposit IS the pipe call, so the transaction the
+        # client registered is the transaction we are looking at — that hash plus the sender is
+        # the whole claim.
+        dep = await d.deposits.find_one(
+            {"mode": "direct", "src_tx_hash": (m.get("tx") or "").lower()}
+        )
+        if dep:
+            why = _direct_sender_ok(dep, receipt) or _sane(
+                dep, int(dep["eth"]["value_units"]), m, asset
+            )
+            return (None, "deposit", why) if why else (dep, "deposit", "")
         return None, "", "no FulfilledOrder log in the receipt (not a DLN fill)"
     order_ids = [f["order_id"] for f in fulfilled]
     for oid in order_ids:
@@ -346,7 +412,7 @@ async def record_unattributed(
         "at": time.time(),
     }
     await d.unattributed_locks.update_one({"_id": key}, {"$setOnInsert": row}, upsert=True)
-    await tg.queue(
+    await tg.alert(
         "lock_unattributed",
         f"MANUAL HANDLING REQUIRED: a {asset.key} lock to our pubkey cannot be attributed — nobody was "
         f"credited. tx {m['tx']} msgId {m['msg_id']} amount {m['amount']} ({reason})",
@@ -367,11 +433,11 @@ async def handle_log(
         return "foreign"
     if await _seen(m):
         return "seen"
-    receipt = await rpc.receipt(m["tx"], prefer=prefer)
+    receipt = await rpc.receipt(m["tx"], prefer=prefer, pin=prefer is not None)
     if not receipt:
         raise ethpipe.RpcError(f"receipt {m['tx']} not available yet — chunk will be retried")
     fulfilled = find_fulfilled_in_receipt(receipt)
-    doc, how, reason = await attribute(m, asset, fulfilled, retries=retries)
+    doc, how, reason = await attribute(m, asset, fulfilled, retries=retries, receipt=receipt)
     if doc is not None:
         claimed = await lock_deposit(doc, how, m, asset, fulfilled)
         if claimed:
@@ -386,52 +452,113 @@ async def handle_log(
     return "unattributed"
 
 
-async def retry_unattributed(rpc: ethpipe.Rpc, max_age_s: float = 86400.0) -> int:
-    """Re-attempt open unattributed locks (DLN's indexing lag is the usual cause). No sleeps here."""
+def _backoff(tries: int) -> float:
+    return min(RETRY_BACKOFF_S * (2 ** max(0, tries - 1)), RETRY_BACKOFF_MAX_S)
+
+
+async def abandon_unattributed(row: dict[str, Any], why: str) -> None:
+    """Stop retrying a lock nothing can attribute. It is NOT resolved and nobody is credited —
+    it stays on the operator's desk, it just no longer burns a slot in every pass."""
+    await db().unattributed_locks.update_one(
+        {"_id": row["_id"], "status": "open"},
+        {"$set": {"status": "abandoned", "abandoned_at": time.time(), "abandoned_why": why}},
+    )
+    await tg.alert(
+        "lock_abandoned",
+        f"MANUAL HANDLING REQUIRED: a {row.get('asset')} lock is still unattributed after "
+        f"{int(row.get('tries') or 0)} attempts ({why}) — automatic retries have stopped and "
+        "nobody has been credited",
+        lock=row["_id"],
+    )
+
+
+async def retry_unattributed(
+    rpc: ethpipe.Rpc,
+    max_age_s: float = 86400.0,
+    page: int = RETRY_PAGE,
+    max_rows: int = RETRY_MAX_ROWS,
+) -> int:
+    """Re-attempt open unattributed locks (DLN's indexing lag is the usual cause), OLDEST FIRST
+    and backed off per row, paging until the due rows run out. An un-sorted, un-aged window of
+    20 could be filled forever by rows that will never attribute, and starve a recoverable one.
+    No sleeps here."""
     d = db()
     n = 0
-    rows = (
-        await d.unattributed_locks.find({"status": "open", "at": {"$gte": time.time() - max_age_s}})
-        .limit(20)
-        .to_list(20)
-    )
-    for row in rows:
-        asset = ASSETS.get(row["asset"])
-        if asset is None:
-            continue
-        receipt = await rpc.receipt(row["tx"])
-        if not receipt:
-            continue
-        m = {
-            "tx": row["tx"],
-            "block": row["block"],
-            "log_index": row["log_index"],
-            "msg_id": row["msg_id"],
-            "amount": int(row["amount"]),
-            "relayer_fee": int(row["relayer_fee"]),
-            "receiver": row["receiver"],
-            "address": row["pipe"],
+    seen = 0
+    while seen < max_rows:
+        now = time.time()
+        due = {
+            "status": "open",
+            "$or": [{"next_try_at": {"$exists": False}}, {"next_try_at": {"$lte": now}}],
         }
-        fulfilled = find_fulfilled_in_receipt(receipt)
-        doc, how, _ = await attribute(m, asset, fulfilled, retries=1)
-        if doc is None:
-            continue
-        claimed = await lock_deposit(doc, how, m, asset, fulfilled)
-        if claimed:
+        rows = await d.unattributed_locks.find(due).sort("at", 1).limit(page).to_list(page)
+        if not rows:
+            break
+        seen += len(rows)
+        for row in rows:
+            tries = int(row.get("tries") or 0) + 1
+            if now - float(row.get("at") or 0) > max_age_s:
+                await abandon_unattributed(row, f"older than {int(max_age_s)}s")
+                continue
+            if tries > RETRY_MAX_TRIES:
+                await abandon_unattributed(row, f"{RETRY_MAX_TRIES} attempts")
+                continue
             await d.unattributed_locks.update_one(
                 {"_id": row["_id"]},
                 {
                     "$set": {
-                        "status": "resolved",
-                        "deposit_id": claimed["_id"],
-                        "resolved_at": time.time(),
+                        "tries": tries,
+                        "last_try_at": now,
+                        "next_try_at": now + _backoff(tries),
                     }
                 },
             )
-            await tg.queue(
-                "deposit_locked",
-                f"Deposit locked (late attribution) in the {asset.key} pipe, msg {m['msg_id']}",
-                deposit_id=claimed["_id"],
-            )
-            n += 1
+            if await _retry_one(row, rpc):
+                n += 1
+        if len(rows) < page:
+            break
     return n
+
+
+async def _retry_one(row: dict[str, Any], rpc: ethpipe.Rpc) -> bool:
+    """One re-attribution attempt. True when the lock became a locked deposit."""
+    d = db()
+    asset = ASSETS.get(row["asset"])
+    if asset is None:
+        return False
+    receipt = await rpc.receipt(row["tx"])
+    if not receipt:
+        return False
+    m = {
+        "tx": row["tx"],
+        "block": row["block"],
+        "log_index": row["log_index"],
+        "msg_id": row["msg_id"],
+        "amount": int(row["amount"]),
+        "relayer_fee": int(row["relayer_fee"]),
+        "receiver": row["receiver"],
+        "address": row["pipe"],
+    }
+    fulfilled = find_fulfilled_in_receipt(receipt)
+    doc, how, _ = await attribute(m, asset, fulfilled, retries=1, receipt=receipt)
+    if doc is None:
+        return False
+    claimed = await lock_deposit(doc, how, m, asset, fulfilled)
+    if not claimed:
+        return False
+    await d.unattributed_locks.update_one(
+        {"_id": row["_id"]},
+        {
+            "$set": {
+                "status": "resolved",
+                "deposit_id": claimed["_id"],
+                "resolved_at": time.time(),
+            }
+        },
+    )
+    await tg.queue(
+        "deposit_locked",
+        f"Deposit locked (late attribution) in the {asset.key} pipe, msg {m['msg_id']}",
+        deposit_id=claimed["_id"],
+    )
+    return True

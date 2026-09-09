@@ -1,6 +1,5 @@
-// Status indicators shared by the Deposit, Withdraw and Activity pages and the footer: deposit and
-// payout status pills, and the honest anonymity grade computed from real counts.
-import type { DepositStatus, RequestStatus, Stats } from '../lib/types';
+// Status pills shared by the Deposit and Activity pages.
+import type { DepositStatus, RequestStatus } from '../lib/types';
 
 const DEPOSIT: Record<DepositStatus, { label: string; cls: string }> = {
   submitted: { label: 'Submitted', cls: 'pill-indigo' },
@@ -39,26 +38,6 @@ export function RequestStatusPill({ status }: { status: string }) {
   return (
     <span className={`pill ${m.cls}`} data-status={status}>
       {m.label}
-    </span>
-  );
-}
-
-export type Grade = 'weak' | 'ok' | 'good';
-
-/** Fewer than 10 deposits in 24 h reads "weak" — never overstated (spec §9.6). */
-export function anonymityGrade(stats: Stats | null): { grade: Grade; text: string } {
-  if (!stats) return { grade: 'weak', text: 'Anonymity today: unknown — stats unavailable, assume weak' };
-  const n = stats.deposits_24h ?? 0;
-  const count = `${n} deposit${n === 1 ? '' : 's'} in the last 24 h`;
-  if (n < 10) return { grade: 'weak', text: `Anonymity today: weak — ${count}` };
-  if (n < 50) return { grade: 'ok', text: `Anonymity today: ok — ${count}` };
-  return { grade: 'good', text: `Anonymity today: good — ${count}` };
-}
-
-export function GradeText({ grade, text }: { grade: Grade; text: string }) {
-  return (
-    <span className={`grade grade-${grade}`} data-grade={grade}>
-      {text}
     </span>
   );
 }

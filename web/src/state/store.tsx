@@ -8,7 +8,17 @@ import { CHAIN_META } from '../lib/chains';
 import { checksum, hexValue } from '../lib/format';
 import { buildSiweMessage } from '../lib/siwe';
 import type { Account, Asset, AssetKey, Balance, Chain, Stats } from '../lib/types';
-import { getWalletOptions, onWalletsChanged, parseChainId, startDiscovery, type Eip1193Provider, type WalletOption } from '../lib/wallet';
+import {
+  WALLETCONNECT_ID,
+  getWalletOptions,
+  initWalletConnect,
+  onWalletsChanged,
+  parseChainId,
+  restoreWalletConnect,
+  startDiscovery,
+  type Eip1193Provider,
+  type WalletOption,
+} from '../lib/wallet';
 
 const ACCOUNT_POLL_MS = 10_000;
 const LAST_WALLET_KEY = 'pgas.wallet.v1';
@@ -43,7 +53,10 @@ interface Attached {
   provider: Eip1193Provider;
   onAccounts: (...args: unknown[]) => void;
   onChain: (...args: unknown[]) => void;
+  onDisconnect?: () => void;
 }
+
+type ConnectedOption = WalletOption & { provider: Eip1193Provider };
 
 function useWalletState(onDisconnect: () => void): WalletState {
   const [options, setOptions] = useState<WalletOption[]>([]);
@@ -54,6 +67,7 @@ function useWalletState(onDisconnect: () => void): WalletState {
   const [error, setError] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const attached = useRef<Attached | null>(null);
+  const optionRef = useRef<WalletOption | null>(null);
   const addressRef = useRef<string | null>(null);
   const autoTried = useRef(false);
   addressRef.current = address;
@@ -63,11 +77,16 @@ function useWalletState(onDisconnect: () => void): WalletState {
     if (!a) return;
     a.provider.removeListener?.('accountsChanged', a.onAccounts);
     a.provider.removeListener?.('chainChanged', a.onChain);
+    if (a.onDisconnect) a.provider.removeListener?.('disconnect', a.onDisconnect);
     attached.current = null;
   }, []);
 
   const disconnect = useCallback(() => {
+    const a = attached.current;
     detach();
+    // a WalletConnect session outlives the page unless ended explicitly
+    if (a && optionRef.current?.source === 'walletconnect') a.provider.disconnect?.().catch(() => undefined);
+    optionRef.current = null;
     setOption(null);
     setAddress(null);
     setChainId(null);
@@ -81,7 +100,7 @@ function useWalletState(onDisconnect: () => void): WalletState {
   }, [detach, onDisconnect]);
 
   const attach = useCallback(
-    async (o: WalletOption, accounts: string[]) => {
+    async (o: ConnectedOption, accounts: string[]) => {
       detach();
       const p = o.provider;
       const cid = parseChainId(await p.request({ method: 'eth_chainId' }).catch(() => null));
@@ -93,7 +112,11 @@ function useWalletState(onDisconnect: () => void): WalletState {
       const onChain = (id: unknown) => setChainId(parseChainId(id));
       p.on?.('accountsChanged', onAccounts);
       p.on?.('chainChanged', onChain);
-      attached.current = { provider: p, onAccounts, onChain };
+      // only WalletConnect's 'disconnect' means the session ended; injected wallets emit it for RPC hiccups
+      const onDisconnect = o.source === 'walletconnect' ? () => disconnect() : undefined;
+      if (onDisconnect) p.on?.('disconnect', onDisconnect);
+      attached.current = { provider: p, onAccounts, onChain, onDisconnect };
+      optionRef.current = o;
       setOption(o);
       setAddress(checksum(accounts[0]));
       setChainId(cid);
@@ -112,9 +135,14 @@ function useWalletState(onDisconnect: () => void): WalletState {
       setConnecting(true);
       setError(null);
       try {
-        const accs = (await o.provider.request({ method: 'eth_requestAccounts' })) as string[];
+        if (o.disabledReason) throw new Error(`${o.name} is ${o.disabledReason}`);
+        const provider = o.provider ?? (o.source === 'walletconnect' ? await initWalletConnect() : null);
+        if (!provider) throw new Error(`${o.name} has no provider`);
+        // WalletConnect pairs through its QR modal in connect(); request() throws until a session exists
+        if (o.source === 'walletconnect' && !provider.session) await provider.connect?.();
+        const accs = (await provider.request({ method: 'eth_requestAccounts' })) as string[];
         if (!Array.isArray(accs) || !accs.length) throw new Error('The wallet granted no account');
-        await attach(o, accs);
+        await attach({ ...o, provider }, accs);
         setPickerOpen(false);
       } catch (e) {
         setError(errorText(e));
@@ -151,8 +179,10 @@ function useWalletState(onDisconnect: () => void): WalletState {
     autoTried.current = true;
     void (async () => {
       try {
-        const accs = (await o.provider.request({ method: 'eth_accounts' })) as string[];
-        if (Array.isArray(accs) && accs.length) await attach(o, accs);
+        // WalletConnect: only when a session survived the reload; never open the QR modal unasked
+        const provider = last === WALLETCONNECT_ID ? await restoreWalletConnect() : o.provider;
+        const accs = provider ? ((await provider.request({ method: 'eth_accounts' })) as string[]) : [];
+        if (provider && Array.isArray(accs) && accs.length) await attach({ ...o, provider }, accs);
         else localStorage.removeItem(LAST_WALLET_KEY);
       } catch {
         // locked or refused: the user connects by hand

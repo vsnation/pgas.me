@@ -118,7 +118,14 @@ class RpcError(RuntimeError):
 
 class Rpc:
     """Ordered endpoint pool. Every call tries the endpoints in order; a call that no endpoint
-    answers RAISES — callers must not read that as an empty result."""
+    answers RAISES — callers must not read that as an empty result.
+
+    `prefer` is an ORDERING hint (that endpoint first, the others after). `pin=True` turns it
+    into a PIN: only that endpoint may answer, and if it cannot the call raises. A scan pins
+    every read to the endpoint that vouched for the head, because a lagging endpoint answering
+    eth_getLogs with `[]` is not "no locks" — it is "I cannot see those blocks yet", and
+    checkpointing that answer skips a real deposit forever.
+    """
 
     def __init__(self, urls: list[str] | None = None, timeout: float = 8.0):
         self.urls = urls or settings.eth_rpc_list
@@ -139,14 +146,28 @@ class Rpc:
         err = body.get("error") if isinstance(body, dict) else body
         raise RpcError(f"{url}: {json.dumps(err)[:200]}")
 
-    async def call(self, method: str, params: list[Any], prefer: str | None = None) -> Any:
-        """Try the endpoints in order (`prefer` first when given)."""
-        urls = ([prefer] + [u for u in self.urls if u != prefer]) if prefer else self.urls
+    async def call(
+        self, method: str, params: list[Any], prefer: str | None = None, pin: bool = False
+    ) -> Any:
+        """Try the endpoints in order (`prefer` first when given; ONLY it when `pin`)."""
+        res, _url = await self.call_from(method, params, prefer=prefer, pin=pin)
+        return res
+
+    async def call_from(
+        self, method: str, params: list[Any], prefer: str | None = None, pin: bool = False
+    ) -> tuple[Any, str]:
+        """(result, the endpoint that answered) — the caller can pin its next call to it."""
+        if pin:
+            if not prefer:
+                raise RpcError(f"{method}: a pinned call needs an endpoint")
+            urls = [prefer]
+        else:
+            urls = ([prefer] + [u for u in self.urls if u != prefer]) if prefer else list(self.urls)
         last: Exception | None = None
         async with httpx.AsyncClient(timeout=self.timeout) as c:
             for url in urls:
                 try:
-                    return await self._post(c, url, method, params)
+                    return await self._post(c, url, method, params), url
                 except RpcError as e:
                     last = e
         raise RpcError(f"{method}: no endpoint answered ({last})")
@@ -156,8 +177,15 @@ class Rpc:
         async with httpx.AsyncClient(timeout=self.timeout) as c:
             return await self._post(c, url, method, params)
 
-    async def block_number(self, prefer: str | None = None) -> int:
-        return int(await self.call("eth_blockNumber", [], prefer=prefer), 16)
+    async def block_number(self, prefer: str | None = None, pin: bool = False) -> int:
+        return int(await self.call("eth_blockNumber", [], prefer=prefer, pin=pin), 16)
+
+    async def head_from(self) -> tuple[int, str]:
+        """(head, the endpoint that answered it). Every read of a range that ends at this head
+        has to be pinned to THAT endpoint, or the range was answered by a node that may not have
+        the blocks."""
+        res, url = await self.call_from("eth_blockNumber", [])
+        return int(res, 16), url
 
     async def pool_heads(self) -> dict[str, int]:
         """Head per endpoint, skipping any that reports eth_syncing != false or does not answer."""
@@ -171,8 +199,17 @@ class Rpc:
                 continue
         return heads
 
-    async def receipt(self, tx_hash: str, prefer: str | None = None) -> dict[str, Any] | None:
-        return await self.call("eth_getTransactionReceipt", [tx_hash], prefer=prefer)
+    async def receipt(
+        self, tx_hash: str, prefer: str | None = None, pin: bool = False
+    ) -> dict[str, Any] | None:
+        return await self.call("eth_getTransactionReceipt", [tx_hash], prefer=prefer, pin=pin)
+
+    async def transaction(
+        self, tx_hash: str, prefer: str | None = None, pin: bool = False
+    ) -> dict[str, Any] | None:
+        """eth_getTransactionByHash. None means "no endpoint has this transaction" — which is
+        NOT the same as "it does not exist"; a caller that cannot read must not conclude."""
+        return await self.call("eth_getTransactionByHash", [tx_hash], prefer=prefer, pin=pin)
 
     async def logs(
         self,
@@ -181,6 +218,7 @@ class Rpc:
         from_block: int,
         to_block: int,
         prefer: str | None = None,
+        pin: bool = False,
     ) -> list[dict[str, Any]]:
         res = await self.call(
             "eth_getLogs",
@@ -193,6 +231,7 @@ class Rpc:
                 }
             ],
             prefer=prefer,
+            pin=pin,
         )
         if not isinstance(res, list):
             raise RpcError(f"eth_getLogs: unexpected answer {str(res)[:120]}")

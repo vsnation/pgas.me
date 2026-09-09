@@ -3,12 +3,15 @@
 // personal_sign is delegated to Node-side ethers wallets through page.exposeFunction, so the mock
 // API can really recover signers and the message templates are checked end to end.
 import type { Page, Route } from '@playwright/test';
-import { Wallet, getAddress, getBytes, verifyMessage } from 'ethers';
+import { AbiCoder, Interface, Wallet, getAddress, getBytes, verifyMessage } from 'ethers';
 
 export const HOST = '127.0.0.1:4173';
 export const NATIVE = '0x0000000000000000000000000000000000000000';
 export const USDC = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48';
 export const STATEMENT = 'Sign in to Pgas.me. This signature costs nothing and moves nothing.';
+
+/** deBridge's icon CDN, served locally by `blockExternal(page, true)` so screenshots stay offline. */
+const CHAIN_ICON = (name: string) => `https://app.debridge.com/assets/images/chain/${name}.svg`;
 
 export const walletA = new Wallet('0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d');
 export const walletB = new Wallet('0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a');
@@ -28,17 +31,26 @@ interface Destination {
   created_at: number;
 }
 
+// Five EVM chains (Story and Cronos have no batch-balance helper, so the scanner uses Multicall3
+// there) plus deBridge's two non-EVM chains, which must render as "not scanned", never as errors.
 const CHAINS = [
   { chain_id: 1, dln_chain_id: 1, name: 'Ethereum', native_symbol: 'ETH' },
   { chain_id: 42161, dln_chain_id: 42161, name: 'Arbitrum', native_symbol: 'ETH' },
   { chain_id: 8453, dln_chain_id: 8453, name: 'Base', native_symbol: 'ETH' },
   { chain_id: 1514, dln_chain_id: 100000013, name: 'Story', native_symbol: 'IP' },
+  { chain_id: 25, dln_chain_id: 100000019, name: 'Cronos', native_symbol: 'CRO' },
+  { chain_id: 7565164, dln_chain_id: 7565164, name: 'Solana', native_symbol: 'SOL' },
+  { chain_id: 728126428, dln_chain_id: 100000026, name: 'Tron', native_symbol: 'TRX' },
 ];
+
+export const DAI = '0x6B175474E89094C44Da98b954EedeAC495271d0F';
+export const WBTC = '0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599';
 
 const TOKENS = [
   { address: NATIVE, symbol: 'ETH', name: 'Ether', decimals: 18, logo: '' },
-  { address: USDC, symbol: 'USDC', name: 'USD Coin', decimals: 6, logo: '' },
-  { address: '0x6B175474E89094C44Da98b954EedeAC495271d0F', symbol: 'DAI', name: 'Dai', decimals: 18, logo: '' },
+  { address: USDC, symbol: 'USDC', name: 'USD Coin', decimals: 6, logo: CHAIN_ICON('usdc') },
+  { address: DAI, symbol: 'DAI', name: 'Dai', decimals: 18, logo: '' },
+  { address: WBTC, symbol: 'WBTC', name: 'Wrapped BTC', decimals: 8, logo: '' },
 ];
 
 const ASSETS = [
@@ -72,6 +84,8 @@ const ASSETS = [
 ];
 
 const TX = '0x' + 'ab'.repeat(32);
+const DLN_ORDER = '0xeF4fB24aD0916217251F553c0596F8Edc630EB66';
+const DLN_ALLOWANCE_TARGET = '0x6A000F20005980200259B80c5102003040001068';
 
 export class MockApi {
   armed = false;
@@ -278,39 +292,63 @@ export class MockApi {
       return this.json(route, 200, { removed: address });
     }
     if (method === 'POST' && path === '/quote') {
+      // API_CONTRACT.md "Quote modes": off Ethereum it is a DLN order; on Ethereum the source token
+      // either IS the target asset (direct to the pipe) or has to be swapped in the user's own wallet.
       const amount = BigInt(String(b.amount));
-      const native = String(b.src_token).toLowerCase() === NATIVE;
-      const decimals = native ? 18 : 6;
-      const outUnits = native ? (amount * 98n) / 100n : (amount * 10n ** 12n * 98n) / 100n / 4000n;
+      const target = ASSETS.find((a) => a.key === b.target_asset) ?? ASSETS[0];
+      const src = TOKENS.find((t) => t.address.toLowerCase() === String(b.src_token).toLowerCase()) ?? {
+        address: String(b.src_token),
+        symbol: 'UNKNOWN',
+        name: 'Unknown',
+        decimals: 18,
+        logo: '',
+      };
+      const isTarget = src.address.toLowerCase() === target.token.toLowerCase();
+      const mode = Number(b.src_chain_id) !== 1 ? 'dln' : isTarget ? 'direct' : 'swap';
+      const native = src.address.toLowerCase() === NATIVE;
+      // a crude but deterministic conversion into the target asset's units
+      const usdOf = (v: bigint, dec: number) => (Number(v) / 10 ** dec) * (native ? 4000 : src.symbol === 'WBTC' ? 100000 : 1);
+      const toTarget = (v: bigint) => {
+        const usd = usdOf(v, src.decimals);
+        const price = target.key === 'ETH' ? 4000 : target.key === 'WBTC' ? 100000 : 1;
+        return BigInt(Math.round((usd / price) * 10 ** target.decimals));
+      };
+      const outUnits = mode === 'direct' ? amount : ((isTarget ? amount : toTarget(amount)) * 98n) / 100n;
+      const relayerFee = outUnits / 1000n;
+      const estimate: Record<string, unknown> = {
+        src: { chain_id: b.src_chain_id, token: src.address, symbol: src.symbol, decimals: src.decimals, amount: String(b.amount) },
+        out_units: outUnits.toString(),
+        out_groth: Number((outUnits * 100000000n) / 10n ** BigInt(target.decimals)),
+        usd: usdOf(amount, src.decimals),
+        eta_s: mode === 'direct' ? 12 * 12 + 120 : 420,
+      };
       const quote: Record<string, unknown> = {
         quote_id: 'q-' + Math.random().toString(36).slice(2, 8),
-        target_asset: b.target_asset,
+        target_asset: target.key,
+        mode,
         armed: this.armed,
         expires_at: new Date(Date.now() + 30_000).toISOString(),
-        estimate: {
-          src: { chain_id: b.src_chain_id, token: b.src_token, symbol: native ? 'ETH' : 'USDC', decimals, amount: String(b.amount) },
-          out_units: outUnits.toString(),
-          out_groth: Number(outUnits / 10n ** 10n),
-          value_units: outUnits.toString(),
-          relayer_fee_units: '40000000000000',
-          usd: (Number(outUnits) / 1e18) * 4000,
-          eta_s: 420,
-        },
+        estimate,
       };
+      if (mode === 'swap') {
+        // the swap lands in the user's OWN wallet, so it is issued armed or not; never a deposit
+        estimate.dln_fees = { protocolFee: '1000000000000000' };
+        quote.swap_tx = { chain_id: 1, to: DLN_ORDER, data: '0xfeedface', value: native ? String(amount) : '0' };
+        if (!native) quote.approval = { chain_id: 1, token: src.address, spender: DLN_ALLOWANCE_TARGET, amount: String(amount) };
+        quote.next = { src_chain_id: 1, src_token: target.token, amount: outUnits.toString() };
+        return this.json(route, 200, quote);
+      }
+      estimate.value_units = (outUnits - relayerFee).toString();
+      estimate.relayer_fee_units = relayerFee.toString();
+      if (mode === 'dln') {
+        estimate.dln_fees = { protocolFee: '1000000000000000' };
+        quote.order_id = '0x' + '77'.repeat(32);
+      }
       if (this.armed) {
-        quote.tx = {
-          chain_id: b.src_chain_id,
-          to: '0xeF4fB24aD0916217251F553c0596F8Edc630EB66',
-          data: '0xdeadbeef',
-          value: native ? String(b.amount) : '0',
-        };
+        const to = mode === 'direct' ? target.pipe : DLN_ORDER;
+        quote.tx = { chain_id: mode === 'direct' ? 1 : b.src_chain_id, to, data: '0xdeadbeef', value: native ? String(amount) : '0' };
         if (!native)
-          quote.approval = {
-            chain_id: b.src_chain_id,
-            token: b.src_token,
-            spender: '0xeF4fB24aD0916217251F553c0596F8Edc630EB66',
-            amount: String(b.amount),
-          };
+          quote.approval = { chain_id: mode === 'direct' ? 1 : b.src_chain_id, token: src.address, spender: to, amount: String(amount) };
       } else quote.note = 'ingress not armed: no Beam pubkey configured';
       return this.json(route, 200, quote);
     }
@@ -354,12 +392,148 @@ export class MockApi {
   }
 }
 
-/** Blocks every request that leaves 127.0.0.1 (RPCs, CoinGecko, fonts unless allowed). */
-export async function blockExternal(page: Page, allowFonts = false) {
+/**
+ * Blocks every request that leaves 127.0.0.1 (RPCs, CoinGecko, fonts unless allowed). With
+ * `allowAssets` the Google Fonts CSS is fetched for real and deBridge's chain/token icons are served
+ * locally, so a screenshot shows the badges without depending on a CDN.
+ */
+export async function blockExternal(page: Page, allowAssets = false) {
   await page.route(/^https?:\/\/(?!127\.0\.0\.1)/, (route) => {
     const url = route.request().url();
-    if (allowFonts && /fonts\.(googleapis|gstatic)\.com/.test(url)) return route.continue();
+    if (allowAssets && /fonts\.(googleapis|gstatic)\.com/.test(url)) return route.continue();
+    if (allowAssets && /app\.debridge\.com\/assets\/images\/.+\.svg$/.test(url)) {
+      const hue = [...url].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7);
+      return route.fulfill({
+        status: 200,
+        contentType: 'image/svg+xml',
+        body: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="16" fill="hsl(${hue} 70% 52%)"/></svg>`,
+      });
+    }
     return route.abort('blockedbyclient');
+  });
+}
+
+// The first FALLBACK_RPCS url of each mocked chain (src/lib/chains.ts): the scanner tries it first,
+// so answering it is enough to make the chain readable.
+const RPC_URLS: Record<number, string> = {
+  1: 'https://ethereum-rpc.publicnode.com',
+  42161: 'https://arb1.arbitrum.io/rpc',
+  8453: 'https://mainnet.base.org',
+  1514: 'https://mainnet.storyrpc.io',
+  25: 'https://evm.cronos.org',
+};
+
+const BATCH_IFACE = new Interface([
+  'function balanceFor(address[] _tokens, address _account) view returns (uint256[] balances, uint256[] decimals)',
+]);
+const MC3_IFACE = new Interface([
+  'function aggregate3((address target, bool allowFailure, bytes callData)[] calls) payable returns ((bool success, bytes returnData)[] returnData)',
+]);
+const CODER = AbiCoder.defaultAbiCoder();
+
+export interface ChainHoldings {
+  native: bigint;
+  tokens: Record<string, bigint>;
+}
+
+/**
+ * A public-RPC double: eth_chainId / eth_getBalance / eth_call for the batch-balance helper,
+ * Multicall3's aggregate3 and plain balanceOf. Install it AFTER blockExternal so it wins the route.
+ */
+export class MockRpc {
+  constructor(public holdings: Record<number, ChainHoldings> = {}) {}
+
+  async install(page: Page) {
+    for (const [id, url] of Object.entries(RPC_URLS)) {
+      await page.route(url, (route) => this.handle(Number(id), route));
+    }
+  }
+
+  private handle(chainId: number, route: Route) {
+    let body: unknown;
+    try {
+      body = JSON.parse(route.request().postData() ?? 'null');
+    } catch {
+      body = null;
+    }
+    const one = (r: { id?: unknown; method?: string; params?: unknown[] }) => {
+      const id = r?.id ?? 1;
+      try {
+        return { jsonrpc: '2.0', id, result: this.answer(chainId, String(r?.method), (r?.params ?? []) as unknown[]) };
+      } catch (e) {
+        return { jsonrpc: '2.0', id, error: { code: -32000, message: (e as Error).message } };
+      }
+    };
+    const out = Array.isArray(body) ? body.map(one) : one(body as never);
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(out) });
+  }
+
+  private answer(chainId: number, method: string, params: unknown[]): unknown {
+    const h = this.holdings[chainId] ?? { native: 0n, tokens: {} };
+    const bal = (token: string) => h.tokens[token.toLowerCase()] ?? 0n;
+    switch (method) {
+      case 'eth_chainId':
+        return '0x' + chainId.toString(16);
+      case 'net_version':
+        return String(chainId);
+      case 'eth_blockNumber':
+        return '0x10';
+      case 'eth_getBalance':
+        return '0x' + h.native.toString(16);
+      case 'eth_call': {
+        const tx = params[0] as { to?: string; data?: string };
+        const data = String(tx?.data ?? '0x');
+        const selector = data.slice(0, 10);
+        if (selector === MC3_IFACE.getFunction('aggregate3')!.selector) {
+          const [calls] = MC3_IFACE.decodeFunctionData('aggregate3', data);
+          const items = (calls as unknown as [string, boolean, string][]).map((c) => [true, CODER.encode(['uint256'], [bal(c[0])])]);
+          return MC3_IFACE.encodeFunctionResult('aggregate3', [items]);
+        }
+        if (selector === BATCH_IFACE.getFunction('balanceFor')!.selector) {
+          const [tokens] = BATCH_IFACE.decodeFunctionData('balanceFor', data);
+          const list = tokens as unknown as string[];
+          return BATCH_IFACE.encodeFunctionResult('balanceFor', [
+            list.map((t) => bal(t)),
+            list.map((t) => BigInt(TOKENS.find((x) => x.address.toLowerCase() === t.toLowerCase())?.decimals ?? 18)),
+          ]);
+        }
+        return CODER.encode(['uint256'], [bal(String(tx?.to ?? ''))]);
+      }
+      default:
+        throw new Error(`mock rpc: unsupported ${method}`);
+    }
+  }
+}
+
+const USD = {
+  ethereum: 4000,
+  'story-2': 3.2,
+  'crypto-com-chain': 0.12,
+  [USDC.toLowerCase()]: 1,
+  [DAI.toLowerCase()]: 1,
+  [WBTC.toLowerCase()]: 100000,
+} as Record<string, number>;
+
+/** A wallet with something on every mocked chain, including the two with no batch-balance helper. */
+export const DEMO_HOLDINGS: Record<number, ChainHoldings> = {
+  1: {
+    native: 250000000000000000n, // 0.25 ETH
+    tokens: { [USDC.toLowerCase()]: 1834500000n, [DAI.toLowerCase()]: 402000000000000000000n, [WBTC.toLowerCase()]: 3400000n },
+  },
+  42161: { native: 120000000000000000n, tokens: { [USDC.toLowerCase()]: 640120000n } },
+  8453: { native: 45000000000000000n, tokens: { [USDC.toLowerCase()]: 96000000n, [DAI.toLowerCase()]: 12500000000000000000n } },
+  1514: { native: 1500000000000000000000n, tokens: { [USDC.toLowerCase()]: 25000000n } },
+  25: { native: 8200000000000000000000n, tokens: { [USDC.toLowerCase()]: 310000000n, [DAI.toLowerCase()]: 88000000000000000000n } },
+};
+
+/** CoinGecko double so the chips carry USD labels offline. Install after blockExternal. */
+export async function installMockPrices(page: Page) {
+  await page.route(/api\.coingecko\.com/, (route) => {
+    const url = new URL(route.request().url());
+    const keys = (url.searchParams.get('ids') ?? url.searchParams.get('contract_addresses') ?? '').split(',').filter(Boolean);
+    const body: Record<string, { usd: number }> = {};
+    for (const k of keys) if (USD[k.toLowerCase()] !== undefined) body[k] = { usd: USD[k.toLowerCase()] };
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
   });
 }
 
@@ -372,92 +546,114 @@ export async function installMockWallet(page: Page, wallets: Wallet[] = [walletA
     return w.signMessage(getBytes(hexMessage));
   });
   await page.addInitScript(
-    ({ accounts, tx }) => {
-      const listeners: Record<string, Array<(...a: unknown[]) => void>> = {};
-      const state = { accounts, chainId: 1, sent: [] as unknown[] };
-      const emit = (ev: string, ...args: unknown[]) => (listeners[ev] ?? []).forEach((l) => l(...args));
-      const provider = {
-        isMetaMask: true,
-        async request({ method, params }: { method: string; params?: any[] }) {
-          switch (method) {
-            case 'eth_requestAccounts':
-            case 'eth_accounts':
-              return state.accounts;
-            case 'eth_chainId':
-              return '0x' + state.chainId.toString(16);
-            case 'net_version':
-              return String(state.chainId);
-            case 'wallet_switchEthereumChain':
-              state.chainId = parseInt(params?.[0]?.chainId, 16);
-              emit('chainChanged', '0x' + state.chainId.toString(16));
-              return null;
-            case 'wallet_addEthereumChain':
-              return null;
-            case 'eth_getBalance':
-              return '0x0';
-            case 'eth_blockNumber':
-              return '0x10';
-            case 'eth_estimateGas':
-              return '0x5208';
-            case 'eth_getTransactionReceipt':
-              return {
-                transactionHash: params?.[0],
-                transactionIndex: '0x0',
-                blockHash: '0x' + 'cd'.repeat(32),
-                blockNumber: '0xf',
-                from: state.accounts[0],
-                to: '0xeF4fB24aD0916217251F553c0596F8Edc630EB66',
-                cumulativeGasUsed: '0x5208',
-                gasUsed: '0x5208',
-                effectiveGasPrice: '0x3b9aca00',
-                gasPrice: '0x3b9aca00',
-                contractAddress: null,
-                logs: [],
-                logsBloom: '0x' + '00'.repeat(256),
-                status: '0x1',
-                type: '0x2',
-              };
-            case 'eth_call':
-              throw Object.assign(new Error('execution reverted'), { code: -32000 });
-            case 'personal_sign':
-              return (window as any).__mockSign(params?.[0], params?.[1]);
-            case 'eth_sendTransaction':
-              state.sent.push(params?.[0]);
-              return tx;
-            default:
-              throw Object.assign(new Error(`mock: unsupported ${method}`), { code: 4200 });
-          }
-        },
-        on(ev: string, l: (...a: unknown[]) => void) {
-          (listeners[ev] = listeners[ev] ?? []).push(l);
-        },
-        removeListener(ev: string, l: (...a: unknown[]) => void) {
-          listeners[ev] = (listeners[ev] ?? []).filter((x) => x !== l);
-        },
+    ({ accountsA, accountsB, tx }) => {
+      // one provider factory, three instances: the announced main wallet (also window.ethereum),
+      // a second announced wallet, and a legacy-only Coin98 global
+      const make = (accounts: string[]) => {
+        const listeners: Record<string, Array<(...a: unknown[]) => void>> = {};
+        const state = { accounts, chainId: 1, sent: [] as unknown[] };
+        const emit = (ev: string, ...args: unknown[]) => (listeners[ev] ?? []).forEach((l) => l(...args));
+        const provider = {
+          isMetaMask: true,
+          async request({ method, params }: { method: string; params?: any[] }) {
+            switch (method) {
+              case 'eth_requestAccounts':
+              case 'eth_accounts':
+                return state.accounts;
+              case 'eth_chainId':
+                return '0x' + state.chainId.toString(16);
+              case 'net_version':
+                return String(state.chainId);
+              case 'wallet_switchEthereumChain':
+                state.chainId = parseInt(params?.[0]?.chainId, 16);
+                emit('chainChanged', '0x' + state.chainId.toString(16));
+                return null;
+              case 'wallet_addEthereumChain':
+                return null;
+              case 'eth_getBalance':
+                return '0x0';
+              case 'eth_blockNumber':
+                return '0x10';
+              case 'eth_estimateGas':
+                return '0x5208';
+              case 'eth_getTransactionReceipt':
+                return {
+                  transactionHash: params?.[0],
+                  transactionIndex: '0x0',
+                  blockHash: '0x' + 'cd'.repeat(32),
+                  blockNumber: '0xf',
+                  from: state.accounts[0],
+                  to: '0xeF4fB24aD0916217251F553c0596F8Edc630EB66',
+                  cumulativeGasUsed: '0x5208',
+                  gasUsed: '0x5208',
+                  effectiveGasPrice: '0x3b9aca00',
+                  gasPrice: '0x3b9aca00',
+                  contractAddress: null,
+                  logs: [],
+                  logsBloom: '0x' + '00'.repeat(256),
+                  status: '0x1',
+                  type: '0x2',
+                };
+              case 'eth_call':
+                throw Object.assign(new Error('execution reverted'), { code: -32000 });
+              case 'personal_sign':
+                return (window as any).__mockSign(params?.[0], params?.[1]);
+              case 'eth_sendTransaction':
+                state.sent.push(params?.[0]);
+                return tx;
+              default:
+                throw Object.assign(new Error(`mock: unsupported ${method}`), { code: 4200 });
+            }
+          },
+          on(ev: string, l: (...a: unknown[]) => void) {
+            (listeners[ev] = listeners[ev] ?? []).push(l);
+          },
+          removeListener(ev: string, l: (...a: unknown[]) => void) {
+            listeners[ev] = (listeners[ev] ?? []).filter((x) => x !== l);
+          },
+        };
+        return {
+          provider,
+          state,
+          setAccounts(list: string[]) {
+            state.accounts = list;
+            emit('accountsChanged', list);
+          },
+        };
       };
-      (window as any).ethereum = provider;
-      (window as any).__mock = {
-        state,
-        setAccounts(list: string[]) {
-          state.accounts = list;
-          emit('accountsChanged', list);
-        },
-      };
-      const icon =
+      const main = make(accountsA);
+      const second = make(accountsB);
+      const coin98 = make(accountsA);
+      (window as any).ethereum = main.provider;
+      (window as any).coin98 = { provider: coin98.provider };
+      (window as any).__mock = main;
+      const icon = (fill: string) =>
         'data:image/svg+xml;utf8,' +
         encodeURIComponent(
-          '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><rect width="40" height="40" rx="10" fill="#0E8F86"/></svg>',
+          `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40"><rect width="40" height="40" rx="10" fill="${fill}"/></svg>`,
         );
-      const announce = () =>
+      const announce = () => {
         window.dispatchEvent(
           new CustomEvent('eip6963:announceProvider', {
-            detail: Object.freeze({ info: { uuid: 'mock-uuid-1', name: 'Mock Wallet', icon, rdns: 'me.pgas.mock' }, provider }),
+            detail: Object.freeze({
+              info: { uuid: 'mock-uuid-1', name: 'Mock Wallet', icon: icon('#0E8F86'), rdns: 'me.pgas.mock' },
+              provider: main.provider,
+            }),
           }),
         );
+        window.dispatchEvent(
+          new CustomEvent('eip6963:announceProvider', {
+            detail: Object.freeze({
+              info: { uuid: 'mock-uuid-2', name: 'Mock Wallet 2', icon: icon('#4A63E7'), rdns: 'me.pgas.mock2' },
+              provider: second.provider,
+            }),
+          }),
+        );
+      };
       window.addEventListener('eip6963:requestProvider', announce);
       announce();
     },
-    { accounts: [wallets[0].address], tx: TX },
+    { accountsA: [wallets[0].address], accountsB: [wallets[1].address], tx: TX },
   );
 }
 

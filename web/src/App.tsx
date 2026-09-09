@@ -1,7 +1,6 @@
 // App chrome — header (brand, tabs, network chip, connect), notices, the wallet picker dialog, the
 // stats footer — and the tab switch. Page bodies live in pages/.
 import { useEffect, useRef, useState } from 'react';
-import { GradeText, anonymityGrade } from './components/Status';
 import { errorText } from './lib/api';
 import { chainName } from './lib/chains';
 import { fmtAgo, fmtNumber, shortAddr } from './lib/format';
@@ -79,12 +78,6 @@ function Header() {
   );
 }
 
-const SOURCE_LABEL: Record<WalletOption['source'], string> = {
-  eip6963: 'Injected (EIP-6963)',
-  injected: 'Injected',
-  farcaster: 'Farcaster mini app',
-};
-
 function WalletPicker() {
   const { wallet } = useStore();
   const [busy, setBusy] = useState<string | null>(null);
@@ -110,6 +103,13 @@ function WalletPicker() {
       setBusy(null);
     }
   };
+  const subtitle = (o: WalletOption) => {
+    if (busy === o.id) return o.source === 'walletconnect' ? 'Loading WalletConnect…' : 'Waiting for the wallet…';
+    if (o.disabledReason) return o.disabledReason;
+    if (o.hint) return o.hint;
+    return o.source === 'farcaster' ? 'Farcaster mini app' : 'browser extension or in-app browser';
+  };
+  const detected = wallet.options.filter((o) => o.source !== 'walletconnect');
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && closePicker()}>
       <div className="modal" role="dialog" aria-modal="true" aria-label="Connect a wallet" ref={dialog}>
@@ -120,35 +120,35 @@ function WalletPicker() {
           </button>
         </div>
         <div className="stack">
-          {wallet.options.length === 0 ? (
-            <div className="stack-sm">
-              <p>No browser wallet was detected on this page.</p>
-              <p className="small muted">
-                Install an injected wallet (MetaMask, Rabby, Coinbase Wallet, Zerion, Trust, OKX) or open pgas.me from your wallet's
-                built-in browser. Inside Warpcast the Farcaster wallet is used automatically.
-              </p>
-            </div>
-          ) : (
-            <div className="wallet-list" role="list">
-              {wallet.options.map((o) => (
-                <button
-                  key={o.id}
-                  type="button"
-                  className="wallet-row"
-                  onClick={() => pick(o)}
-                  disabled={busy !== null}
-                  role="listitem"
-                  data-wallet-id={o.id}
-                >
-                  <img src={o.icon} alt="" />
-                  <span className="stack-sm" style={{ gap: 0 }}>
-                    <span className="w-name">{o.name}</span>
-                    <span className="w-src">{busy === o.id ? 'Waiting for the wallet…' : SOURCE_LABEL[o.source]}</span>
-                  </span>
-                </button>
-              ))}
-            </div>
+          {detected.length === 0 && (
+            <p className="small muted">
+              No browser wallet was detected on this page. Install one (MetaMask, Rabby, Coinbase Wallet, Zerion, Trust, OKX, Coin98…), open
+              pgas.me from your wallet's in-app browser, or scan with WalletConnect below.
+            </p>
           )}
+          <div className="wallet-list" role="list">
+            {wallet.options.map((o) => (
+              <button
+                key={o.id}
+                type="button"
+                className="wallet-row"
+                onClick={() => pick(o)}
+                disabled={busy !== null || !!o.disabledReason}
+                aria-disabled={!!o.disabledReason}
+                role="listitem"
+                data-wallet-id={o.id}
+              >
+                <img src={o.icon} alt="" />
+                <span className="stack-sm" style={{ gap: 0, minWidth: 0 }}>
+                  <span className="row" style={{ gap: 8 }}>
+                    <span className="w-name">{o.name}</span>
+                    {(o.source === 'injected' || o.source === 'eip6963') && <span className="pill pill-teal">Detected</span>}
+                  </span>
+                  <span className="w-src">{subtitle(o)}</span>
+                </span>
+              </button>
+            ))}
+          </div>
           {err && <p className="error-text">{err}</p>}
           <p className="tiny muted">
             The account is the wallet. Signing in costs nothing and moves nothing; whoever controls the wallet controls the balance.
@@ -195,7 +195,6 @@ function ArmedChip({ on, label }: { on: boolean; label: string }) {
 function StatsFooter() {
   const { data } = useStore();
   const { stats, statsError } = data;
-  const g = anonymityGrade(stats);
   return (
     <footer className="footer">
       <div className="container">
@@ -233,9 +232,7 @@ function StatsFooter() {
           </div>
         )}
         <div className="footer-note">
-          <GradeText grade={g.grade} text={g.text} />
-          <span>Custodial v1 — the balance is a ledger entry, the wallet is the account.</span>
-          <span>2% fee at unlock; no fee at deposit.</span>
+          <span>Settled on Beam — a confidential ledger: no addresses on-chain, blinded amounts.</span>
         </div>
       </div>
     </footer>
