@@ -1,0 +1,219 @@
+"""deBridge DLN client (read-only HTTP; the only state-changing thing DLN ever does is what the
+USER signs). Primary host first, the deswap mirror as fallback. Errors are never swallowed
+into "no data": every failure raises DlnError with the upstream message so routes answer 502.
+
+Shapes (recorded live 2026-09-09):
+  GET /supported-chains-info        → {"chains":[{"chainId":100000013,"originalChainId":1514,"chainName":"Story"}, …]}
+  GET /token-list?chainId=42161     → {"tokens":{"0x…":{symbol,name,decimals,address,logoURI,isNative?}, …}}
+  GET /dln/order/create-tx?…        → {"estimation":{srcChainTokenIn{…},dstChainTokenOut{amount,…},costsDetails[]},
+                                       "tx":{data,to,value[,allowanceTarget,allowanceValue]},"orderId","order":{…},
+                                       "fixFee","protocolFee","estimatedTransactionFee":{…}}
+  GET /dln/tx/{hash}/order-ids      → {"orderIds":["0x…"]}
+  GET /dln/order/{id}/status        → {"status":"Fulfilled","orderId":"0x…"}   (400 UNKNOWN_ORDER when unknown)
+  GET stats-api /Orders/{id}/liteModel → {state, rawOrderMetadataHex, orderFulfilledTransactionHash, …}
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any
+
+import httpx
+
+from .config import settings
+
+CHAINS_TTL_S = 3600
+TOKENS_TTL_S = 600
+
+TERMINAL_OK = ("Fulfilled", "SentUnlock", "ClaimedUnlock")
+TERMINAL_CANCELLED = ("OrderCancelled", "ClaimedOrderCancel")
+
+
+class DlnError(RuntimeError):
+    def __init__(self, message: str, status: int | None = None, error_id: str | None = None):
+        super().__init__(message)
+        self.status = status
+        self.error_id = error_id
+
+
+# reachability bookkeeping for the monitor
+health: dict[str, Any] = {"last_ok_at": 0.0, "last_fail_at": 0.0, "last_error": ""}
+
+_chains_cache: dict[str, Any] = {"at": 0.0, "data": None}
+_tokens_cache: dict[int, dict[str, Any]] = {}
+
+
+def clear_cache() -> None:
+    _chains_cache["at"] = 0.0
+    _chains_cache["data"] = None
+    _tokens_cache.clear()
+
+
+def _bases() -> list[str]:
+    out = [settings.dln_base.rstrip("/")]
+    if settings.dln_mirror and settings.dln_mirror.rstrip("/") != out[0]:
+        out.append(settings.dln_mirror.rstrip("/"))
+    return out
+
+
+def _upstream_message(r: httpx.Response) -> str:
+    try:
+        body = r.json()
+    except ValueError:
+        return f"HTTP {r.status_code}: {r.text[:200]}"
+    if isinstance(body, dict):
+        msg = body.get("errorMessage") or body.get("message") or body.get("error") or ""
+        eid = body.get("errorId") or body.get("errorCode")
+        return (
+            f"{eid}: {msg}" if eid and msg else (msg or f"HTTP {r.status_code}: {str(body)[:200]}")
+        )
+    return f"HTTP {r.status_code}: {str(body)[:200]}"
+
+
+async def _get(
+    path: str,
+    params: dict[str, Any] | None = None,
+    *,
+    bases: list[str] | None = None,
+    timeout: float | None = None,
+) -> Any:
+    """GET path on the primary, then the mirror. A 4xx with an upstream message is final (it is
+    the API's verdict, not a transport failure) and raises at once; transport errors and 5xx fall
+    through to the next base."""
+    last: Exception | None = None
+    async with httpx.AsyncClient(timeout=timeout or settings.dln_timeout_s) as c:
+        for base in bases or _bases():
+            url = f"{base}/{path.lstrip('/')}"
+            try:
+                r = await c.get(url, params=params)
+            except httpx.HTTPError as e:
+                last = DlnError(f"{url}: {type(e).__name__}: {e}")
+                continue
+            if r.status_code < 300:
+                health["last_ok_at"] = time.time()
+                try:
+                    return r.json()
+                except ValueError:
+                    last = DlnError(f"{url}: not JSON: {r.text[:120]}")
+                    continue
+            msg = _upstream_message(r)
+            err_id = None
+            try:
+                err_id = r.json().get("errorId")
+            except Exception:  # noqa: BLE001
+                pass
+            if 400 <= r.status_code < 500:
+                # the API answered; its verdict does not change on the mirror
+                health["last_ok_at"] = time.time()
+                raise DlnError(msg, status=r.status_code, error_id=err_id)
+            last = DlnError(msg, status=r.status_code, error_id=err_id)
+    health["last_fail_at"] = time.time()
+    health["last_error"] = str(last)
+    raise last if last else DlnError("DLN: no base configured")
+
+
+async def supported_chains(force: bool = False) -> list[dict[str, Any]]:
+    now = time.time()
+    if not force and _chains_cache["data"] is not None and now - _chains_cache["at"] < CHAINS_TTL_S:
+        return _chains_cache["data"]
+    body = await _get("supported-chains-info")
+    chains = body.get("chains") if isinstance(body, dict) else body
+    if not isinstance(chains, list) or not chains:
+        raise DlnError("supported-chains-info: empty or malformed answer")
+    _chains_cache["data"] = chains
+    _chains_cache["at"] = now
+    return chains
+
+
+async def chain_map() -> dict[int, dict[str, Any]]:
+    """originalChainId (EVM id) → chain row."""
+    return {
+        int(c["originalChainId"]): c for c in await supported_chains() if "originalChainId" in c
+    }
+
+
+async def dln_chain_id(evm_chain_id: int) -> int:
+    row = (await chain_map()).get(int(evm_chain_id))
+    if not row:
+        raise DlnError(f"chain {evm_chain_id} is not supported by DLN", status=400)
+    return int(row["chainId"])
+
+
+async def token_list(dln_chain: int, force: bool = False) -> list[dict[str, Any]]:
+    """Tokens of one chain as a list (DLN keys them by address), native first."""
+    now = time.time()
+    cached = _tokens_cache.get(int(dln_chain))
+    if not force and cached and now - cached["at"] < TOKENS_TTL_S:
+        return cached["data"]
+    body = await _get("token-list", {"chainId": int(dln_chain)})
+    toks = body.get("tokens") if isinstance(body, dict) else None
+    if isinstance(toks, dict):
+        rows = list(toks.values())
+    elif isinstance(toks, list):
+        rows = toks
+    else:
+        raise DlnError(f"token-list {dln_chain}: malformed answer")
+    rows.sort(
+        key=lambda t: (
+            0 if (t.get("isNative") or t.get("address", "").lower().endswith("0" * 40)) else 1,
+            (t.get("symbol") or "").upper(),
+        )
+    )
+    _tokens_cache[int(dln_chain)] = {"at": now, "data": rows}
+    return rows
+
+
+async def create_tx(params: dict[str, Any]) -> dict[str, Any]:
+    """GET /dln/order/create-tx. Returns the whole body (estimation, tx, orderId, …). Raises DlnError
+    with the upstream message (e.g. COMPLIANCE_ADDRESS_BLOCKED, amount too small) on refusal."""
+    body = await _get("dln/order/create-tx", params)
+    if not isinstance(body, dict) or "estimation" not in body:
+        raise DlnError(f"create-tx: malformed answer {str(body)[:200]}")
+    return body
+
+
+async def order_ids_by_tx(tx_hash: str) -> list[str]:
+    body = await _get(f"dln/tx/{tx_hash}/order-ids")
+    ids = body.get("orderIds") if isinstance(body, dict) else None
+    if not isinstance(ids, list):
+        raise DlnError(f"order-ids {tx_hash}: malformed answer {str(body)[:200]}")
+    return [str(i) for i in ids]
+
+
+async def order_status(order_id: str) -> dict[str, Any]:
+    body = await _get(f"dln/order/{order_id}/status")
+    if not isinstance(body, dict) or "status" not in body:
+        raise DlnError(f"order status {order_id}: malformed answer {str(body)[:200]}")
+    return body
+
+
+async def lite_model(order_id: str) -> dict[str, Any] | None:
+    """The DLN stats API's lite order model — best effort, never evidence. It carries
+    rawOrderMetadataHex (our 5-byte metadata tag at bytes[45:50]) and the fulfilment tx hash.
+    Returns None when the stats API cannot answer (it indexes with delay)."""
+    try:
+        body = await _get(
+            f"Orders/{order_id}/liteModel", bases=[settings.dln_stats_base.rstrip("/")], timeout=15
+        )
+    except DlnError:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def out_amount(body: dict[str, Any]) -> int:
+    """estimation.dstChainTokenOut.amount as int (raw units of the target on Ethereum)."""
+    try:
+        return int(body["estimation"]["dstChainTokenOut"]["amount"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise DlnError(f"create-tx: no dstChainTokenOut.amount ({e})") from e
+
+
+def recommended_amount(body: dict[str, Any]) -> int | None:
+    """estimation.dstChainTokenOut.recommendedAmount — what solvers will actually fill at. With an
+    explicit dstChainTokenOutAmount this can be BELOW `amount` (recorded live: a 250k-gas hook
+    lowers it by ≈ $0.20); an order above it may sit unfilled."""
+    try:
+        v = body["estimation"]["dstChainTokenOut"].get("recommendedAmount")
+        return int(v) if v is not None else None
+    except (KeyError, TypeError, ValueError):
+        return None
