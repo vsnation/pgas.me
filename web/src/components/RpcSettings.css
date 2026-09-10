@@ -1,0 +1,190 @@
+/* T54 — the RPC settings popup.
+ *
+ * Its own file rather than more lines in styles.css: this is one dialog, three workers were editing
+ * that file the day this was written, and nothing here is used anywhere else. Every colour is one of
+ * the tokens defined on `:root` in styles.css, so light and dark both come out right without a
+ * second palette — never a literal colour here.
+ */
+
+/* the header control, sized like the theme switch beside it */
+.rpc-gear {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  color: var(--muted);
+  flex: none;
+}
+.rpc-gear:hover:not(:disabled) {
+  color: var(--ink);
+  background: var(--surface-2);
+}
+
+.rpc-settings {
+  min-width: 0;
+}
+.rpc-toolbar {
+  gap: 8px;
+}
+
+/* one scroll area, so the dialog's own head and copy stay put with thirty chains under them */
+.rpc-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 52vh;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.rpc-row {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.rpc-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.rpc-chain-icon {
+  border-radius: 50%;
+  flex: none;
+}
+.rpc-row-head .num {
+  margin-left: auto;
+}
+.rpc-row-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+/* The shared `.select` carries no affordance of its own, and a dropdown that looks like a text box
+   is a dropdown nobody opens — the whole feature is "pick one of many". So: the native control with
+   its own arrow suppressed, and one drawn in a THEME TOKEN, which a data-URI arrow could not be. */
+.rpc-field {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+}
+.rpc-field::after {
+  content: '';
+  position: absolute;
+  right: 13px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  border-right: 2px solid var(--muted);
+  border-bottom: 2px solid var(--muted);
+  transform: translateY(-70%) rotate(45deg);
+  pointer-events: none;
+}
+.rpc-row-body .select {
+  background: var(--surface);
+  min-width: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 32px;
+}
+.rpc-more {
+  align-self: flex-start;
+}
+
+/* the health dot: three states plus "nobody has asked yet", which is a hole rather than a colour */
+.rpc-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--muted);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+.rpc-dot-unknown {
+  background: transparent;
+  border: 1.5px solid var(--muted);
+}
+.rpc-dot-ok {
+  background: var(--teal);
+}
+.rpc-dot-slow {
+  background: var(--amber);
+}
+.rpc-dot-failed {
+  background: var(--red);
+}
+
+.rpc-endpoints {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.rpc-endpoint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  min-width: 0;
+}
+.rpc-endpoint.active {
+  background: var(--teal-soft);
+}
+.rpc-endpoint-url {
+  flex: 1;
+  min-width: 0;
+}
+.rpc-endpoint .link-btn,
+.rpc-endpoint .pill {
+  flex: none;
+}
+
+.rpc-custom {
+  border-top: 1px dashed var(--line);
+  padding-top: 8px;
+}
+.rpc-custom-actions {
+  gap: 10px;
+}
+
+/* A phone gets a sheet, not a card floating in 20px of backdrop: the list is long, the selects are
+   touch targets, and the dialog is the whole task while it is open. */
+@media (max-width: 560px) {
+  .modal-backdrop.rpc-modal {
+    padding: 0;
+    align-items: stretch;
+  }
+  .rpc-modal .modal {
+    max-width: none;
+    max-height: none;
+    height: 100%;
+    border: 0;
+    border-radius: 0;
+    padding: 16px;
+  }
+  /* pulled up over the panel's own padding and given it back as its own, so it sticks flush to the
+     top of the sheet instead of leaving a strip of scrolling content above it */
+  .rpc-modal .modal-head {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--surface);
+    padding: 16px 0 10px;
+    margin: -16px 0 8px;
+  }
+  .rpc-list {
+    max-height: none;
+    overflow: visible;
+  }
+  .rpc-row-body {
+    flex-wrap: wrap;
+  }
+}

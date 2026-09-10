@@ -20,6 +20,8 @@ import {
   walletA,
   walletB,
 } from './mocks';
+// T35b: the API's own sentences, so a shortfall the page shows is the shortfall production writes
+import * as SAY from './api-sentences';
 
 const ETH_PIPE = '0xB1d7FF9D3aCaf30e282c5F6eb1F2A6503f516a96';
 const UNISWAP_NOTE = 'via Uniswap V4 — one transaction, the hook locks your ETH in the Beam bridge';
@@ -41,6 +43,13 @@ function breakChecksum(address: string): string {
   }
   throw new Error('no cased character in ' + address);
 }
+
+/**
+ * groth → exactly the string `lib/format.fmtGroth` prints (2–6 decimals). The Schedule page is not
+ * allowed to compute a fee any more, so its numbers are asserted THROUGH the API's own answer: this
+ * turns a number the mock sent into the text the page must be showing, and nothing re-derives a fee.
+ */
+const shown = (g: number) => (g / 1e8).toLocaleString('en-US', { maximumFractionDigits: 6, minimumFractionDigits: 2 });
 
 test.describe('Pgas.me web', () => {
   let api: MockApi;
@@ -69,7 +78,12 @@ test.describe('Pgas.me web', () => {
     await installMockWallet(page);
     // `Date.now()` and `new Date()` freeze; timers keep running, so the app is not stalled — the
     // Schedule page's presets are pure functions of "now", and this is the only way to assert them.
-    if (opts.fixedTime !== undefined) await page.clock.setFixedTime(opts.fixedTime);
+    // The API prices `release_at` and the headroom against the same instant, or the two clocks
+    // would disagree by however long the run takes.
+    if (opts.fixedTime !== undefined) {
+      api.nowOverrideS = Math.floor(opts.fixedTime / 1000);
+      await page.clock.setFixedTime(opts.fixedTime);
+    }
     await page.goto(path);
   }
 
@@ -184,6 +198,9 @@ test.describe('Pgas.me web', () => {
       amount: '100000000000000000',
       target_asset: 'ETH',
       sender: walletA.address,
+      // T31b item 7: every quote names a route. `auto` is what an omitted route always meant —
+      // said out loud, so the API's ONE resolver (PGAS_INGRESS_DEFAULT_ROUTE) is what decides.
+      route: 'auto',
     });
     // everything the operator asked to be taken off the page (T1d): no client-side minimum, no
     // countdown, no quote/order ids, no portfolio blurb, no stats strip — one footer line survives
@@ -432,18 +449,26 @@ test.describe('Pgas.me web', () => {
     await expect.poll(() => api.calls.some((c) => c.path === '/withdrawals/fees?asset=ETH')).toBe(true);
     const rows = page.getByTestId('schedule-row');
     await expect(rows).toHaveCount(1);
-    await expect(rows.first()).toContainText('min 0.01 ETH');
+    // there is no minimum any more (min_amount_groth is the 1-groth grid), so nothing states one
+    await expect(page.getByTestId('amount-hint-0')).toHaveText('any amount');
     await expect(page.getByTestId('schedule-submit')).toBeDisabled();
 
     // lowercase in, EIP-55 out
     await page.getByLabel('Address 1').fill(walletB.address.toLowerCase());
     await expect(page.getByTestId('address-checksummed-0')).toHaveText(walletB.address);
     await page.getByLabel('Amount 1').fill('0.1');
-    await expect(page.getByTestId('total-amount')).toContainText('0.10 ETH');
-    await expect(page.getByTestId('total-fee')).toContainText('0.002 ETH');
-    await expect(page.getByTestId('total-debited')).toContainText('0.102 ETH');
-    await expect(page.getByTestId('total-remaining')).toContainText('0.398 ETH');
-    await expect(page.getByTestId('fee-line')).toHaveText('Fee 2 % · bridge fee paid by Pgas.me · you receive exactly what you enter');
+    // all four lines come off POST /v1/withdrawals/preview: our 2 %, the crossing at cost (1× the
+    // fee of the moment for an order that goes to the bridge now), and what the two add up to
+    await expect(page.getByTestId('total-amount')).toHaveText('0.10 ETH');
+    await expect(page.getByTestId('total-fee')).toHaveText('0.002 ETH');
+    await expect(page.getByTestId('total-bridge-fee')).toHaveText('0.0002 ETH');
+    await expect(page.getByTestId('total-debited')).toHaveText('0.1022 ETH');
+    await expect(page.getByTestId('total-remaining')).toHaveText('0.3978 ETH');
+    // T45 — "at cost" is a claim about what is KEPT, and until 2026-09-10 the unspent headroom
+    // was not returned. The line says what the bridge fee actually is now.
+    await expect(page.getByTestId('fee-line')).toHaveText(
+      'Fee 2 % · bridge fee: an estimate, whatever the crossing does not use comes back to your balance · you receive exactly what you enter',
+    );
     await expect(page.getByTestId('schedule-submit')).toBeEnabled();
 
     // a mixed-case string whose checksum does not match is a typo, and says so
@@ -455,14 +480,24 @@ test.describe('Pgas.me web', () => {
     await page.getByLabel('Address 2').fill('0xnot-an-address');
     await expect(page.getByTestId('address-error-1')).toHaveText('not an EVM address');
 
-    // below the API's minimum, then over Available: both hold the button down
+    // 0.001 ETH is an order like any other now — priced, not refused. Only the batch rule is left.
     await page.getByLabel('Address 2').fill(walletA.address);
     await page.getByLabel('Amount 2').fill('0.001');
-    await expect(page.getByTestId('amount-error-1')).toHaveText('minimum 0.01 ETH');
-    await expect(page.getByTestId('schedule-submit')).toBeDisabled();
+    await expect(page.getByTestId('amount-error-1')).toHaveCount(0);
+    await expect(page.getByTestId('row-total-1')).toContainText('fee 0.00002 · bridge 0.0002 · total 0.00122 ETH');
+    await expect(page.getByTestId('schedule-submit')).toBeEnabled();
     await page.getByLabel('Amount 2').fill('0.6');
-    await expect(page.getByTestId('schedule-problems')).toContainText('short by 0.214 ETH');
-    await expect(page.getByTestId('total-remaining')).toContainText('-0.214 ETH');
+    // over Available is the BATCH's verdict, under the totals — not a complaint about a row.
+    // T35b: the number is the TOP-UP after which every wallet gets what it asked for (the fixed
+    // point), not `need − available` — crediting that one would have flipped a from-amount row to
+    // on-top and been refused again.
+    // T45 item 5: the sentence names the top-up IN ETH. `shortfall_groth` was a FIELD NAME in a
+    // line a person had to act on — the machine's copy of the number is still on `batch` and in
+    // `X-Shortfall-Groth`, which is what a client reads.
+    await expect(page.getByTestId('batch-problem')).toContainText('Top up 0.2144 ETH ');
+    await expect(page.getByTestId('batch-problem')).not.toContainText('groth');
+    await expect(page.getByTestId('row-problem-1')).toHaveCount(0);
+    await expect(page.getByTestId('total-remaining')).toHaveText('-0.2144 ETH');
     await expect(page.getByTestId('schedule-submit')).toBeDisabled();
 
     // removing the offending row is all it takes
@@ -474,9 +509,14 @@ test.describe('Pgas.me web', () => {
     await page.getByLabel('Address 2').fill(walletA.address);
     await page.getByLabel('Amount 2').fill('0.05');
     await page.getByLabel('Deliver 2').selectOption('2h');
+    // an order that waits before it is released funds more than today's crossing (the headroom
+    // curve), so the second row's bridge fee is the larger one — and the debit is the API's sum
+    await expect(page.getByTestId('schedule-submit')).toBeEnabled();
+    const availableBefore = api.balances.ETH.available;
     await page.getByTestId('schedule-submit').click();
     await expect(page.getByTestId('schedule-result')).toContainText('Scheduled 2 orders');
-    await expect(page.getByTestId('schedule-result')).toContainText('Debited 0.153 ETH (fee 0.003)');
+    const debited = availableBefore - api.balances.ETH.available;
+    await expect(page.getByTestId('result-debited')).toContainText(`Debited ${shown(debited)} ETH (fee 0.003 · bridge fee 0.0004`);
 
     const call = api.calls.find((c) => c.path === '/withdrawals' && c.method === 'POST');
     const body = call!.body as { asset: string; mode: string; items: { W: string; amount_groth: number; deliver_at: number }[] };
@@ -496,7 +536,7 @@ test.describe('Pgas.me web', () => {
     // the form is empty again and the balance moved
     await expect(rows).toHaveCount(1);
     await expect(page.getByLabel('Address 1')).toHaveValue('');
-    await expect(page.getByTestId('total-available')).toContainText('0.347 ETH');
+    await expect(page.getByTestId('total-available')).toHaveText(`${shown(api.balances.ETH.available)} ETH`);
     expect(pageErrors).toEqual([]);
   });
 
@@ -560,9 +600,167 @@ test.describe('Pgas.me web', () => {
     // the balance moves between render and click — the client's own arithmetic says yes, the API says no
     api.balances.ETH.available = 10000000;
     await page.getByTestId('schedule-submit').click();
-    await expect(page.getByTestId('schedule-error')).toHaveText(
-      'short by 0.308 ETH — this batch debits 0.408 ETH (amounts + 2%) and Available is 0.1 ETH',
+    // the API's own sentence, verbatim (T35b: it is the mock's default now, so this IS production's)
+    await expect(page.getByTestId('schedule-error')).toHaveText(SAY.batchShort('ETH', 40820000, 10000000, 30820000));
+    expect(pageErrors).toEqual([]);
+  });
+
+  test('schedule: any amount goes — 0.0001 ETH is priced, and what was quoted is what is charged', async ({ page }) => {
+    await boot(page, '/schedule');
+    await connectAndSignIn(page);
+    await expect.poll(() => api.calls.some((c) => c.path === '/withdrawals/fees?asset=ETH')).toBe(true);
+    // `min_amount_groth` is the asset's grid (1 groth): that is not a floor, and the form says so
+    // by not stating one at all (the row hint used to read "min 0.01 ETH").
+    await expect(page.getByTestId('amount-hint-0')).toHaveText('any amount');
+    await expect(page.locator('body')).not.toContainText('minimum');
+
+    await page.getByLabel('Address 1').fill(walletB.address);
+    await page.getByLabel('Amount 1').fill('0.0001');
+    // 10 000 groth: our 2 % is 200 groth, and the crossing costs what it costs — twice the order,
+    // itemised, which is exactly the trade the admin asked for ("bridge takes not huge fees")
+    await expect(page.getByTestId('row-total-0')).toContainText('fee 0.000002 · bridge 0.0002 · total 0.000302 ETH');
+    await expect(page.getByTestId('total-amount')).toHaveText('0.0001 ETH');
+    await expect(page.getByTestId('total-fee')).toHaveText('0.000002 ETH');
+    await expect(page.getByTestId('total-bridge-fee')).toHaveText('0.0002 ETH');
+    await expect(page.getByTestId('total-debited')).toHaveText('0.000302 ETH');
+    await expect(page.getByTestId('bridge-fee-note')).toContainText('whatever the crossing does not use comes back');
+    await expect(page.getByTestId('schedule-submit')).toBeEnabled();
+
+    // the quote on screen, then the charge: one function priced both, so they are the same numbers
+    const quote = api.previewResponses.at(-1)!;
+    // `delivered_groth` is on EVERY batch, as the real API sends it (T35b): here it is the amount,
+    // because the balance paid the fees on top
+    expect(quote.totals).toEqual({
+      amount_groth: 10000,
+      delivered_groth: 10000,
+      fee_groth: 200,
+      bridge_fee_groth: 20000,
+      total_debited_groth: 30200,
+    });
+    await page.getByTestId('schedule-submit').click();
+    await expect(page.getByTestId('schedule-result')).toContainText('Scheduled 1 order');
+    await expect(page.getByTestId('result-debited')).toHaveText(
+      `Debited ${shown(quote.totals.total_debited_groth)} ETH (fee ${shown(quote.totals.fee_groth)} · bridge fee ${shown(
+        quote.totals.bridge_fee_groth,
+      )}).`,
     );
+    // and the order that was written carries the same split — amount, our fee, the bridge's
+    const orders = page.getByTestId('schedule-orders');
+    await expect(orders.locator('tr.row-new')).toHaveCount(1, { timeout: 15_000 });
+    await expect(orders.locator('tr.row-new')).toContainText(`${shown(quote.items[0].amount_groth)} ETH`);
+    await expect(page.getByTestId('order-bridge-req-new-1')).toHaveText(`+ ${shown(quote.items[0].bridge_fee_groth)} bridge`);
+    // Available fell by amount + fee + bridge fee, and by nothing else
+    await expect(page.getByTestId('total-available')).toHaveText(`${shown(50000000 - quote.totals.total_debited_groth)} ETH`);
+    expect(pageErrors).toEqual([]);
+  });
+
+  test("schedule: over Available is the API's verdict on the BATCH, and it holds the button down", async ({ page }) => {
+    await boot(page, '/schedule');
+    await connectAndSignIn(page);
+    await page.getByLabel('Address 1').fill(walletB.address);
+    await page.getByLabel('Amount 1').fill('0.6'); // Available is 0.5
+    /**
+     * F4 (2026-09-10): Σ total ≤ Available is one decision about the LIST. The real API has never
+     * marked an item for it — items stay `ok:true` and only `batch` says no — so it is rendered
+     * under the totals, in the API's words, and the row is left alone.
+     */
+    await expect(page.getByTestId('batch-problem')).toHaveText(SAY.batchShort('ETH', 61220000, 50000000, 11220000));
+    await expect(page.getByTestId('row-problem-0')).toHaveCount(0);
+    // ⛔ T35b: the API DOES mark the row that ran out of money (`price_item`, `problem_code:
+    // "batch"`) — it just refuses on it as a BATCH, and this page shows the sentence once, under
+    // the totals. The mock now sends what the API sends, and `row-problem-0` above is the proof
+    // that the page reads the code rather than rendering every problem it is handed.
+    const only = api.previewResponses.at(-1)!.items;
+    expect(only.map((i) => [i.ok, i.problem_code])).toEqual([[false, 'batch']]);
+    // and it BLOCKS: a verdict that only paints a number red is not a guard (the button used to
+    // stay live, and the user's evidence was a 409 banner after the fact)
+    await expect(page.getByTestId('schedule-submit')).toBeDisabled();
+    // the card still shows what the list would cost, with Remaining in the red
+    await expect(page.getByTestId('total-debited')).toHaveText('0.6122 ETH');
+    await expect(page.getByTestId('total-remaining')).toHaveText('-0.1122 ETH');
+    await expect(page.getByTestId('total-remaining')).toHaveClass(/error-text/);
+
+    // a smaller order prices clean and the button opens again — same rows, a new quote
+    await page.getByLabel('Amount 1').fill('0.4');
+    await expect(page.getByTestId('batch-problem')).toHaveCount(0);
+    await expect(page.getByTestId('total-debited')).toHaveText('0.4082 ETH');
+    await expect(page.getByTestId('schedule-submit')).toBeEnabled();
+    expect(api.calls.some((c) => c.path === '/withdrawals' && c.method === 'POST')).toBe(false);
+    expect(pageErrors).toEqual([]);
+  });
+
+  test('schedule: a 422 names the item it refused, on that item — and never dumps the list of addresses', async ({ page }) => {
+    await boot(page, '/schedule');
+    await connectAndSignIn(page);
+    const addrs = [walletB.address, ADDR3, ADDR4];
+    for (const [n, a] of addrs.entries()) {
+      if (n > 0) await page.getByTestId('schedule-add').click();
+      await page.getByLabel(`Address ${n + 1}`).fill(a);
+      await page.getByLabel(`Amount ${n + 1}`).fill(n === 1 ? '0.001' : '0.05');
+    }
+    await expect(page.getByTestId('schedule-submit')).toBeEnabled();
+    await expect(page.getByTestId('amount-hint-1')).toHaveText('any amount');
+
+    /**
+     * F5 (2026-09-10): the deployment's floor moves between the quote and the click — the API
+     * prices the batch again and refuses 422 with `detail:{message, items, min_amount_groth}`.
+     * That dict used to reach the screen as `JSON.stringify(detail)`: a raw blob listing every
+     * destination address in the batch, which is the one thing this product must not show.
+     */
+    api.minAmountGroth = 5_000_000; // 0.05 ETH
+    await page.getByTestId('schedule-submit').click();
+
+    const banner = page.getByTestId('schedule-error');
+    // T45 item 5 — the minimum is stated in ETH. It used to read "at least 5000000 groth (0.05
+    // ETH)", which is an internal unit first and the real one in brackets.
+    await expect(banner).toHaveText(
+      '1 of 3 item(s) cannot be scheduled (item 2: each payout must be at least 0.05 ETH) — ' +
+        'nothing was scheduled and nothing was debited',
+    );
+    // the refusal is ON the item it is about, where it can be acted on
+    await expect(page.getByTestId('row-problem-1')).toHaveText('each payout must be at least 0.05 ETH');
+    await expect(page.getByTestId('row-problem-0')).toHaveCount(0);
+    await expect(page.getByTestId('row-problem-2')).toHaveCount(0);
+    // …and the floor the API just stated is what the rows say, instead of "any amount"
+    await expect(page.getByTestId('amount-hint-1')).toHaveText('min 0.05 ETH');
+
+    // NOT ONE destination address is in the banner, and neither is the JSON that carried them
+    const text = (await banner.textContent()) ?? '';
+    for (const a of addrs) expect(text).not.toContain(a);
+    expect(text).not.toContain('"W"');
+    expect(text).not.toContain('bridge_fee_groth');
+    // nothing was scheduled: the rows are still there, and the balance did not move
+    await expect(page.getByTestId('schedule-row')).toHaveCount(3);
+    await expect(page.getByTestId('schedule-result')).toHaveCount(0);
+    expect(api.balances.ETH.available).toBe(50000000);
+
+    // fixing the row it named clears the refusal, and the button comes back
+    await page.getByLabel('Amount 2').fill('0.06');
+    await expect(page.getByTestId('row-problem-1')).toHaveCount(0);
+    await expect(page.getByTestId('schedule-submit')).toBeEnabled();
+    expect(pageErrors).toEqual([]);
+  });
+
+  test('schedule: a fee the API cannot read refuses in its own words, and nothing is scheduled on a guess', async ({ page }) => {
+    await boot(page, '/schedule');
+    await connectAndSignIn(page);
+    // law: a fee that cannot be read refuses — it is never guessed, and never the last one reused
+    api.previewFail = { status: 503, detail: 'the bridge fee could not be read right now — nothing was scheduled' };
+    await page.getByLabel('Address 1').fill(walletB.address);
+    await page.getByLabel('Amount 1').fill('0.1');
+    await expect(page.getByTestId('schedule-problems')).toContainText('the bridge fee could not be read right now');
+    await expect(page.getByTestId('schedule-submit')).toBeDisabled();
+    // no price is shown at all: not the row's, not the card's
+    await expect(page.getByTestId('row-total-0')).toHaveCount(0);
+    await expect(page.getByTestId('total-debited')).toHaveText('0.00 ETH');
+    expect(api.calls.some((c) => c.path === '/withdrawals' && c.method === 'POST')).toBe(false);
+
+    // when it can be read again, the same list prices and the button opens
+    api.previewFail = null;
+    await page.getByLabel('Amount 1').fill('0.11');
+    await expect(page.getByTestId('schedule-problems')).toHaveCount(0);
+    await expect(page.getByTestId('total-debited')).toHaveText('0.1124 ETH');
+    await expect(page.getByTestId('schedule-submit')).toBeEnabled();
     expect(pageErrors).toEqual([]);
   });
 
@@ -593,7 +791,7 @@ test.describe('Pgas.me web', () => {
     await expect(tiles).toContainText('Scheduled');
     await expect(tiles).toContainText('Paid out');
     await expect(tiles).toContainText('deposits still bridging');
-    await expect(tiles).toContainText('incl. 2 % fee');
+    await expect(tiles).toContainText('incl. 2 % fee + bridge fee');
     // the bucket names and the formula subtitles are gone (T14)
     await expect(tiles).not.toContainText('Pending bridge');
     await expect(tiles).not.toContainText('credits − scheduled − sent');
@@ -630,9 +828,13 @@ test.describe('Pgas.me web', () => {
     await credited.click();
     await expect(page.getByTestId('timeline-detail')).toHaveCount(0);
 
-    // the footer is one sentence on every page — no stats strip, no armed chips
+    // the footer is one sentence on every page — no stats strip, no armed chips — plus, since T44,
+    // the "How it works" link, which is the ONLY route to that page on a phone (the header's nav is
+    // hidden there). So: the sentence, and the link, and nothing else.
     await expect(page.getByTestId('stats-strip')).toHaveCount(0);
-    await expect(page.locator('.footer')).toHaveText('Settled on Beam — a confidential ledger: no addresses on-chain, blinded amounts.');
+    await expect(page.locator('.footer')).toContainText('Settled on Beam — a confidential ledger: no addresses on-chain, blinded amounts.');
+    await expect(page.getByTestId('footer-how')).toHaveText('How it works');
+    await expect(page.locator('.footer').getByRole('link')).toHaveCount(1);
 
     // a 401 on a locked route ends the session and asks for a fresh sign-in — by hand this time,
     // because auto sign-in asks once per address and this address already answered
@@ -742,6 +944,80 @@ test.describe('Pgas.me web', () => {
       // and the API's release_at came back 66 min ahead of each of them (never before now)
       const rows = page.getByTestId('schedule-orders').locator('tr.row-new');
       await expect(rows).toHaveCount(5, { timeout: 15_000 });
+      expect(pageErrors).toEqual([]);
+    });
+
+    test("schedule: the totals are the API's own four numbers, and only the newest quote is on screen", async ({ page }) => {
+      const FIXED = Date.UTC(2026, 8, 9, 10, 15, 0);
+      const nowS = FIXED / 1000;
+      await boot(page, '/schedule', { fixedTime: FIXED });
+      await connectAndSignIn(page);
+      const previews = () => api.calls.filter((c) => c.path === '/withdrawals/preview');
+
+      await page.getByLabel('Address 1').fill(walletB.address);
+      await page.getByLabel('Amount 1').fill('0.1');
+      await page.getByLabel('Deliver 1').selectOption('2h');
+      // the request body is the contract's, and only it: no fee, no total, no minimum travels up
+      await expect
+        .poll(() => previews().at(-1)?.body)
+        .toEqual({ asset: 'ETH', items: [{ W: walletB.address, amount_groth: 10000000, deliver_at: nowS + 7200 }] });
+      expect(previews().at(-1)!.method).toBe('POST');
+      expect(previews().at(-1)!.auth).toBe(`Bearer ${api.token}`);
+      // and a preview writes nothing: no order was created by asking what the list costs
+      expect(api.requests.filter((r) => String(r._id).startsWith('req-new')).length).toBe(0);
+
+      // An order released ~54 min from now funds more than a crossing costs at this moment:
+      // 20 000 × (1 + 2 × 3240/2 592 000) = 20 050 groth. The page prints it; it derives nothing.
+      const quote = api.previewResponses.at(-1)!;
+      expect(quote.totals).toEqual({
+        amount_groth: 10000000,
+        delivered_groth: 10000000, // on every batch since T35b; the fees rode on top here
+        fee_groth: 200000,
+        bridge_fee_groth: 20050,
+        total_debited_groth: 10220050,
+      });
+      expect(quote.min_amount_groth).toBe(1);
+      await expect(page.getByTestId('total-amount')).toHaveText(`${shown(quote.totals.amount_groth)} ETH`);
+      await expect(page.getByTestId('total-fee')).toHaveText(`${shown(quote.totals.fee_groth)} ETH`);
+      await expect(page.getByTestId('total-bridge-fee')).toHaveText(`${shown(quote.totals.bridge_fee_groth)} ETH`);
+      await expect(page.getByTestId('total-debited')).toHaveText(`${shown(quote.totals.total_debited_groth)} ETH`);
+      await expect(page.getByTestId('row-total-0')).toContainText(
+        `fee ${shown(quote.items[0].fee_groth)} · bridge ${shown(quote.items[0].bridge_fee_groth)} · total ${shown(
+          quote.items[0].total_groth,
+        )} ETH`,
+      );
+      // the four lines are named for what they are, the bridge one with the headroom in the words
+      const card = page.getByTestId('schedule-totals');
+      await expect(card).toContainText('Amounts');
+      await expect(card).toContainText('Fee (2%)');
+      await expect(card).toContainText('Bridge fee');
+      await expect(card).toContainText('Total debited');
+      // T45 — the headroom curve is not in the sentence any more: with the 4× subsidy it is flat
+      // at the floor, and the part the crossing does not spend is refunded at settlement, so the
+      // number the user has to reason about is not a multiplier — it is "you get the rest back".
+      await expect(page.getByTestId('bridge-fee-note')).toHaveText(
+        'Bridge fee: an estimate — whatever the crossing does not use comes back to your balance.',
+      );
+
+      // Two edits with the FIRST quote deliberately slow: the answer that lands last is the older
+      // one, and it must never reach the screen — every request takes a number, and only the
+      // current number is rendered (a slow quote for a list nobody is looking at is not money).
+      const n0 = previews().length;
+      api.previewDelaysMs[n0] = 1500;
+      await page.getByLabel('Amount 1').fill('0.2');
+      await expect.poll(() => previews().length).toBe(n0 + 1);
+      // while that quote is in flight the total is not 0.00 — it is not known yet, and says so
+      await expect(page.getByTestId('total-debited')).toHaveText('—');
+      await expect(page.getByTestId('preview-status')).toHaveText('Pricing this list…');
+      await page.getByLabel('Amount 1').fill('0.3');
+      await expect(page.getByTestId('total-amount')).toHaveText('0.30 ETH');
+      // now the slow 0.2 answer arrives, after the fast 0.3 one
+      await expect.poll(() => api.previewResponses.at(-1)!.totals.amount_groth, { timeout: 10_000 }).toBe(20000000);
+      const newest = api.previewResponses.at(-2)!;
+      expect(newest.totals.amount_groth).toBe(30000000);
+      await expect(page.getByTestId('total-amount')).toHaveText('0.30 ETH');
+      await expect(page.getByTestId('total-debited')).toHaveText(`${shown(newest.totals.total_debited_groth)} ETH`);
+      await expect(page.getByTestId('schedule-submit')).toBeEnabled();
       expect(pageErrors).toEqual([]);
     });
   });
@@ -967,7 +1243,7 @@ test.describe('Pgas.me web', () => {
     await payWith(page, { token: 'dai' });
     await page.getByLabel('Amount (DAI)').fill('100');
     await expect(page.getByTestId('direct-note')).toContainText('your DAI goes straight into the Beam bridge');
-    expect((api.calls.filter((c) => c.path === '/quote').pop()?.body as { route?: string }).route).toBeUndefined();
+    expect((api.calls.filter((c) => c.path === '/quote').pop()?.body as { route?: string }).route).toBe('auto');
     await expect(page.getByTestId('uniswap-note')).toHaveCount(0);
     await expect(page.getByTestId('deposit-form')).toContainText('What to deposit');
     expect(pageErrors).toEqual([]);
@@ -988,7 +1264,7 @@ test.describe('Pgas.me web', () => {
     await expect(page.getByTestId('uniswap-note')).toHaveCount(0);
     await expect(page.getByTestId('deposit-form')).toContainText('What to deposit');
     // the button above only exists because the quote came back, so the last call is that quote
-    expect((api.calls.filter((c) => c.path === '/quote').pop()?.body as { route?: string }).route).toBeUndefined();
+    expect((api.calls.filter((c) => c.path === '/quote').pop()?.body as { route?: string }).route).toBe('auto');
     expect(pageErrors).toEqual([]);
   });
 
@@ -1029,13 +1305,16 @@ test.describe('Pgas.me web', () => {
     await expect(page.getByTestId('uniswap-primary')).toHaveCount(0);
     await page.getByLabel('Amount (ETH)').fill('0.3');
     await expect(page.getByTestId('direct-note')).toContainText('straight into the Beam bridge');
-    // no `route` key at all: an API build that has never heard of the field sees the old body
+    // `route: "auto"` and nothing else — the client never NAMES the closed route (T31b item 7).
+    // An API build that has never heard of the field ignores an unknown body key, which is why
+    // saying "auto" out loud is safe where naming "uniswap" would have been a 409.
     expect(api.calls.filter((c) => c.path === '/quote').pop()?.body).toEqual({
       src_chain_id: 1,
       src_token: NATIVE,
       amount: '300000000000000000',
       target_asset: 'ETH',
       sender: walletA.address,
+      route: 'auto',
     });
     await expect(page.getByTestId('min-out')).toHaveCount(0);
     await expect(page.getByTestId('price-impact')).toHaveCount(0);
@@ -1078,6 +1357,7 @@ test.describe('Pgas.me web', () => {
       amount: '300000000000000000',
       target_asset: 'ETH',
       sender: walletA.address,
+      route: 'auto',
     });
     await expect(page.getByTestId('min-out')).toHaveCount(0);
     await expect(page.getByTestId('price-impact')).toHaveCount(0);
@@ -1253,11 +1533,21 @@ test.describe('Pgas.me web', () => {
       await page.evaluate(() => window.scrollTo(0, 0));
       await expect(totals).not.toBeInViewport();
       await expect(sticky).toBeVisible();
-      await expect(sticky).toContainText('Remaining');
+      // the ONE number that decides the button, and only it — the breakdown stays in the card
+      await expect(sticky).toContainText('Total debited');
+      await expect(sticky).not.toContainText('Bridge fee');
+      await expect(sticky).not.toContainText('Amounts');
       const box = (await sticky.boundingBox())!;
       const barBox = (await bar.boundingBox())!;
       expect(box.y + box.height).toBeLessThanOrEqual(844);
-      expect(box.y + box.height).toBeLessThanOrEqual(barBox.y + 1); // clear of the tab bar
+      /**
+       * FLUSH, not merely clear: the strip's bottom edge IS the tab bar's top edge, so the two
+       * fixed things read as one band. `bottom` used to be a constant 64px against a tab bar that
+       * measures 50.5 here, and the 13.5px of daylight that left is what schedule-mobile.png
+       * showed the form scrolling through — a delivery select cut in half between the two bars.
+       * The number is not written down anywhere now: the tab bar publishes its own height.
+       */
+      expect(Math.abs(box.y + box.height - barBox.y)).toBeLessThanOrEqual(1);
       const cardBox = (await totals.boundingBox())!;
       expect(cardBox.y).toBeGreaterThan(box.y + box.height); // and clear of the card it repeats
 
@@ -1270,6 +1560,71 @@ test.describe('Pgas.me web', () => {
       const lastCard = (await page.locator('.page > section.card').last().boundingBox())!;
       const barNow = (await bar.boundingBox())!;
       expect(lastCard.y + lastCard.height).toBeLessThanOrEqual(barNow.y);
+      expect(pageErrors).toEqual([]);
+    });
+
+    test('mobile: the totals bar is never ON a row — every row can be brought clear of it', async ({ page }) => {
+      await boot(page, '/schedule');
+      await connectAndSignIn(page);
+      await page.getByTestId('schedule-form').waitFor();
+      const rows = [walletB.address, ADDR3, ADDR4, ADDR5, walletA.address];
+      for (const [n, a] of rows.entries()) {
+        if (n > 0) await page.getByTestId('schedule-add').click();
+        await page.getByLabel(`Address ${n + 1}`).fill(a);
+        await page.getByLabel(`Amount ${n + 1}`).fill('0.01');
+      }
+      await expect(page.getByTestId('row-total-4')).toBeVisible();
+
+      /**
+       * F7 (screen review 2026-09-10): schedule-mobile.png showed the sticky Total bar drawn ON
+       * the second row mid-scroll — over its amount field, which the user was about to type in.
+       * The bar is hidden while the Totals card is on screen (the test above), but that says
+       * nothing about the rows ABOVE that card, which is where the whole form is. So: however a
+       * row is brought into view — tapped, focused, scrolled to — it must end up clear of the bar.
+       */
+      /** How many pixels of `selector` the bar is drawn over right now (0 when it is not drawn). */
+      const under = (selector: string) =>
+        page.evaluate((sel) => {
+          const bar = document.querySelector('[data-testid="sticky-totals"]') as HTMLElement | null;
+          if (!bar || getComputedStyle(bar).display === 'none') return 0;
+          const b = bar.getBoundingClientRect();
+          const el = document.querySelector(sel);
+          if (!el) return -1; // a selector that matches nothing must not read as "clear"
+          const r = el.getBoundingClientRect();
+          return Math.max(0, Math.round(Math.min(b.bottom, r.bottom) - Math.max(b.top, r.top)));
+        }, selector);
+      const toTop = () => page.evaluate(() => window.scrollTo(0, 0));
+
+      for (let n = 0; n < rows.length; n++) {
+        // a tap on a field brings THAT field into view, and it lands above the bar, not behind it
+        await toTop();
+        await page.getByLabel(`Amount ${n + 1}`).click();
+        expect(await under(`[aria-label="Amount ${n + 1}"]`), `the amount field of row ${n + 1} is under the bar`).toBe(0);
+        // and the whole row can be scrolled clear of it — including the last one, which is what
+        // the room at the end of the form is for
+        await toTop();
+        await page.getByTestId('schedule-row').nth(n).scrollIntoViewIfNeeded();
+        expect(await under(`[data-testid="schedule-row"][data-row="${n}"]`), `row ${n + 1} is under the bar`).toBe(0);
+      }
+
+      // and at the very bottom of the page it covers nothing at all — not a card, not the footer
+      // (which is the last thing on the page, and so the one that has to reserve the room)
+      await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+      const covered = await page.evaluate(() => {
+        const bar = document.querySelector('[data-testid="sticky-totals"]') as HTMLElement;
+        if (getComputedStyle(bar).display === 'none') return [];
+        const b = bar.getBoundingClientRect();
+        return [...document.querySelectorAll('section.card, .footer-note')]
+          .map((c) => {
+            const q = c.getBoundingClientRect();
+            return { id: c.getAttribute('data-testid') ?? c.className, over: Math.min(b.bottom, q.bottom) - Math.max(b.top, q.top) };
+          })
+          .filter((x) => x.over > 0)
+          .map((x) => x.id);
+      });
+      expect(covered).toEqual([]);
+      // it repeats a number and is aria-hidden: it must not swallow a tap meant for what is under it
+      await expect(page.getByTestId('sticky-totals')).toHaveCSS('pointer-events', 'none');
       expect(pageErrors).toEqual([]);
     });
   });

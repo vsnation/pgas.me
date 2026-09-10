@@ -108,6 +108,10 @@ def beam_pay(monkeypatch: pytest.MonkeyPatch) -> LedgerBeamPay:
     beampay.set_beampay(bp)
     monkeypatch.setattr(settings, "beam_treasury_address", TREASURY)
     monkeypatch.setattr(settings, "beam_mp_address", MP)
+    # the working-float policy (PGAS_SHIELD_KEEP_GROTH) has its own file
+    # (test_beam_payout_spendable); this one tests the shield MECHANICS, so the
+    # policy is pinned out of the way rather than silently deciding these cases
+    monkeypatch.setattr(settings, "shield_keep_groth", 0)
     monkeypatch.setattr(settings, "hold_backoff_s", 0.0)
     yield bp
     beampay.set_beampay(None)
@@ -672,7 +676,7 @@ async def test_code_deployed_after_scheduling_holds_the_order_and_alerts_once(
     await payouts.process_once()
     row = await payout(mock_db)
     assert row["status"] == "scheduled" and "beam_txid" not in row
-    assert row["hold_reason"] == payouts.DEST_NOW_CONTRACT
+    assert row["hold_detail"] == payouts.DEST_NOW_CONTRACT
     assert "process_invoke_data" not in beam_wallet.methods()
     events = await mock_db["pgasme_test"].events.find({}).to_list(10)
     assert [e["kind"] for e in events] == ["payout_dest_now_contract"]

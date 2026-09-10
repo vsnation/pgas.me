@@ -1,0 +1,973 @@
+/* The operator console's visual system (T49).
+ *
+ * Everything here is scoped under `.ops` — the panel's root element — so not one rule can reach
+ * the public app, and none of the public app's `.card` / `.tile` / `.seg` rules decide anything
+ * here either. The panel names its own classes.
+ *
+ * It borrows the SITE's tokens (`--bg --surface --surface-2 --ink --muted --line`, the three font
+ * families) and adds exactly one thing of its own: a four-tone STATE ramp. State on this page is
+ * never the brand accent — indigo is a link and teal is the mark; a page where "teal" means both
+ * "our brand" and "this payout arrived" cannot be scanned.
+ *
+ * Both grounds are stated in full, three times, the same way styles.css does it: bare `:root` is
+ * light, `prefers-color-scheme: dark` guarded by `:not([data-theme='light'])` covers the system
+ * default, and `[data-theme='dark']` covers the explicit switch. No colour has its only
+ * definition inside a media query.
+ */
+
+:root {
+  /* state — good / warning / critical / neutral. Contrast measured against --surface. */
+  --ops-good: #0b6b45;
+  --ops-good-soft: rgba(11, 107, 69, 0.1);
+  --ops-warn: #8a5a06;
+  --ops-warn-soft: rgba(138, 90, 6, 0.12);
+  --ops-crit: #a32226;
+  --ops-crit-soft: rgba(163, 34, 38, 0.1);
+  --ops-neutral: #5c6577;
+  --ops-neutral-soft: rgba(92, 101, 119, 0.09);
+  /* the page's own ground: a shade off the site's so the sticky bar reads as chrome */
+  --ops-bar: rgba(244, 246, 250, 0.92);
+  --ops-rule: var(--line);
+  --ops-rule-strong: #c2c9d6;
+  --ops-max: 1320px;
+  /* ⛔ EVERY NAME IN THIS BLOCK IS `--ops-`-PREFIXED, AND EVERY SELECTOR BELOW IT IS SCOPED UNDER
+     `.ops`. This stylesheet is imported by a page of the same bundle as the public app, so a bare
+     `--s2` or a bare `.dot` here is a rule about somebody else's page: `App.tsx` already draws a
+     `.dot` inside `.chip`, and the explainer's step numerals already carry `.n`. */
+  --ops-s0: 4px;
+  --ops-s1: 8px;
+  --ops-s2: 16px;
+  --ops-s3: 24px;
+  --ops-s4: 32px;
+  --ops-s5: 48px;
+  --ops-t1: 11.5px; /* eyebrows and column heads — the ONLY uppercase on this page */
+  --ops-t2: 13px; /* secondary prose: reasons, ages, hints */
+  --ops-t3: 14.5px; /* the body size */
+  --ops-t4: 19px; /* section headings and lead figures */
+  --ops-t5: 21px; /* the page title (display) */
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --ops-good: #5ad39c;
+    --ops-good-soft: rgba(90, 211, 156, 0.13);
+    --ops-warn: #e6ae5a;
+    --ops-warn-soft: rgba(230, 174, 90, 0.14);
+    --ops-crit: #f4787c;
+    --ops-crit-soft: rgba(244, 120, 124, 0.13);
+    --ops-neutral: #9aa5b8;
+    --ops-neutral-soft: rgba(154, 165, 184, 0.1);
+    --ops-bar: rgba(15, 19, 25, 0.92);
+    --ops-rule-strong: #3a4557;
+  }
+}
+:root[data-theme='dark'] {
+  --ops-good: #5ad39c;
+  --ops-good-soft: rgba(90, 211, 156, 0.13);
+  --ops-warn: #e6ae5a;
+  --ops-warn-soft: rgba(230, 174, 90, 0.14);
+  --ops-crit: #f4787c;
+  --ops-crit-soft: rgba(244, 120, 124, 0.13);
+  --ops-neutral: #9aa5b8;
+  --ops-neutral-soft: rgba(154, 165, 184, 0.1);
+  --ops-bar: rgba(15, 19, 25, 0.92);
+  --ops-rule-strong: #3a4557;
+}
+
+/* ───────────────────────────────────────────────────────────────────────── shell */
+
+.ops {
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: var(--ops-t3);
+  line-height: 1.5;
+}
+.ops-wrap {
+  width: 100%;
+  max-width: var(--ops-max);
+  margin: 0 auto;
+  padding: 0 var(--ops-s3);
+}
+/* ⛔ PADDING-TOP/BOTTOM, NEVER THE SHORTHAND. `main` carries `.ops-wrap` too, and a `padding:`
+   shorthand here resets that element's horizontal gutter to 0 — which is exactly what it did:
+   every table ran to the bare edge of the window and the last column fell off it. */
+.ops-body {
+  padding-top: var(--ops-s4);
+  padding-bottom: var(--ops-s5);
+}
+
+/* the sticky bar: two rows, one hairline, no shadow */
+.ops-bar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--ops-bar);
+  backdrop-filter: saturate(1.4) blur(10px);
+  border-bottom: 1px solid var(--ops-rule);
+}
+.ops-bar-top {
+  display: flex;
+  align-items: center;
+  gap: var(--ops-s3);
+  height: 52px;
+}
+.ops-mark {
+  display: flex;
+  align-items: center;
+  gap: var(--ops-s1);
+  flex: 0 0 auto;
+}
+.ops-mark img {
+  width: 24px;
+  height: 24px;
+  display: block;
+}
+.ops-title {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--ops-t5);
+  letter-spacing: -0.015em;
+  line-height: 1;
+}
+.ops-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: var(--ops-s3);
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+  height: 100%;
+}
+.ops-tabs::-webkit-scrollbar {
+  display: none;
+}
+.ops-tabs button {
+  appearance: none;
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 0 0 2px;
+  margin: 0;
+  cursor: pointer;
+  white-space: nowrap;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: -0.005em;
+  color: var(--muted);
+}
+.ops-tabs button:hover {
+  color: var(--ink);
+}
+.ops-tabs button.on {
+  color: var(--ink);
+  border-bottom-color: var(--ink);
+}
+.ops-tools {
+  display: flex;
+  align-items: center;
+  gap: var(--ops-s1);
+  flex: 0 0 auto;
+}
+
+/* the status strip */
+.ops-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ops-s0) var(--ops-s2);
+  padding: 0 0 var(--ops-s1);
+  min-height: 26px;
+}
+.ops-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: var(--ops-t2);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.ops-stat b {
+  font-weight: 600;
+  color: var(--ink);
+}
+.ops-stat .dot {
+  align-self: center;
+}
+/* the phone spellings, swapped in by the media query at the bottom of this file */
+.ops-strip .short {
+  display: none;
+}
+.ops-stat.is-crit b {
+  color: var(--ops-crit);
+}
+.ops-stat.is-warn b {
+  color: var(--ops-warn);
+}
+
+.ops .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ops-neutral);
+  display: inline-block;
+  flex: 0 0 auto;
+}
+.ops .dot.is-good {
+  background: var(--ops-good);
+}
+.ops .dot.is-warn {
+  background: var(--ops-warn);
+}
+.ops .dot.is-crit {
+  background: var(--ops-crit);
+}
+
+/* ───────────────────────────────────────────────────────────────────── typography */
+
+.ops h1,
+.ops h2,
+.ops h3 {
+  margin: 0;
+  font-family: var(--font-body);
+}
+.ops-eyebrow {
+  font-size: var(--ops-t1);
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.ops-lead {
+  font-size: var(--ops-t4);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.ops-sub {
+  font-size: var(--ops-t2);
+  color: var(--muted);
+}
+.ops .n {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.94em;
+}
+.ops-id {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.9em;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  color: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+  border-bottom: 1px dotted var(--line);
+}
+.ops-id:hover {
+  border-bottom-color: var(--muted);
+}
+.ops-id.copied {
+  color: var(--ops-good);
+  border-bottom-color: var(--ops-good);
+}
+.ops a {
+  color: var(--indigo);
+  text-decoration: none;
+}
+.ops a:hover {
+  text-decoration: underline;
+}
+.ops :focus-visible {
+  outline: 2px solid var(--indigo);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* ─────────────────────────────────────────────────────────────────────── sections */
+
+.ops-section {
+  margin-top: var(--ops-s5);
+}
+.ops-section:first-child {
+  margin-top: 0;
+}
+.ops-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--ops-s2);
+  padding-bottom: var(--ops-s1);
+  border-bottom: 1px solid var(--ops-rule-strong);
+  margin-bottom: var(--ops-s2);
+}
+.ops-section-note {
+  font-size: var(--ops-t2);
+  color: var(--muted);
+  text-align: right;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.ops-empty {
+  display: flex;
+  align-items: center;
+  gap: var(--ops-s1);
+  padding: var(--ops-s2) 0;
+  color: var(--muted);
+  font-size: var(--ops-t3);
+}
+
+/* ───────────────────────────────────────────────────────────────── attention items */
+
+/* A QUEUE, NOT A STACK OF CARDS. Eleven identical rounded boxes with a coloured rail down the
+   left is the shape this redesign exists to get rid of; a line per item, separated by the same
+   hairline every table uses, is read top-to-bottom in one pass. Severity is the dot and, for the
+   criticals only, the colour of the heading. */
+.ops-needs {
+  display: flex;
+  flex-direction: column;
+}
+.ops-need {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: var(--ops-s0) var(--ops-s2);
+  padding: 9px 0;
+  border-bottom: 1px solid var(--ops-rule);
+}
+.ops-need:last-child {
+  border-bottom: 0;
+}
+.ops-need-what {
+  font-weight: 600;
+}
+.ops-need.is-crit .ops-need-what {
+  color: var(--ops-crit);
+}
+.ops-need-why {
+  font-size: var(--ops-t2);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.ops-need-when {
+  display: flex;
+  align-items: baseline;
+  gap: var(--ops-s2);
+  font-size: var(--ops-t2);
+  color: var(--muted);
+  white-space: nowrap;
+  text-align: right;
+}
+.ops-need-go {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-size: var(--ops-t2);
+  color: var(--indigo);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ops-need-go:hover {
+  text-decoration: underline;
+}
+
+/* ───────────────────────────────────────────────────────────────────────── figures */
+
+.ops-figs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ops-s1) var(--ops-s5);
+  padding: var(--ops-s1) 0;
+}
+.ops-fig {
+  display: flex;
+  align-items: baseline;
+  gap: var(--ops-s1);
+}
+.ops-fig-v {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--ops-t4);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+.ops-fig-k {
+  font-size: var(--ops-t2);
+  color: var(--muted);
+}
+.ops-fig-sub {
+  display: block;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--ops-t2);
+  color: var(--muted);
+}
+
+/* ────────────────────────────────────────────────────────────────────────── tables */
+
+.ops-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+table.ops-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--ops-t3);
+}
+/* ⚠️ NOT `position: sticky`. The two-row status bar is the thing that must stay pinned, and a
+   page-level sticky `th` on top of it is (a) a second floating layer to reason about and (b)
+   unrenderable in a full-page screenshot — the header paints at its sticky offset, i.e. on top of
+   whichever row happens to be there, which is how the first round of evidence came back with the
+   column heads sitting in the middle of the table. */
+table.ops-table th {
+  background: var(--bg);
+  text-align: left;
+  font-size: var(--ops-t1);
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 6px 12px 6px 0;
+  border-bottom: 1px solid var(--ops-rule-strong);
+  white-space: nowrap;
+}
+table.ops-table td {
+  padding: 9px 12px 9px 0;
+  border-bottom: 1px solid var(--ops-rule);
+  vertical-align: top;
+}
+table.ops-table th:last-child,
+table.ops-table td:last-child {
+  padding-right: 0;
+}
+table.ops-table .r {
+  text-align: right;
+}
+/* the row's own label ("bWBTC · aid 38") is an identity, not prose: it never wraps */
+table.ops-table td:first-child .ops-cellsub {
+  white-space: nowrap;
+}
+/* the second line of a right-aligned money cell ("asked 0.0019999 bETH") is a number too */
+table.ops-table td.r .ops-cellsub {
+  white-space: nowrap;
+}
+/* a right-aligned number must not touch the left-aligned cell after it */
+table.ops-table th.r + th,
+table.ops-table td.r + td {
+  padding-left: var(--ops-s1);
+}
+/* a tabular number broken across two lines is not a number any more ("40 / min / ago") */
+table.ops-table td > .n,
+table.ops-table td > .ops-ladder .ops-ladder-name {
+  white-space: nowrap;
+}
+table.ops-table tr.ops-row {
+  cursor: pointer;
+}
+table.ops-table tr.ops-row:hover > td {
+  background: var(--surface-2);
+}
+table.ops-table tr.ops-row.open > td {
+  background: var(--surface-2);
+}
+table.ops-table tr.ops-row:focus-visible > td {
+  background: var(--surface-2);
+  outline: 2px solid var(--indigo);
+  outline-offset: -2px;
+}
+table.ops-table tr.ops-stripe td {
+  border-bottom: 1px solid var(--ops-rule);
+  padding-top: 0;
+  padding-bottom: 9px;
+  font-size: var(--ops-t2);
+}
+.ops-stripe-in {
+  display: flex;
+  align-items: baseline;
+  gap: var(--ops-s1);
+  padding: 6px var(--ops-s2);
+  border-radius: var(--radius-sm);
+  background: var(--ops-warn-soft);
+  color: var(--ink);
+}
+.ops-stripe-in.is-crit {
+  background: var(--ops-crit-soft);
+}
+.ops-stripe-in b {
+  font-weight: 600;
+}
+.ops-cellsub {
+  display: block;
+  font-size: var(--ops-t2);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+/* the two-line money table needs no hover */
+table.ops-table.static tr:hover > td {
+  background: none;
+}
+
+/* ─────────────────────────────────────────────────────────────────────── the ladder */
+
+.ops-ladder {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 132px;
+}
+.ops-ladder-steps {
+  display: flex;
+  gap: 3px;
+}
+.ops-ladder-steps i {
+  display: block;
+  width: 18px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--line);
+}
+.ops-ladder-steps i.done {
+  background: var(--ops-neutral);
+}
+.ops-ladder-steps i.now {
+  background: var(--ops-warn);
+}
+.ops-ladder.is-good .ops-ladder-steps i.now,
+.ops-ladder.is-good .ops-ladder-steps i.done {
+  background: var(--ops-good);
+}
+.ops-ladder.is-crit .ops-ladder-steps i.now {
+  background: var(--ops-crit);
+}
+.ops-ladder-name {
+  font-size: var(--ops-t2);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.ops-ladder.is-crit .ops-ladder-name {
+  color: var(--ops-crit);
+}
+.ops-ladder.is-warn .ops-ladder-name {
+  color: var(--ops-warn);
+}
+
+/* ───────────────────────────────────────────────────────────────────────── pills */
+
+.ops-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--ops-neutral-soft);
+  color: var(--muted);
+  font-size: var(--ops-t2);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.ops-pill.is-good {
+  color: var(--ops-good);
+  background: var(--ops-good-soft);
+  border-color: transparent;
+}
+.ops-pill.is-warn {
+  color: var(--ops-warn);
+  background: var(--ops-warn-soft);
+  border-color: transparent;
+}
+.ops-pill.is-crit {
+  color: var(--ops-crit);
+  background: var(--ops-crit-soft);
+  border-color: transparent;
+}
+
+/* ─────────────────────────────────────────────────────────────────── controls */
+
+.ops-btn {
+  appearance: none;
+  font: inherit;
+  font-size: var(--ops-t2);
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ops-btn:hover {
+  border-color: var(--muted);
+}
+.ops-btn.is-crit {
+  color: var(--ops-crit);
+}
+.ops-btn.primary {
+  background: var(--ink);
+  color: var(--bg);
+  border-color: var(--ink);
+  font-weight: 600;
+  padding: 7px 16px;
+  font-size: var(--ops-t3);
+}
+.ops-btn.primary:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.ops-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--ops-t2);
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ops-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ops-s1);
+  padding: 0 0 var(--ops-s2);
+}
+.ops-input,
+.ops-select {
+  font: inherit;
+  font-size: var(--ops-t2);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink);
+}
+.ops-input {
+  min-width: 200px;
+}
+.ops-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ops-s0);
+}
+.ops-chip {
+  appearance: none;
+  font: inherit;
+  font-size: var(--ops-t2);
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ops-chip.on {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--bg);
+}
+.ops-count {
+  font-size: var(--ops-t2);
+  color: var(--muted);
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+/* ─────────────────────────────────────────────────────────────────── the banner */
+
+.ops-banner {
+  display: flex;
+  align-items: baseline;
+  gap: var(--ops-s1);
+  padding: 10px var(--ops-s2);
+  border-radius: var(--radius-sm);
+  background: var(--ops-crit-soft);
+  color: var(--ink);
+  border: 1px solid var(--ops-crit);
+  margin-bottom: var(--ops-s3);
+  font-size: var(--ops-t3);
+}
+.ops-banner b {
+  color: var(--ops-crit);
+}
+
+/* ─────────────────────────────────────────────────────────────── the row drawer */
+
+.ops-drawer-back {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 13, 18, 0.32);
+  z-index: 40;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  cursor: default;
+}
+.ops-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(520px, 100vw);
+  z-index: 41;
+  background: var(--surface);
+  border-left: 1px solid var(--line);
+  box-shadow: -12px 0 32px -18px rgba(10, 13, 18, 0.5);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.ops-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--ops-s2);
+  padding: var(--ops-s2) var(--ops-s3);
+  border-bottom: 1px solid var(--ops-rule);
+}
+.ops-drawer-body {
+  overflow: auto;
+  padding: var(--ops-s3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--ops-s3);
+}
+.ops-kv {
+  display: grid;
+  grid-template-columns: minmax(96px, auto) 1fr;
+  gap: 5px var(--ops-s2);
+  font-size: var(--ops-t3);
+  margin: 0;
+}
+.ops-kv dt {
+  color: var(--muted);
+  font-size: var(--ops-t2);
+}
+.ops-kv dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.ops-line {
+  display: flex;
+  gap: var(--ops-s2);
+  padding: 6px 0;
+  border-bottom: 1px solid var(--ops-rule);
+  font-size: var(--ops-t2);
+}
+.ops-line:last-child {
+  border-bottom: 0;
+}
+.ops-line time {
+  color: var(--muted);
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.ops-raw {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre;
+  overflow: auto;
+  max-height: 45vh;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: var(--ops-s2);
+  margin: var(--ops-s1) 0 0;
+}
+.ops-disclosure > summary {
+  cursor: pointer;
+  font-size: var(--ops-t2);
+  color: var(--muted);
+  list-style: none;
+  padding: 4px 0;
+}
+.ops-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+.ops-disclosure > summary::before {
+  content: '▸ ';
+}
+.ops-disclosure[open] > summary::before {
+  content: '▾ ';
+}
+
+/* ──────────────────────────────────────────────────────────────────── the gate */
+
+.ops-gate {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--ops-s3);
+}
+.ops-gate form {
+  width: 100%;
+  max-width: 380px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--ops-s2);
+}
+.ops-gate .ops-title {
+  font-size: 26px;
+}
+.ops-gate label {
+  display: block;
+  font-size: var(--ops-t1);
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 5px;
+}
+.ops-gate input {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: var(--ops-t3);
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink);
+}
+.ops-gate .err {
+  color: var(--ops-crit);
+  font-size: var(--ops-t2);
+}
+
+/* ─────────────────────────────────────────────────────────────────────── timeline */
+
+.ops-timeline {
+  display: flex;
+  flex-direction: column;
+}
+/* `minmax(0, 1fr)`, not `1fr`: a grid track's default minimum is min-content, so one long event
+   sentence widens the whole timeline past its container instead of wrapping inside it. */
+.ops-event {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  gap: var(--ops-s2);
+  align-items: baseline;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--ops-rule);
+}
+.ops-event:last-child {
+  border-bottom: 0;
+}
+.ops-event time {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--ops-t2);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.ops-event .kind {
+  font-size: var(--ops-t2);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.ops-event .text {
+  overflow-wrap: anywhere;
+}
+.ops-event.unsent .text::after {
+  content: 'unsent';
+  margin-left: var(--ops-s1);
+  font-size: var(--ops-t1);
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ops-warn);
+}
+
+/* ───────────────────────────────────────────────────────────────────── phone */
+
+@media (max-width: 860px) {
+  /* longhands here too: the shorthand would reset `.ops-body`'s vertical padding on the element
+     that carries both classes — the same trap, one media query further down */
+  .ops-wrap {
+    padding-left: var(--ops-s2);
+    padding-right: var(--ops-s2);
+  }
+  .ops-bar-top {
+    height: auto;
+    flex-wrap: wrap;
+    gap: var(--ops-s1) var(--ops-s2);
+    padding-top: 10px;
+  }
+  .ops-tabs {
+    order: 3;
+    width: 100%;
+    flex-basis: 100%;
+    gap: var(--ops-s2);
+    padding-bottom: 6px;
+  }
+  .ops-tools {
+    margin-left: auto;
+  }
+  .ops-title {
+    font-size: 18px;
+  }
+  /* THE SAME TRAP, A THIRD TIME. `main` carries `.ops-wrap` and `.ops-body`; a `padding:`
+     shorthand in EITHER rule wipes the other's side of the box. Longhands only, everywhere. */
+  .ops-body {
+    padding-top: var(--ops-s3);
+    padding-bottom: var(--ops-s5);
+  }
+  .ops-section {
+    margin-top: var(--ops-s4);
+  }
+  table.ops-table th {
+    position: static;
+  }
+  .ops-figs {
+    gap: var(--ops-s1) var(--ops-s3);
+  }
+  .ops-fig-v {
+    font-size: 16px;
+  }
+  .ops-drawer {
+    top: auto;
+    left: 0;
+    width: 100%;
+    max-height: 86vh;
+    border-left: 0;
+    border-top: 1px solid var(--line);
+    border-radius: var(--radius) var(--radius) 0 0;
+  }
+  .ops-need {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .ops-need-when {
+    grid-column: 2;
+    text-align: left;
+    justify-content: flex-start;
+  }
+  .ops-strip {
+    gap: 2px 10px;
+  }
+  .ops-strip .long {
+    display: none;
+  }
+  .ops-strip .short {
+    display: inline;
+  }
+  .ops-strip .ops-stat {
+    font-size: 12px;
+  }
+  .ops-input {
+    min-width: 0;
+    flex: 1 1 140px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ops * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

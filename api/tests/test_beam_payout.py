@@ -23,6 +23,7 @@ real. Nothing in this file can make a `create_tx: true` call, and the tests asse
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any
 
@@ -65,6 +66,22 @@ LIVE_GAS = {
 }
 
 
+def _wallet_args(raw: str) -> dict[str, str]:
+    """`k=v,k=v` — the wallet's own `args` format, split the way the WALLET splits it.
+
+    ⛔ THE WALLET SPLITS ON `,` BEFORE THE SHADER SEES ANYTHING (`ProcessorManager::AddArgs`,
+    bvm2.cpp:3373). A value containing a comma — `indexes=1,2,3` — therefore reaches the shader
+    as `indexes=1` plus two broken pairs, and the two indexes that vanished are two messages
+    nobody can see. The fake reproduces that rather than being clever about it, so a caller that
+    ever goes back to a comma list fails here instead of on the box. The list separator is `;`."""
+    out: dict[str, str] = {}
+    for tok in str(raw).split(","):
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k] = v
+    return out
+
+
 def _hex(n: int) -> str:
     return hex(n)
 
@@ -95,6 +112,16 @@ class FakeBeamPay(beampay.BeamPay):
         self.in_sync = True
         self.addresses: dict[str, dict[str, dict[str, int]]] = {}
         self.address_types: dict[str, str] = {}
+        # ⛔ THE WALLET'S OWN TOTALS, WHICH ARE NOT THE LEDGER'S. `/wallet_status.totals` is what
+        # the WALLET can spend right now, split by bucket, and it is the fact BeamPay's
+        # per-address ledger cannot express: on 2026-09-10 the live wallet reported asset 36
+        # `available 0 / available_mp 0 / maturing_mp 1652864` while BeamPay's registry summed
+        # 2,652,864 — a release would have passed every ledger gate and handed the wallet a send
+        # it could not fund. By DEFAULT the fake derives the totals from the balances it already
+        # holds (regular = every non-max_privacy address, shielded = every max_privacy one), so a
+        # wallet that owes what the ledger says can spend it. `wallet_totals[asset_id]` overrides
+        # any field of one asset's row, which is how a test models the max-privacy lock.
+        self.wallet_totals: dict[int, dict[str, int]] = {}
         self.invalid: set[str] = set()  # answered is_valid: false
         self.tx_rows: list[dict[str, Any]] = []  # db.txs, oldest first
         self.tx_index: dict[str, dict[str, Any]] = {}
@@ -108,6 +135,12 @@ class FakeBeamPay(beampay.BeamPay):
         self.withdraw_lands = True  # the daemon emits the transaction immediately
         self.withdraw_fee = 1_100_000  # BeamPay's own offline/max-privacy fee
         self.next_created = "MaxPrivacyTokenCreatedByBeamPay" + "z" * 40
+        # ⛔ A REGULAR `/create_wallet` ANSWERS AN SBBS ADDRESS, NOT A TOKEN. A regular Beam
+        # address is 64/66 hex characters and a max-privacy one is a long base58 token; the
+        # crossing-address path (T40) refuses the second shape on purpose, because a crossing
+        # funded into a max-privacy address could not be spent for 72 h. The fake has to be
+        # able to answer BOTH shapes or that guard can never be exercised.
+        self.next_regular = "7c" + "5e" * 31
         self.created: list[dict[str, Any]] = []  # every /create_wallet body, in order
         self.next_tx = 1
         self.now = time.time
@@ -190,6 +223,65 @@ class FakeBeamPay(beampay.BeamPay):
             bal["available"][aid] = bal["available"].get(aid, 0) + d
         return deltas
 
+    def totals(self) -> list[dict[str, Any]]:
+        """`/wallet_status.totals`, in the shape the live wallet answers (read on the box
+        2026-09-10 10:2xZ): one row per asset carrying `available_regular` / `available_mp` /
+        `maturing_regular` / `maturing_mp` and the `available` / `maturing` sums.
+
+        Derived from the addresses this fake holds unless `wallet_totals` overrides it: an
+        address created `max_privacy` is shielded value, everything else is regular. A negative
+        per-address balance (BeamPay books an invocation's whole BEAM fee to the REGISTERED
+        address, which drives it below zero) is not a negative wallet balance — the wallet holds
+        what it holds — so each bucket is floored at 0."""
+        buckets: dict[int, dict[str, int]] = {}
+        for addr, bal in self.addresses.items():
+            mp = self.address_types.get(addr) == "max_privacy"
+            for aid, v in bal["available"].items():
+                row = buckets.setdefault(
+                    int(aid),
+                    {"available_regular": 0, "available_mp": 0,
+                     "maturing_regular": 0, "maturing_mp": 0, "locked": 0},
+                )
+                row["available_mp" if mp else "available_regular"] += int(v)
+            for aid, v in bal["locked"].items():
+                row = buckets.setdefault(
+                    int(aid),
+                    {"available_regular": 0, "available_mp": 0,
+                     "maturing_regular": 0, "maturing_mp": 0, "locked": 0},
+                )
+                row["locked"] += int(v)
+        for aid, over in self.wallet_totals.items():
+            row = buckets.setdefault(
+                int(aid),
+                {"available_regular": 0, "available_mp": 0,
+                 "maturing_regular": 0, "maturing_mp": 0, "locked": 0},
+            )
+            # only the numbers feed the derivation below; anything else a test pins (a bucket
+            # spelled as a word, say) is applied RAW at the end, because a reader that refuses
+            # a shape it does not understand has to be able to MEET one
+            row.update({k: int(v) for k, v in over.items() if isinstance(v, int)})
+        out: list[dict[str, Any]] = []
+        for aid, row in sorted(buckets.items()):
+            reg = max(0, int(row["available_regular"]))
+            mp = max(0, int(row["available_mp"]))
+            mreg = max(0, int(row["maturing_regular"]))
+            mmp = max(0, int(row["maturing_mp"]))
+            out.append(
+                {
+                    "asset_id": aid,
+                    "available": reg + mp,
+                    "available_regular": reg,
+                    "available_mp": mp,
+                    "maturing": mreg + mmp,
+                    "maturing_regular": mreg,
+                    "maturing_mp": mmp,
+                    "locked": max(0, int(row["locked"])),
+                }
+            )
+            out[-1].update({k: v for k, v in self.wallet_totals.get(aid, {}).items()
+                            if not isinstance(v, int)})
+        return out
+
     def paths(self) -> list[str]:
         return [path for _m, path, _b in self.calls]
 
@@ -234,7 +326,11 @@ class FakeBeamPay(beampay.BeamPay):
         if path == "/wallet_status":
             return 200, {
                 "status": True,
-                "result": {"current_height": self.height_, "is_in_sync": self.in_sync},
+                "result": {
+                    "current_height": self.height_,
+                    "is_in_sync": self.in_sync,
+                    "totals": self.totals(),
+                },
             }
         if path == "/validate_address":
             return 200, {"status": True, "result": params.get("address") not in self.invalid}
@@ -243,7 +339,13 @@ class FakeBeamPay(beampay.BeamPay):
             # one address forever would let "a fresh max-privacy address per shield chunk" pass
             # while every chunk went to the same one — which is precisely the collision the
             # per-chunk address exists to prevent, so the fake must be able to show it.
-            addr = f"{self.next_created}{len(self.created)}"
+            kind = str((body or {}).get("wallet_type") or "regular")
+            n = len(self.created)
+            addr = (
+                f"{self.next_regular[:-2]}{n % 100:02d}"
+                if kind == "regular"
+                else f"{self.next_created}{n}"
+            )
             self.created.append(dict(body or {}, address=addr))
             self.register(addr, str((body or {}).get("wallet_type") or "regular"))
             return 200, {"address": addr, "note": (body or {}).get("note")}
@@ -340,8 +442,29 @@ class FakeWalletApi(beam.Wallet):
         self.local_msgs: dict[int, dict[str, Any]] = {}
         self.next_txid = 1
         self.raise_on: set[str] = set()  # method names that answer with a BeamError
+        # ── one receiver key per deposit (WO-20260910-3). `patched` is "is K1's pipe app the
+        # one being called?" and it defaults to FALSE, because the SHIPPED app is what is on
+        # the box: it has no concept of an index, ignores `index=` entirely and answers the
+        # cid-derived key for every value of it (measured live, T41 §1). That default is what
+        # makes an unpatched box a test case rather than a silent success.
+        self.patched = False
+        self.pk = "02" + "ab" * 32  # the pipe's LEGACY (cid-derived) receiver key
+        self.get_pk_args: list[int | None] = []  # the index asked for, per call
+        self.view_index_args: list[str | None] = []  # the `indexes=` of each view_incoming
+        self.receive_index_args: list[int | None] = []  # the index each claim signed with
         self.omit_receiver = False
         self.omit_cid = False
+        # ⛔ COINS, NOT A BALANCE. Beam locks a WHOLE UTXO per pending transaction, so what
+        # bounds concurrent releases is the COUNT of spendable coins, not their total. The fake
+        # derives the list from BeamPay's totals and splits each bucket into `default_coins`
+        # coins; `coins[(asset_id, "regular"|"shielded")]` overrides the count for one bucket,
+        # which is how a test models the box's shape (2 spendable BEAM coins, 0 bETH ones).
+        self.coins: dict[tuple[int, str], int] = {}
+        self.default_coins = 8
+        self.bad_utxo = False  # answer a coin whose `status` is not a number at all
+        # exact per-coin amounts for one bucket, when a test cares about SIZE and not only
+        # count (the box holds 0.01 BEAM and 9.835 BEAM — only one of them can pay a fee)
+        self.coin_amounts: dict[tuple[int, str], list[int]] = {}
         self.on_invoke_send: Any = None  # hook: called when a send is BUILT (create_tx:false)
         self.invoke_fee = 1_100_000  # what the WALLET charges for an invocation; we never set it
         self._pending: dict[str, Any] | None = None
@@ -394,20 +517,102 @@ class FakeWalletApi(beam.Wallet):
             )
         return {"txid": txid}
 
+    def _m_get_utxo(self, p: dict[str, Any]) -> list[dict[str, Any]]:
+        """The wallet's UTXO list, in the shape the live wallet answers (read on the box
+        2026-09-10): `type` is `norm`/`chng` for a regular output and `shld` for a shielded
+        one, and `status` 1 is available, 3 maturing, 6 spent. Paged with count/skip."""
+        rows: list[dict[str, Any]] = []
+        for t in (self.bp.totals() if self.bp else []):
+            aid = int(t["asset_id"])
+            for field, kind, bucket in (
+                ("available_regular", "norm", "regular"),
+                ("available_mp", "shld", "shielded"),
+            ):
+                value = int(t.get(field) or 0)
+                exact = self.coin_amounts.get((aid, bucket))
+                if exact is not None:
+                    amounts = list(exact)
+                else:
+                    n = self.coins.get((aid, bucket), self.default_coins) if value > 0 else 0
+                    amounts = [value // n] * n if n else []
+                rows.extend(
+                    {
+                        "amount": amount, "asset_id": aid, "type": kind,
+                        "status": 1, "status_string": "available",
+                        "id": f"{aid}-{bucket}-{i}", "maturity": self.height,
+                        "createTxId": "", "spentTxId": "",
+                    }
+                    for i, amount in enumerate(amounts)
+                )
+            if int(t.get("maturing_mp") or 0):
+                rows.append(
+                    {
+                        "amount": int(t["maturing_mp"]), "asset_id": aid, "type": "shld",
+                        "status": 3, "status_string": "maturing",
+                        "id": f"{aid}-shld-maturing", "maturity": self.height,
+                        "createTxId": "", "spentTxId": "",
+                    }
+                )
+        if self.bad_utxo and rows:
+            rows[0] = dict(rows[0], status="who knows")
+        skip = int(p.get("skip") or 0)
+        count = int(p.get("count") or len(rows) or 1)
+        return rows[skip : skip + count]
+
+    def pk_for(self, index: int | None) -> str:
+        """What the app being called answers for `get_pk`.
+
+        ⛔ THE SHIPPED APP ANSWERS THE LEGACY KEY FOR EVERY INDEX. That is the whole trap: a
+        33-byte answer to `index=7` is not evidence that a per-deposit key was derived, so the
+        fake reproduces it rather than pretending an unpatched box would fail loudly."""
+        if not index or int(index) <= 0 or not self.patched:
+            return self.pk
+        return "02" + f"{int(index):064x}"
+
     def _m_invoke_contract(self, p: dict[str, Any]) -> dict[str, Any]:
         assert p.get("create_tx") is False, "a test must NEVER ask for create_tx: true"
-        args = dict(kv.split("=", 1) for kv in str(p["args"]).split(","))
+        args = _wallet_args(str(p["args"]))
         cid = args.get("cid", "")
         action = args.get("action")
+        if action == "get_pk":
+            idx = int(args["index"]) if args.get("index") else None
+            self.get_pk_args.append(idx)
+            body = {"pk": self.pk_for(idx)}
+            if self.patched:
+                body["index"] = int(idx or 0)  # the patched app echoes what it derived for
+            return {"output": json.dumps(body)}
         if action == "view_incoming":
-            return {"output": json.dumps({"incoming": [{"MsgId": m["msg_id"], "amount": m["amount"]} for m in self.incoming]})}
+            raw = args.get("indexes")
+            self.view_index_args.append(raw)
+            # K1's shader, exactly: the legacy key (0) is ALWAYS in the match set; an explicit
+            # `indexes` list (`;`-separated, any non-digit is a separator) replaces the window;
+            # with neither `indexes` nor `maxIndex` it derives a DEFAULT window of 1..64. An
+            # index outside the resulting set is INVISIBLE — never "not delivered yet" — which
+            # is the property `receiver_keys.open_indexes` exists to satisfy.
+            want: set[int] | None
+            if not self.patched:
+                want = None  # the shipped app has no concept of an index at all
+            elif raw:
+                want = {int(x) for x in re.split(r"\D+", raw) if x} | {0}
+            elif args.get("maxIndex"):
+                want = set(range(0, int(args["maxIndex"]) + 1))
+            else:
+                want = set(range(0, 65))
+            rows = []
+            for m in self.incoming:
+                i = int(m.get("index") or 0)
+                if want is not None and i not in want:
+                    continue
+                row: dict[str, Any] = {"MsgId": m["msg_id"], "amount": m["amount"]}
+                if self.patched:
+                    row["index"] = i
+                rows.append(row)
+            return {"output": json.dumps({"incoming": rows})}
         if action == "local_msg_count":
             return {"output": json.dumps({"count": max(self.local_msgs) if self.local_msgs else 0})}
         if action == "local_msg":
             m = self.local_msgs.get(int(args["msgId"]))
             return {"output": json.dumps(m) if m else ""}
-        if action == "get_pk":
-            return {"output": json.dumps({"pk": "02" + "ab" * 32})}
         if action in ("send", "receive"):
             if action == "send" and self.on_invoke_send is not None:
                 self.on_invoke_send(args)
@@ -418,7 +623,23 @@ class FakeWalletApi(beam.Wallet):
             if action == "send":
                 signed = int(args["amount"]) + int(args["relayerFee"])
             else:
+                asked = int(args["index"]) if args.get("index") else None
+                self.receive_index_args.append(asked)
                 msg = int(args["msgId"])
+                if self.patched:
+                    # ⛔ K1's app checks the message's stored receiver against the key of the
+                    # index it was given and REFUSES before signing — no raw_data at all. The
+                    # fake refuses too, so "we passed the wrong index" fails here and not with a
+                    # signature over somebody else's message.
+                    delivered = next(
+                        (int(r.get("index") or 0) for r in self.incoming
+                         if int(r["msg_id"]) == msg),
+                        None,
+                    )
+                    if delivered is not None and delivered != int(asked or 0):
+                        return {"output": json.dumps({"error": (
+                            "receiver key mismatch: this message was not sent to the key of "
+                            "this index")})}
                 signed = -next(
                     (int(m["amount"]) for m in self.incoming if int(m["msg_id"]) == msg), 0
                 )
@@ -478,6 +699,13 @@ class FakeEth:
         return self.start.get(a, 0) + sum(d for b, x, d in self.events if x == a and b <= block)
 
     async def block_number(self, prefer: str | None = None, pin: bool = False) -> int:
+        # ⛔ THE DOUBLE HAS TO BE DEAD WHERE THE CALLER READS (T40b F13). `head_dead` used to
+        # stop `head_from` only, and the destination re-read has moved to
+        # `ethpipe.code_at_head_anywhere`, which asks each ENDPOINT for its own head through
+        # here — so a "dead pool" that still answered this one was a pool the guard could not
+        # meet. The prober must call the way the caller calls, and so must the fake.
+        if self.head_dead:
+            raise ethpipe.RpcError("eth_blockNumber: no endpoint answered")
         return self.head
 
     async def head_from(self) -> tuple[int, str]:
@@ -529,6 +757,10 @@ def beam_pay(monkeypatch: pytest.MonkeyPatch) -> FakeBeamPay:
     beampay.set_beampay(bp)
     monkeypatch.setattr(settings, "beam_treasury_address", TREASURY)
     monkeypatch.setattr(settings, "beam_mp_address", MP)
+    # the working-float policy (PGAS_SHIELD_KEEP_GROTH) has its own file
+    # (test_beam_payout_spendable); this one tests the shield MECHANICS, so the
+    # policy is pinned out of the way rather than silently deciding these cases
+    monkeypatch.setattr(settings, "shield_keep_groth", 0)
     yield bp
     beampay.set_beampay(None)
 
@@ -580,7 +812,17 @@ async def make_payout(
     row.update(over)
     await mock_db["pgasme_test"].payout_requests.insert_one(dict(row))
     await ledger.credit("acct1", "ETH", 10 * amount, f"seed-{rid}")
-    await ledger.schedule("acct1", "ETH", amount + row["fee_groth"], rid, "test")
+    # the debit the row was written against — amount + our fee, plus the bridge fee it funded if
+    # this is a post-2026-09-10 row (`bridge_fee_groth` passed through `over`). ONE call, so a
+    # test row is debited exactly the way `routers/withdrawals._write_items` debits a real one.
+    await ledger.schedule(
+        "acct1",
+        "ETH",
+        amount + row["fee_groth"],
+        rid,
+        "test",
+        bridge_fee_groth=int(row.get("bridge_fee_groth") or 0),
+    )
     return row
 
 
@@ -600,6 +842,14 @@ async def make_deposit(mock_db: Any, dep_id: str = "dep1", value: int = 12_000_0
         "updated_at": now - 300,
     }
     await mock_db["pgasme_test"].deposits.insert_one(dict(doc))
+    # ⛔ THE CLAIM BOOKS THIS DEPOSIT'S bETH TO THE TREASURY, and the shield spends it from
+    # there. The fake applies attribution deltas only when a test asks it to, so without this
+    # the ledger shows a treasury that never received the deposit it is about to shield — and
+    # the working-float policy (`payouts._treasury_shielding`), which reads exactly that
+    # balance, would be measuring a wallet that does not exist.
+    bp = beampay.beampay()
+    if isinstance(bp, FakeBeamPay):
+        bp.fund(TREASURY, ASSETS[str(doc["asset"])].aid, int(value))
     return doc
 
 
@@ -744,21 +994,26 @@ async def test_a_payout_walks_every_status_and_emits_one_event_per_transition(
         assert W.lower() not in ev["text"].lower()
 
 
-async def test_a_failed_beam_kernel_fails_the_payout_and_refunds_the_debit(mock_db, eth, armed):
+async def test_a_failed_beam_kernel_delays_the_payout_and_refunds_nothing(mock_db, eth, armed):
+    """⛔ **NEVER FAILED** (T40, admin 2026-09-10). A dead Beam transaction is a dead ATTEMPT,
+    not a dead order: nothing crossed, so the money is still owed and stays reserved, and the
+    crossing is tried again once that transaction is PROVEN dead (status 4/2 and no kernel)."""
     await make_payout(mock_db)
     eth.start = {ETH.pipe.lower(): 5 * 10**18}
     await payouts.process_once()  # scheduled → releasing (+ sent)
     await payouts.process_once()  # → bridging
     w = beam.wallet()
-    w.txs["beamtx-1"].update({"status": beam.TX_FAILED, "status_string": "failed"})
+    txid = (await payout(mock_db))["beam_txid"]
+    w.txs[txid].update({"status": beam.TX_FAILED, "status_string": "failed", "kernel": None})
     before = (await ledger.balance("acct1", "ETH"))["available"]
     await payouts.process_once()
     row = await payout(mock_db)
-    assert row["status"] == "failed" and "failed" in row["failed_reason"]
+    assert row["status"] == payouts.DELAYED and "failed" in row["hold_detail"]
     after = (await ledger.balance("acct1", "ETH"))["available"]
-    assert after - before == 500_000 + 10_000  # amount + the 2% fee, back to Available
-    ev = await mock_db["pgasme_test"].events.find_one({"kind": "payout_failed"})
-    assert ev["notified"] is True and ev["immediate"] is True  # the operator hears at once
+    assert after == before  # nothing came back: the order is not over
+    ev = await mock_db["pgasme_test"].events.find_one({"kind": "payout_delayed"})
+    assert ev is not None and ev["request_id"] == "req1"
+    assert await mock_db["pgasme_test"].events.find_one({"kind": "payout_failed"}) is None
 
 
 async def test_a_lost_response_is_resolved_from_the_chain_and_never_re_signed(
@@ -824,7 +1079,7 @@ async def test_an_unresolvable_send_is_held_for_a_human_never_retried(mock_db, e
     await payouts.process_once()
     row = await payout(mock_db)
     assert row["status"] == "held" and row["held_from"] == "releasing"
-    assert "NOT auto-retried" in row["hold_reason"] and row["unresolved_at"] > 0
+    assert "NOT auto-retried" in row["hold_detail"] and row["unresolved_at"] > 0
     assert "process_invoke_data" not in beam.wallet().methods()
 
 
@@ -1396,7 +1651,7 @@ async def test_with_the_flags_off_nothing_signs_and_the_orders_say_why(
         await payouts.process_once()
     row = await payout(mock_db)
     assert row["status"] == "scheduled" and row["dark"] is True
-    assert "PGAS_PAYOUT_DIRECT_ENABLED=0" in row["hold_reason"]
+    assert "PGAS_PAYOUT_DIRECT_ENABLED=0" in row["hold_detail"]
     dep = await deposit(mock_db)
     assert dep["treasury"] == "claiming" and dep["dark"] is True
     assert "PGAS_CLAIM_ENABLED=0" in dep["hold_reason"]
@@ -1427,30 +1682,41 @@ async def test_a_dark_order_is_not_stuck(mock_db, eth, monkeypatch):
 
 
 async def test_the_any_asset_branch_refuses(mock_db, eth, monkeypatch):
+    """The DARK statuses ARE the any-asset branch (bETH → our distributor, then a cross-chain
+    swap to the user's own chain and asset): designed, and refused.
+
+    ⚠️ `mode="instant"` stopped being one of them on 2026-09-10 (T34). It is the Ethereum-side
+    payout now, with a branch of its own — so it refuses for its own reason, and this test pins
+    that the two refusals are DIFFERENT rather than letting one quietly stand in for the other."""
     monkeypatch.setattr(settings, "payout_instant_enabled", True)
     await make_payout(mock_db, mode="instant")
     await make_payout(mock_db, rid="req2", status="waiting_for_dep_eth")
     await payouts.process_once()
-    for rid in ("req1", "req2"):
-        row = await payout(mock_db, rid)
-        assert "not implemented" in row["hold_reason"] and row["dark"] is True
-    assert (await payout(mock_db, "req2"))["status"] == "waiting_for_dep_eth"
+    instant = await payout(mock_db, "req1")
+    assert "PGAS_DISTRIBUTOR_KEY_FILE" in instant["hold_detail"] and instant["dark"] is True
+    assert instant["status"] == "scheduled"
+    anyasset = await payout(mock_db, "req2")
+    assert "not implemented" in anyasset["hold_detail"] and anyasset["dark"] is True
+    assert anyasset["status"] == "waiting_for_dep_eth"
 
 
 async def test_a_relayer_that_wants_more_than_a_tenth_is_refused(mock_db, eth, armed):
     await make_payout(mock_db, amount=20_000)  # 0.0002 ETH against a 3600-groth fee
     await payouts.process_once()
     row = await payout(mock_db)
-    assert row["status"] == "scheduled" and "max 10%" in row["hold_reason"]
+    assert row["status"] == "scheduled" and "max 10%" in row["hold_detail"]
 
 
 async def test_a_short_float_waits_and_says_so(mock_db, eth, armed, beam_wallet, beam_pay):
-    """The float is the max-privacy address's BeamPay balance — never a wallet total."""
+    """The float is a sum of BeamPay ADDRESS balances — never a wallet total — and since
+    2026-09-10 it names both halves so an operator can see which one is short."""
     beam_pay.addresses[MP]["available"]["36"] = 100
+    beam_pay.addresses[TREASURY]["available"]["36"] = 0
     await make_payout(mock_db)
     await payouts.process_once()
     row = await payout(mock_db)
-    assert row["status"] == "scheduled" and "shielded float" in row["hold_reason"]
+    assert row["status"] == "scheduled" and "the float holds" in row["hold_detail"]
+    assert "shielded across" in row["hold_detail"] and "unshielded at the treasury" in row["hold_detail"]
     assert "invoke_contract" not in beam_wallet.methods()
     assert ("GET", "/balances", {"address": MP}) in beam_pay.calls
 
@@ -1459,13 +1725,28 @@ async def test_the_float_cannot_be_read_without_a_max_privacy_address(
     mock_db, eth, armed, beam_wallet, monkeypatch
 ):
     """An address we cannot name is a float we cannot read, and a release must never spend
-    against a number nobody measured."""
+    against a number nobody measured.
+
+    ⚠️ 2026-09-10: that is the law for the SHIELDED half only. With
+    `PGAS_PAYOUT_SPEND_UNSHIELDED=1` the treasury's own balance is float too, and it is
+    readable without any max-privacy address — so a missing one is no longer fatal, it simply
+    means the shielded half is zero. With the flag OFF the original refusal stands."""
     monkeypatch.setattr(settings, "beam_mp_address", "")
+    monkeypatch.setattr(settings, "payout_spend_unshielded", False)
     await make_payout(mock_db)
     await payouts.process_once()
     row = await payout(mock_db)
-    assert row["status"] == "scheduled" and "shielded float cannot be read" in row["hold_reason"]
+    assert row["status"] == "scheduled" and "shielded float cannot be read" in row["hold_detail"]
     assert "process_invoke_data" not in beam_wallet.methods()
+
+    # …and with the flag on, the unshielded treasury funds it and the release goes
+    monkeypatch.setattr(settings, "payout_spend_unshielded", True)
+    monkeypatch.setattr(settings, "hold_backoff_s", 0.0)  # the row just held; read it again now
+    beam_pay = beampay.beampay()
+    beam_pay.fund(TREASURY, ETH.aid, 1_000_000)
+    await payouts.process_once()
+    row = await payout(mock_db)
+    assert row["status"] == "releasing" and row["source"] == "regular"
 
 
 # ============================================================== the calldata assertions
@@ -1575,7 +1856,9 @@ async def test_the_status_command_reads_and_never_writes(
     assert "wallet 4030000 · node/explorer 4030002 (lag 2)" in text
     assert "pending intents: 1 payout · 0 treasury" in text
     assert "ETH" in text and "aid" in text
-    assert set(beam_wallet.methods()) <= {"wallet_status"}
+    # the CLI reads BeamPay for every number except the COIN COUNTS, which only the wallet can
+    # answer (`get_utxo` — a read that moves nothing and that BeamPay has no route for)
+    assert set(beam_wallet.methods()) <= {"get_utxo"}
 
 
 async def test_the_cli_refuses_an_unknown_id(mock_db, eth, capsys):

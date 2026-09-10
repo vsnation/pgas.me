@@ -8,12 +8,16 @@ export function Modal({
   children,
   testId,
   width,
+  className,
 }: {
   title: string;
   onClose: () => void;
   children: ReactNode;
   testId?: string;
   width?: number;
+  /** Goes on the BACKDROP, so a dialog that needs its own shape (a full-screen sheet on a phone)
+   *  can restyle the panel and the space around it without a second dialog implementation. */
+  className?: string;
 }) {
   const dialog = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -23,7 +27,7 @@ export function Modal({
     return () => document.removeEventListener('keydown', onKey);
   }, [onClose]);
   return (
-    <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+    <div className={`modal-backdrop${className ? ` ${className}` : ''}`} onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div
         className="modal"
         role="dialog"

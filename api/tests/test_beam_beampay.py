@@ -41,8 +41,12 @@ from test_beam_payout import (
 from pgasme import beam, beampay, payouts, tg, workers
 from pgasme.config import settings
 
-# The only two wallet-api methods this project is allowed to make.
-ALLOWED_WALLET_METHODS = {"invoke_contract", "process_invoke_data"}
+# The only wallet-api methods this project is allowed to make. Two of them SIGN or BUILD; the
+# third (2026-09-10) is a READ that moves nothing and that BeamPay has no route for — the COUNT
+# of spendable coins, which decides how many crossings the wallet can carry at once and which a
+# per-address ledger balance cannot express. Two releases 0.7 s apart both died "Not enough
+# inputs" for want of it. Anything else against :10001 is still a defect (law 10).
+ALLOWED_WALLET_METHODS = {"invoke_contract", "process_invoke_data", "get_utxo"}
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +60,10 @@ def beam_pay(monkeypatch: pytest.MonkeyPatch) -> FakeBeamPay:
     beampay.set_beampay(bp)
     monkeypatch.setattr(settings, "beam_treasury_address", TREASURY)
     monkeypatch.setattr(settings, "beam_mp_address", MP)
+    # the working-float policy (PGAS_SHIELD_KEEP_GROTH) has its own file
+    # (test_beam_payout_spendable); this one tests the shield MECHANICS, so the
+    # policy is pinned out of the way rather than silently deciding these cases
+    monkeypatch.setattr(settings, "shield_keep_groth", 0)
     monkeypatch.setattr(settings, "hold_backoff_s", 0.0)
     yield bp
     beampay.set_beampay(None)
@@ -104,8 +112,9 @@ async def test_the_wallet_api_is_reached_for_exactly_two_methods(
     mock_db, eth, armed, beam_wallet, beam_pay
 ):
     """⛔ THE WHOLE LAW, as one assertion. A full deposit AND a full payout run end to end, and
-    the wallet-api sees `invoke_contract` (create_tx:false) and `process_invoke_data` — nothing
-    else. Every balance, status, address and withdrawal came from BeamPay.
+    the wallet-api sees `invoke_contract` (create_tx:false), `process_invoke_data` and the
+    read-only `get_utxo` — nothing else. Every balance, status, address and withdrawal came
+    from BeamPay.
 
     The fake helps: it implements no other method, so a reintroduced `tx_status`, `tx_list`,
     `wallet_status`, `generate_tx_id`, `create_address`, `validate_address` or `tx_send` cannot
@@ -125,10 +134,21 @@ async def test_the_wallet_api_is_reached_for_exactly_two_methods(
     assert all(p.get("create_tx") is False for p in beam_wallet.params_for("invoke_contract"))
     assert (await deposit(mock_db))["treasury"] == "shielded"
     assert (await payout(mock_db))["status"] in ("bridging", "delivering", "sent")
-    # …and every contract txid either machine made is registered with BeamPay
-    assert set(beam_pay.expectations) == {"beamtx-1", "beamtx-2"}
-    assert beam_pay.expectations["beamtx-1"]["address"] == TREASURY  # the claim: an inflow
-    assert beam_pay.expectations["beamtx-2"]["address"] == MP  # the release: the float spends
+    # …and every contract txid either machine made is registered with BeamPay. Looked up BY THE
+    # ROW rather than by ordinal: which invocation happens first is a scheduling detail, and a
+    # test that pins it tests the scheduler instead of the law.
+    dep_row, req_row = await deposit(mock_db), await payout(mock_db)
+    assert set(beam_pay.expectations) == {dep_row["claim_txid"], req_row["beam_txid"]}
+    assert beam_pay.expectations[dep_row["claim_txid"]]["address"] == TREASURY  # claim: inflow
+    # …and the release books to the address that FUNDED it — since T40 a regular-funded crossing
+    # is sent from a FRESH Beam address created for this order alone (admin 2026-09-10: "when
+    # you specify sendFund from — it should be new SBBS address"), funded by an internal
+    # transfer out of the treasury. Booking it to MP would drive MP negative by the whole
+    # crossing and leave the treasury untouched, which is a float that counts value already gone.
+    assert req_row["source"] == "regular"
+    assert req_row["crossing_address"] is True
+    assert req_row["source_address"] not in (TREASURY, MP)
+    assert beam_pay.expectations[req_row["beam_txid"]]["address"] == req_row["source_address"]
 
 
 async def test_invoke_contract_cannot_be_asked_to_create_a_transaction(beam_wallet):
@@ -229,7 +249,7 @@ async def test_a_failed_registration_holds_the_row_and_never_re_sends(
     await payouts.process_once()
     row = await payout(mock_db)
     assert row["status"] == "releasing"  # ⛔ NOT advanced
-    assert "has not accepted its attribution" in row["hold_reason"]
+    assert "has not accepted its attribution" in row["hold_detail"]
     assert beam_wallet.methods().count("process_invoke_data") == 1
 
     beam_pay.raise_on.clear()
@@ -361,7 +381,11 @@ async def test_the_invocation_fee_is_the_wallets_and_is_read_back_from_beampay(
     await payouts.process_once()
     await payouts.process_once()
     row = await payout(mock_db)
-    assert row["beam_fee_groth"] == 1_234_567
+    # ⛔ `crossing_fee_groth`, and NOT `beam_fee_groth` (T40b F7): a payout row carries two BEAM
+    # fees of different kinds — BeamPay's on the transfer that funds the crossing address, and
+    # the wallet's on the invocation — and each has one writer and one field.
+    assert row["crossing_fee_groth"] == 1_234_567
+    assert "beam_fee_groth" not in row
 
 
 async def test_an_absurd_fee_is_paged_the_moment_it_is_read_back(
@@ -494,7 +518,7 @@ async def test_a_missing_confirmation_count_waits_instead_of_inventing_one(
     await payouts.process_once()
     row = await payout(mock_db)
     assert row["status"] == "bridging"  # NOT delivering
-    assert "refusing to guess" in row["hold_reason"]
+    assert "refusing to guess" in row["hold_detail"]
 
     beam_pay.tx("beamtx-1")["confirmations"] = settings.beam_confirmations
     await payouts.process_once()

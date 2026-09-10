@@ -1,11 +1,20 @@
-// Status pills shared by the Deposit page and the Balance timeline, plus the muted hint lines that
-// sit under them. Every status in API_CONTRACT.md has an entry here: an unmapped status still
-// renders (with its raw name and no tone), but that is the fallback, not the design.
+// DEPOSIT status pills, plus the muted hint lines that sit under them. Every deposit status in
+// API_CONTRACT.md has an entry here: an unmapped status still renders (with its raw name and no
+// tone), but that is the fallback, not the design.
 //
 // The words are the user's, not the ledger's: `locked` is the asset sitting in the Beam bridge, and
 // what a depositor is waiting through is "Bridging"; `fallback_pending` is the same wait with a
 // worker doing the crossing by hand, which changes nothing they can act on.
-import type { Deposit, DepositStatus, PayoutRequest, RequestStatus } from '../lib/types';
+//
+// ⛔ THE PAYOUT-ORDER HALF IS GONE (T35b, 2026-09-10). `RequestStatusCell` / `RequestStatusPill` /
+// `requestStatusLabel` and their status table were replaced by `components/PayoutStatus.tsx` +
+// `lib/payouts.ts` when the T40 vocabulary landed, and nothing imported them afterwards — but the
+// table they carried still mapped `failed → "Failed"`, the one word the admin ruled out for
+// anything the system does to itself ("withdrawals on user's side cannot be failed"). A dead
+// implementation of a rule that has been changed is the second implementation waiting to be
+// imported by mistake (law 9), so it is deleted rather than left to rot. `holdReasonText` and
+// `BEAM_CONFIRMATIONS` stay: `lib/payouts.ts` is their one caller and re-exports them.
+import type { Deposit, DepositStatus } from '../lib/types';
 
 const DEPOSIT: Record<DepositStatus, { label: string; cls: string }> = {
   submitted: { label: 'Submitted', cls: 'pill-indigo' },
@@ -18,20 +27,6 @@ const DEPOSIT: Record<DepositStatus, { label: string; cls: string }> = {
   expired: { label: 'Failed', cls: 'pill-red' },
 };
 
-// scheduled → releasing → bridging → delivering → sent (indigo = queued/starting,
-// magenta = in flight, teal = done), and the two dark any-asset statuses as amber holds.
-const REQUEST: Record<RequestStatus, { label: string; cls: string }> = {
-  scheduled: { label: 'Scheduled', cls: 'pill-indigo' },
-  releasing: { label: 'Releasing', cls: 'pill-indigo' },
-  bridging: { label: 'Bridging', cls: 'pill-magenta' },
-  delivering: { label: 'Delivering', cls: 'pill-magenta' },
-  sent: { label: 'Sent', cls: 'pill-teal' },
-  failed: { label: 'Failed', cls: 'pill-red' },
-  cancelled: { label: 'Cancelled', cls: '' },
-  waiting_for_dep_eth: { label: 'Waiting for ETH', cls: 'pill-amber' },
-  waiting_for_swap_to_target_asset: { label: 'Swapping', cls: 'pill-amber' },
-};
-
 /** Beam confirmations the bridge waits for before the relayer can deliver (≈ 1 h at 59.3 s/block). */
 export const BEAM_CONFIRMATIONS = 61;
 
@@ -39,21 +34,8 @@ export function depositStatusLabel(status: string): string {
   return DEPOSIT[status as DepositStatus]?.label ?? status;
 }
 
-export function requestStatusLabel(status: string): string {
-  return REQUEST[status as RequestStatus]?.label ?? status;
-}
-
 export function DepositStatusPill({ status }: { status: string }) {
   const m = DEPOSIT[status as DepositStatus] ?? { label: status, cls: '' };
-  return (
-    <span className={`pill ${m.cls}`} data-status={status}>
-      {m.label}
-    </span>
-  );
-}
-
-export function RequestStatusPill({ status }: { status: string }) {
-  const m = REQUEST[status as RequestStatus] ?? { label: status, cls: '' };
   return (
     <span className={`pill ${m.cls}`} data-status={status}>
       {m.label}
@@ -107,24 +89,4 @@ export function holdReasonText(raw: string | undefined | null): string | null {
   if (/PAYOUT|DIRECT|PAUSE|STOP|KILL/i.test(s)) return 'payouts are paused right now';
   if (/BRIDGE|RELAYER|CONFIRM|ETA/i.test(s)) return 'waiting for the bridge';
   return 'waiting on Pgas.me';
-}
-
-export function RequestStatusCell({ request }: { request: PayoutRequest }) {
-  const confs = request.status === 'bridging' && typeof request.beam_confirmations === 'number' ? request.beam_confirmations : null;
-  const hold = holdReasonText(request.hold_reason);
-  return (
-    <>
-      <RequestStatusPill status={request.status} />
-      {confs !== null && (
-        <div className="tiny muted status-sub" data-hint="confirmations">
-          {confs}/{BEAM_CONFIRMATIONS} Beam confirmations
-        </div>
-      )}
-      {hold && (
-        <div className="tiny muted status-sub" data-hint="hold">
-          {hold}
-        </div>
-      )}
-    </>
-  );
 }

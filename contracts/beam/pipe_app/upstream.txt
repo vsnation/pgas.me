@@ -1,0 +1,13 @@
+# The pinned sources this app is built from. Sourced by build.sh (shell syntax, no spaces around =).
+UPSTREAM_REPO=https://github.com/BeamMW/beam-bridge-pipe.git
+UPSTREAM_COMMIT=597af68bc9a6f3a92dd316ed45283fb3c7efbadc
+# beam-bridge-pipe's `beam` submodule at that commit (bvm/Shaders headers + the shader build flags)
+BEAM_COMMIT=611192918287e63c9446ab7b921c233e8e262ad8
+# shaders/pipe_app.wasm as committed upstream at UPSTREAM_COMMIT (8763 bytes; their toolchain)
+UPSTREAM_PIPE_APP_WASM_SHA256=a53ae07a8a13aca6736bc3b6a5daf608fa4c4c7b25edf2b4a18fd80269c75f83
+# the UNPATCHED upstream source through this repository's toolchain (8936 bytes) — the reference build
+UNPATCHED_REBUILD_SHA256=68689badb29ecbe8ac05cf789e5ff3c46e50f34927f07b19824c7a383113e7e0
+# this build: upstream + pipe_app.indexed.diff (10708 bytes); byte-identical on every rebuild
+PATCHED_SHA256=4fa5e8421e2dbb06a31f59732aabeba04e5d0c6ae5869fd17554b01e0d5e17dc
+TOOLCHAIN="Debian bookworm clang 14.0.6 + LLD 14.0.6, from ./Dockerfile"
+CLANG_FLAGS="--target=wasm32 -I <beam>/bvm -O3 -std=c++17 -fno-rtti -nostdlib -Wl,--export-dynamic,--no-entry,--allow-undefined"

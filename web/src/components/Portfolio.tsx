@@ -15,6 +15,7 @@ import {
   type Holding,
   type Portfolio as PortfolioData,
 } from '../lib/portfolio';
+import { RpcSettingsLink } from './RpcSettings';
 import { useStore } from '../state/store';
 
 const MAX_CHIPS = 24;
@@ -47,10 +48,17 @@ export function Portfolio({
   address,
   selectedKey,
   onPick,
+  onLoaded,
 }: {
   address: string;
   selectedKey?: string | null;
   onPick: (h: Holding) => void;
+  /**
+   * The scan result, published to whoever composes this card. ONE writer: this component scans and
+   * caches, the Deposit page reads what it publishes — the chips and the "Pay with" picker are the
+   * same holdings, not two lists that can disagree (T31 G).
+   */
+  onLoaded?: (p: PortfolioData | null) => void;
 }) {
   const { wallet, data } = useStore();
   const { chains, loading: chainsLoading, error: dataError } = data;
@@ -63,6 +71,15 @@ export function Portfolio({
   const row = useRef<HTMLDivElement>(null);
   const { provider, chainId } = wallet;
 
+  /**
+   * T31 F (admin, 2026-09-10): "You need to cache balances result to avoid update during same or
+   * next update session, if user can't see some balances, he can just click refresh btn."
+   *
+   * So a cached result is rendered whatever its age — no TTL, no automatic re-read on a tab switch,
+   * a reconnect or the next session — and the ONLY scan that happens without the Refresh button is
+   * the first one for an address this browser has never scanned. Thirty public RPCs are not
+   * something to spend because a page was opened again.
+   */
   const scan = useCallback(
     async (force: boolean) => {
       if (!chains.length) return;
@@ -98,10 +115,22 @@ export function Portfolio({
     [address, chains, provider, chainId],
   );
 
+  // A NEW address starts from nothing (two wallets keep two caches, and neither is shown for the
+  // other); everything else — a chain switch in the wallet, a re-render — must not blank the chips
+  // that are already on screen and must never start a scan of its own.
+  const shownFor = useRef<string | null>(null);
   useEffect(() => {
-    setPortfolio(null);
+    if (shownFor.current !== address) {
+      shownFor.current = address;
+      setPortfolio(null);
+      setLive([]);
+    }
     void scan(false);
   }, [address, chains, scan]);
+
+  useEffect(() => {
+    onLoaded?.(portfolio);
+  }, [portfolio, onLoaded]);
 
   // mid-scan the chips come from the chains that already answered; when the scan lands the priced,
   // fully sorted portfolio replaces them
@@ -114,6 +143,8 @@ export function Portfolio({
   const firstKey = chips[0]?.key;
   const totalUsd = holdings.reduce((s, h) => s + (h.usd ?? 0), 0);
   const settled = !!portfolio && !scanning;
+  /** EVM chains no endpoint could be read through — the failure a different endpoint might fix. */
+  const unreadable = evm.filter((c) => c.via === 'none');
 
   // How the scan went — chains read, chains skipped, unreachable endpoints, missing prices — is not
   // something a depositor acts on, so it is the Refresh button's tooltip rather than a line of text
@@ -153,7 +184,11 @@ export function Portfolio({
               {fmtUsd(totalUsd)}
             </span>
           )}
-          {settled && <span className="tiny muted">as of {fmtAgo(portfolio.at)}</span>}
+          {settled && (
+            <span className="tiny muted" data-testid="portfolio-as-of" title={new Date(portfolio.at).toLocaleString()}>
+              as of {fmtAgo(portfolio.at)}
+            </span>
+          )}
           <button
             type="button"
             className="btn btn-sm"
@@ -164,6 +199,9 @@ export function Portfolio({
           >
             {scanning ? 'Scanning…' : 'Refresh'}
           </button>
+          {/* T54 — the second way into the endpoint settings, where a person who just watched a
+              chain fail to load is actually looking. The header's gear is the first. */}
+          <RpcSettingsLink testId="rpc-settings-portfolio">Endpoints</RpcSettingsLink>
         </div>
       </div>
 
@@ -181,7 +219,19 @@ export function Portfolio({
           </div>
         </div>
       )}
-      {error && <div className="banner banner-error">Scan failed: {error}</div>}
+      {error && (
+        <div className="banner banner-error">
+          Scan failed: {error} <RpcSettingsLink>Try a different endpoint</RpcSettingsLink>
+        </div>
+      )}
+      {/* An RPC that could not be read is the ONE scan note a person can do something about, so it
+          is the one that gets a line of its own — with the way to act on it beside it (T54). */}
+      {settled && unreadable.length > 0 && (
+        <p className="tiny muted" data-testid="portfolio-unreadable">
+          Could not read {unreadable.map((c) => c.name).join(', ')} — the endpoint did not answer.{' '}
+          <RpcSettingsLink testId="rpc-settings-unreadable">Choose another</RpcSettingsLink>
+        </p>
+      )}
 
       {(chips.length > 0 || settled) && (
         <div className="stack">

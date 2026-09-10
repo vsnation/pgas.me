@@ -75,10 +75,20 @@ TERMINAL_EXPECT_REFUSALS = frozenset(
     }
 )
 
-# A Beam SBBS ("regular") address is 64 hex characters, 66 with the parity byte. A max-privacy
-# or offline token is base58 and far longer. Shielding to a regular address would "succeed"
-# and shield nothing, so the shape is checked before the first chunk.
-_SBBS_RE = re.compile(r"^[0-9a-fA-F]{64,66}$")
+# A Beam SBBS ("regular") address is `hex(PeerID)` — 32 bytes, 64 characters — followed by the
+# BBS channel in hex WITH ITS LEADING ZEROS STRIPPED, so the string is 64 characters plus a tail
+# of 0–8. A max-privacy or offline token is base58 and far longer. Shielding to a regular
+# address would "succeed" and shield nothing, so the shape is checked before the first chunk.
+#
+# ⛔ THE UPPER BOUND WAS 66 AND THAT WAS A GUESS ("64, 66 with the parity byte") — there is no
+# parity byte here, the tail is a channel number. It refused the live wallet's own addresses:
+# on 2026-09-10 (T3s) `/create_wallet` answered a **67-character** regular address and the UTXO
+# split refused to start, with a second 67-character regular address (BeamPay's own "default")
+# already sitting in the same address book. 72 = 64 + the 8 hex digits a uint32 channel can
+# need. Widening it makes the classifier MORE accurate at all three call sites, and the one
+# that demands "NOT regular" (`_prove_mp_address`) therefore becomes stricter, never looser —
+# nothing else in this system is a bare 64–72-character hex string.
+_SBBS_RE = re.compile(r"^[0-9a-fA-F]{64,72}$")
 
 # `/transactions` answers at most 100 rows per call (api.py:461, `le=100`).
 PAGE = 100
@@ -125,7 +135,7 @@ def treasury_address() -> str:
 
 
 def looks_like_regular_address(address: str) -> bool:
-    """True for a 64/66-hex SBBS address — i.e. NOT a max-privacy or offline token."""
+    """True for a 64–72-hex SBBS address — i.e. NOT a max-privacy or offline token."""
     return bool(_SBBS_RE.match((address or "").strip()))
 
 
@@ -473,6 +483,40 @@ class BeamPay:
             return row
         return None
 
+    async def find_tx_by_id(
+        self, txid: str, since_ts: float, max_pages: int = MAX_PAGES
+    ) -> dict[str, Any] | None:
+        """ONE transaction of ANY kind, matched on the id **we** chose (§IDENTITY-BEATS-BALANCE).
+
+        ⚠️ THE WALK CARRIES NO ADDRESS FILTER, AND IT HAS TO. `/transactions` filters on
+        `sender`/`receiver` (api.py:468), and the transaction this exists for — a `tx_split` —
+        has BOTH of them EMPTY: measured on the box 2026-09-10 17:55Z, tx
+        `390def92c7deb2e9c0274b73daaeef57` came back `sender: '' receiver: ''
+        sender_identity: '' receiver_identity: ''`, NOT the fresh walletID
+        `simple_transaction.cpp:36-42` puts in MyID and PeerID (which is what BeamPay patch #10
+        was written against, and why it refused to book a live split until #10b). Either way no
+        address filter can match it; the unfiltered walk can, because `process_payments.py:479`
+        inserts every non-contract tx into `db.txs` whether or not it can book it.
+
+        ⛔ `/internal/contract_tx/{txid}` is NOT the route for this: it answers
+        `400 not_a_contract_tx` for anything that is not tx_type 12 (api.py:997).
+
+        None means "BeamPay's processor has not recorded it yet" — and only that, because
+        `_walk` RAISES on an incomplete read rather than letting a short scan read as absence."""
+        want = str(txid or "").lower()
+        if not want:
+            raise BeamPayError("find_tx_by_id needs a txid — a walk with nothing to match is not a search")
+        found: dict[str, Any] = {}
+
+        def visit(row: dict[str, Any]) -> bool:
+            if str(row.get("txId") or "").lower() != want:
+                return False
+            found.update(row)
+            return True
+
+        await self._walk(None, since_ts, visit, max_pages=max_pages)
+        return found or None
+
     async def find_txs_by_comments(
         self,
         address: str,
@@ -569,6 +613,99 @@ class BeamPay:
         key reach it? Probing by POSTing a real registration would leave a claim behind on a
         txid that may never exist."""
         return await self.call("GET", "/internal/expect_contract_tx", internal=True)
+
+    # ------------------------------------------- self-transactions (BeamPay patch #10, T36c)
+
+    async def expect_self_tx(
+        self,
+        txid: str,
+        address: str,
+        trade_ref: str,
+        *,
+        kind: str,
+        asset_id: int,
+        expected_fee_groth: int | None = None,
+    ) -> dict[str, Any]:
+        """Claim, IN ADVANCE, that this SELF-transaction's kernel fee belongs to this address.
+
+        A `tx_split` is `TxType::Simple` with sender == receiver == an address the WALLET
+        invented, so BeamPay books nothing for it and its kernel fee leaves the ledger reading
+        above the wallet for ever. This registration is what turns that into a booking — and
+        like `expect_contract_tx` it carries no amount and cannot: the fee comes from the
+        settled transaction's own `fee` field. `expected_fee_groth` is our PREDICTION, which
+        BeamPay never books; it only decides whether a wildly different charge is said out loud.
+
+        ⛔ IT MUST BE SENT BEFORE THE WALLET IS ASKED FOR THE TRANSACTION. BeamPay refuses a
+        registration for a tx it has already finished with (`409 tx_already_booked`), because
+        the branch that would consume it has already run. Idempotent on the txid, so a retry of
+        a POST whose reply was lost is safe."""
+        body: dict[str, Any] = {
+            "txid": str(txid),
+            "address": str(address),
+            "trade_ref": str(trade_ref),
+            "kind": str(kind),
+            "asset_id": int(asset_id),
+        }
+        if expected_fee_groth is not None:
+            body["expected_fee_groth"] = int(expected_fee_groth)
+        return await self.call(
+            "POST", "/internal/expect_self_tx", body=body, internal=True
+        )
+
+    async def self_tx(self, txid: str) -> dict[str, Any] | None:
+        """`GET /internal/self_tx/{txid}` — the registration and what was booked under it.
+
+        THIS IS THE AUTHORITY, not our own POST reply: the reply can be lost in transit while
+        the booking still happens later, in BeamPay's processor, so what actually became of the
+        fee is this row. `status` is the answer — `consumed` carries `booked` and the fee that
+        was really charged; `abandoned`/`expired` carry `error`.
+
+        None means **`expectation_not_found`** — BeamPay has this route and has never heard of
+        that txid.
+
+        ⛔ A ROUTING 404 IS NOT AN ANSWER, and here the two 404s mean opposite things. A build
+        without patch #10 answers `{"detail": "Not Found"}` for every txid, and collapsing that
+        to None would read a version-skewed BeamPay as "you never registered it" — which is the
+        one sentence that would make the command give up on a fee that IS booked."""
+        status, parsed = await self._request(
+            "GET", f"/internal/self_tx/{txid}", internal=True
+        )
+        if status == 404 and _detail_of(parsed) == "expectation_not_found":
+            return None
+        if status >= 400:
+            detail = parsed.get("detail") if isinstance(parsed, dict) else parsed
+            raise BeamPayError(
+                f"self_tx({txid[:12]}…): HTTP {status} {str(detail)[:160]}",
+                status=status,
+                detail=detail,
+            )
+        if not isinstance(parsed, dict) or "status" not in parsed:
+            raise BeamPayError(f"self_tx({txid[:12]}…): unexpected shape {str(parsed)[:120]}")
+        return parsed
+
+    async def self_tx_route_ready(self) -> dict[str, Any] | None:
+        """Side-effect-free preflight: does THIS deployment book self-transactions?
+
+        `None` means it does not — the route is absent, i.e. BeamPay has not had patch #10
+        applied — and that is a real answer, distinguished from every other 404 by FastAPI's
+        own routing-miss `detail` of `Not Found`. Anything unreadable RAISES instead, because
+        "we could not ask" is not "the answer is no" (law 8), and the two lead to opposite
+        decisions about whether a split may run."""
+        status, parsed = await self._request(
+            "GET", "/internal/expect_self_tx", internal=True
+        )
+        if status == 404 and _detail_of(parsed) == "Not Found":
+            return None
+        if status >= 400:
+            detail = parsed.get("detail") if isinstance(parsed, dict) else parsed
+            raise BeamPayError(
+                f"self_tx_route_ready: HTTP {status} {str(detail)[:160]}",
+                status=status,
+                detail=detail,
+            )
+        if not isinstance(parsed, dict) or "available" not in parsed:
+            raise BeamPayError(f"self_tx_route_ready: unexpected shape {str(parsed)[:120]}")
+        return parsed
 
 
 def _detail_of(parsed: Any) -> str:

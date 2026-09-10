@@ -119,3 +119,107 @@ async def test_scan_locks_chunks_and_raises_on_an_unreadable_range():
     rpc.fail_ranges.add((600, 1099))
     with pytest.raises(ethpipe.RpcError):
         await ethpipe.scan_locks(rpc, pipe, 100, 1600, chunk=500)
+
+
+# ─────────────── the pool answers, not the first endpoint of it (2026-09-10, T37d) ─────────────
+#
+# `call()` stops at the FIRST endpoint that ANSWERS, and for eth_getTransactionReceipt and
+# eth_getCode a `null` / a refusal IS an answer. Both cost money on 2026-09-10: a receipt one
+# endpoint could not see yet read as "no receipt" and left lock msgId 138 (0.0019999 ETH)
+# unattributed, and a code read pinned to whichever endpoint answered the head first hit
+# publicnode's "Archive requests require a personal token" every 30 s, so no payout was released.
+
+CODE = "0x60006000fd"
+
+
+def patch_post(monkeypatch, fn):
+    monkeypatch.setattr(ethpipe.Rpc, "_post", fn)
+
+
+async def test_receipt_asks_every_endpoint_not_only_the_first(monkeypatch):
+    """The first endpoint answers `null` for a receipt the second one has. `null` is an answer,
+    so `call()` stopped there — and the caller read it as "not mined yet"."""
+
+    async def per_url(self, c, url, method, params):
+        assert method == "eth_getTransactionReceipt"
+        return {"status": "0x1", "logs": []} if url == "https://b" else None
+
+    patch_post(monkeypatch, per_url)
+    rpc = ethpipe.Rpc(urls=["https://a", "https://b"], timeout=8.0)
+    rec = await rpc.receipt("0x" + "aa" * 32)
+    assert rec and rec["status"] == "0x1"
+
+
+async def test_a_receipt_no_endpoint_answers_is_unreadable_never_absent(monkeypatch):
+    """§an unreadable query is not evidence of anything. Every endpoint erroring is "ask again",
+    never "there is no receipt" — the caller must not conclude from it."""
+
+    async def broken(self, c, url, method, params):
+        raise ethpipe.RpcError(f"{url}: 429 Too Many Requests", url=url)
+
+    patch_post(monkeypatch, broken)
+    rpc = ethpipe.Rpc(urls=["https://a", "https://b"], timeout=8.0)
+    with pytest.raises(ethpipe.RpcError, match="no endpoint answered"):
+        await rpc.receipt("0x" + "aa" * 32)
+
+
+async def test_every_endpoint_answering_null_is_a_receipt_that_is_not_mined_yet(monkeypatch):
+    """The other half: endpoints that DID answer and none has it is an honest None."""
+
+    async def nothing(self, c, url, method, params):
+        return None
+
+    patch_post(monkeypatch, nothing)
+    rpc = ethpipe.Rpc(urls=["https://a", "https://b"], timeout=8.0)
+    assert await rpc.receipt("0x" + "aa" * 32) is None
+
+
+async def test_code_at_head_anywhere_fails_over_to_an_endpoint_that_will_serve_the_read(
+    monkeypatch,
+):
+    """publicnode answers the head and then refuses the code read at it. The remedy for an
+    endpoint that will not serve a query is MORE endpoints (law 8), never a lower bar."""
+    asked: list[tuple[str, str, tuple]] = []
+
+    async def per_url(self, c, url, method, params):
+        asked.append((url, method, tuple(params)))
+        if method == "eth_blockNumber":
+            return hex(100 if url == "https://a" else 120)
+        if url == "https://a":
+            raise ethpipe.RpcError(
+                f"{url}: Archive requests require a personal token", url=url
+            )
+        return CODE
+
+    patch_post(monkeypatch, per_url)
+    rpc = ethpipe.Rpc(urls=["https://a", "https://b"], timeout=8.0)
+    code, head, url = await ethpipe.code_at_head_anywhere(rpc, "0x" + "11" * 20)
+    assert (code, head, url) == (CODE, 120, "https://b")
+    # each endpoint was asked for ITS OWN head, and the code read was pinned to that head
+    assert ("https://a", "eth_getCode", ("0x" + "11" * 20, hex(100))) in asked
+    assert ("https://b", "eth_getCode", ("0x" + "11" * 20, hex(120))) in asked
+
+
+async def test_code_at_head_anywhere_is_unreadable_when_every_endpoint_refuses(monkeypatch):
+    async def broken(self, c, url, method, params):
+        raise ethpipe.RpcError(f"{url}: Can't route your request", url=url)
+
+    patch_post(monkeypatch, broken)
+    rpc = ethpipe.Rpc(urls=["https://a", "https://b"], timeout=8.0)
+    with pytest.raises(ethpipe.RpcError, match="no endpoint"):
+        await ethpipe.code_at_head_anywhere(rpc, "0x" + "11" * 20)
+
+
+async def test_code_at_head_anywhere_refuses_an_implausible_head(monkeypatch):
+    """A node that says block 0 has not told us where the chain is. `"0x"` from it is not
+    "this is a wallet" — it is nothing at all, so the next endpoint is asked instead."""
+
+    async def per_url(self, c, url, method, params):
+        if method == "eth_blockNumber":
+            return hex(0 if url == "https://a" else 77)
+        return "0x"
+
+    patch_post(monkeypatch, per_url)
+    rpc = ethpipe.Rpc(urls=["https://a", "https://b"], timeout=8.0)
+    code, head, url = await ethpipe.code_at_head_anywhere(rpc, "0x" + "11" * 20)
+    assert (code, head, url) == ("0x", 77, "https://b")

@@ -1,0 +1,287 @@
+diff --git a/shaders/pipe_app.cpp b/shaders/pipe_app.cpp
+index 69f7dea..14ef81c 100644
+--- a/shaders/pipe_app.cpp
++++ b/shaders/pipe_app.cpp
+@@ -19,6 +19,9 @@ namespace
+     const char* MSG_ID = "msgId";
+     const char* START_FROM = "startFrom";
+     const char* RELAYER = "relayer";
++    const char* INDEX = "index";
++    const char* MAX_INDEX = "maxIndex";
++    const char* INDEXES = "indexes";
+ 
+     namespace Actions
+     {
+@@ -42,6 +45,86 @@ namespace
+         Env::DocAddText("error", sz);
+     }
+ 
++    // ── Receiver keys ──────────────────────────────────────────────────────────────────
++    // The key a bridge message names is derived by THIS wallet from a blob (Env::DerivePk).
++    // Upstream the blob is the contract id alone, so a wallet owns exactly one receiver key
++    // per pipe and every message ever sent to it names the same 33 bytes. This build adds an
++    // index: KeyID{cid, index} is a different blob, hence a different key, signed for by the
++    // same wallet through the same SigRequest mechanism the contract already authorises
++    // (Method_4 does Env::AddSig(msg.m_UserPK) — whichever key the message names).
++    // Index 0 — or no index at all — is the LEGACY blob, byte-for-byte what upstream derives,
++    // so every message already delivered to this wallet stays claimable and every call that
++    // does not mention an index behaves exactly as before.
++#pragma pack (push, 1)
++    struct UserKeyID
++    {
++        ContractID m_Cid;   // first, so the legacy blob is this struct's first 32 bytes
++        uint64_t m_Index;
++    };
++#pragma pack (pop)
++    static_assert(sizeof(UserKeyID) == sizeof(ContractID) + sizeof(uint64_t), "UserKeyID must be packed");
++
++    struct UserKey
++    {
++        // Owns the blob a SigRequest points into: it must outlive Env::GenerateKernel.
++        UserKeyID m_Kid;
++
++        void Init(const ContractID& cid, uint64_t idx)
++        {
++            _POD_(m_Kid.m_Cid) = cid;
++            m_Kid.m_Index = idx;
++        }
++
++        const void* get_Ptr() const { return &m_Kid; }
++        uint32_t get_Size() const { return m_Kid.m_Index ? sizeof(m_Kid) : sizeof(m_Kid.m_Cid); }
++
++        void DerivePk(PubKey& pk) const { Env::DerivePk(pk, get_Ptr(), get_Size()); }
++        void get_Sig(SigRequest& sig) const { sig.m_pID = get_Ptr(); sig.m_nID = get_Size(); }
++    };
++
++    // The receiver keys a view matches messages against: the legacy key (index 0) plus a
++    // bounded window and/or an explicit list of indexed keys. Bounded, so one call can never
++    // be asked to derive an unbounded number of keys.
++    struct UserKeySet
++    {
++        static const uint32_t s_MaxIndexed = 256;
++        static const uint32_t s_MaxKeys = s_MaxIndexed + 1;
++
++        uint32_t m_Count = 0;
++        uint64_t m_pIndex[s_MaxKeys];
++        PubKey m_pPk[s_MaxKeys];
++
++        bool Add(const ContractID& cid, uint64_t idx)
++        {
++            for (uint32_t i = 0; i < m_Count; i++)
++                if (m_pIndex[i] == idx)
++                    return true; // already in the set
++
++            if (m_Count >= s_MaxKeys)
++                return false;
++
++            UserKey uk;
++            uk.Init(cid, idx);
++            uk.DerivePk(m_pPk[m_Count]);
++            m_pIndex[m_Count] = idx;
++            m_Count++;
++            return true;
++        }
++
++        bool Find(const PubKey& pk, uint64_t& idx) const
++        {
++            for (uint32_t i = 0; i < m_Count; i++)
++            {
++                if (_POD_(m_pPk[i]) == pk)
++                {
++                    idx = m_pIndex[i];
++                    return true;
++                }
++            }
++            return false;
++        }
++    };
++
+     struct ParamsPlus : public Pipe::Params
+     {
+         bool get(const ContractID& cid)
+@@ -88,14 +171,14 @@ namespace
+             return true;
+         }
+ 
+-        bool MoveNext(const PubKey* pPk)
++        bool MoveNext(const UserKeySet* pKeys, uint64_t& idx)
+         {
+             while (true)
+             {
+                 if (!m_Reader.MoveNext_T(m_Key, m_Msg))
+                     return false;
+ 
+-                if (pPk && (_POD_(*pPk) != m_Msg.m_UserPK))
++                if (pKeys && !pKeys->Find(m_Msg.m_UserPK, idx))
+                     continue;
+ 
+                 return true;
+@@ -103,7 +186,7 @@ namespace
+         }
+     };
+ 
+-    void ViewIncoming(const ContractID& cid, const PubKey* pPk, uint64_t iStartFrom)
++    void ViewIncoming(const ContractID& cid, const UserKeySet* pKeys, uint64_t iStartFrom)
+     {
+         Env::DocArray gr("incoming");
+ 
+@@ -111,13 +194,16 @@ namespace
+         if (!wlk.Restart(iStartFrom))
+             return;
+ 
+-        while (wlk.MoveNext(pPk))
++        uint64_t idx = 0;
++        while (wlk.MoveNext(pKeys, idx))
+         {
+             Env::DocGroup gr("");
+             Env::DocAddNum("MsgId", Utils::FromBE(wlk.m_Key.m_KeyInContract.m_MsgId_BE));
+             Env::DocAddNum("amount", wlk.m_Msg.m_Amount);
+ 
+-            if (!pPk)
++            if (pKeys)
++                Env::DocAddNum("index", idx); // which of our keys this message names; 0 = legacy
++            else
+                 Env::DocAddBlob_T("User", wlk.m_Msg.m_UserPK);
+         }
+     }
+@@ -173,9 +259,16 @@ namespace manager
+         ContractID cid;
+         Env::DocGet(CONTRACT_ID, cid);
+ 
++        uint64_t idx = 0;
++        Env::DocGet(INDEX, idx); // absent → 0 → the legacy blob
++
++        UserKey uk;
++        uk.Init(cid, idx);
++
+         PubKey pk;
+-        Env::DerivePk(pk, &cid, sizeof(cid));
++        uk.DerivePk(pk);
+         Env::DocAddBlob_T("pk", pk);
++        Env::DocAddNum("index", idx);
+     }
+ 
+     void SendFunds()
+@@ -242,15 +335,32 @@ namespace manager
+             return;
+         }
+ 
++        uint64_t idx = 0;
++        Env::DocGet(INDEX, idx); // absent → 0 → the legacy blob
++
++        UserKey uk; // outlives GenerateKernel: the SigRequest points into it
++        uk.Init(cid, idx);
++
++        // Refuse early what the contract would refuse late: Method_4 needs a signature by the
++        // key the message names, and the wallet can only sign for the blob it is handed. A
++        // mismatch here would otherwise become a kernel the node rejects.
++        PubKey pk;
++        uk.DerivePk(pk);
++        if (_POD_(pk) != msg.m_UserPK)
++        {
++            OnError("receiver key mismatch: this message was not sent to the key of this index");
++            return;
++        }
++
+         FundsChange fc;
+         fc.m_Aid = params.m_AssetID;
+         fc.m_Amount = msg.m_Amount;
+         fc.m_Consume = 0;
+ 
+         SigRequest sig;
+-        sig.m_pID = &cid;
+-        sig.m_nID = sizeof(cid);
++        uk.get_Sig(sig);
+ 
++        Env::DocAddNum("index", idx);
+         Env::GenerateKernel(&cid, args.s_iMethod, &args, sizeof(args), &fc, 1, &sig, 1, "Receive funds", 1200000);
+     }
+ 
+@@ -300,10 +410,58 @@ namespace manager
+         Env::DocGet(CONTRACT_ID, cid);
+         Env::DocGet(START_FROM, startFrom);
+ 
+-        PubKey pk;
+-        Env::DerivePk(pk, &cid, sizeof(cid));
++        UserKeySet keys;
++        keys.Add(cid, 0); // the legacy key, always
++
++        // Explicit list: indexes=<n;n;n>. The wallet splits the whole args string on ',', so
++        // the list separator is anything that is not a digit — ';' by convention.
++        char szList[2048];
++        uint32_t nList = Env::DocGetText(INDEXES, szList, sizeof(szList));
++        if (nList > sizeof(szList))
++        {
++            OnError("indexes list too long");
++            return;
++        }
++
++        uint64_t maxIndex = 0;
++        bool bHaveMax = Env::DocGet(MAX_INDEX, maxIndex);
++
++        if (nList > 1)
++        {
++            uint64_t v = 0;
++            bool bDigits = false;
++            for (uint32_t i = 0; ; i++)
++            {
++                char c = szList[i];
++                if ((c >= '0') && (c <= '9'))
++                {
++                    v = v * 10 + (c - '0');
++                    bDigits = true;
++                    continue;
++                }
++                if (bDigits && !keys.Add(cid, v))
++                {
++                    OnError("too many indexes (max 256)");
++                    return;
++                }
++                v = 0;
++                bDigits = false;
++                if (!c)
++                    break;
++            }
++        }
++        else if (!bHaveMax)
++            maxIndex = 64; // the default window when neither a list nor a bound is given
++
++        if (maxIndex > UserKeySet::s_MaxIndexed)
++        {
++            OnError("maxIndex too large (max 256)");
++            return;
++        }
++        for (uint64_t i = 1; i <= maxIndex; i++)
++            keys.Add(cid, i);
+ 
+-        ViewIncoming(cid, &pk, startFrom);
++        ViewIncoming(cid, &keys, startFrom);
+     }
+ 
+     void GetLocalMsgCount()
+@@ -429,6 +587,7 @@ BEAM_EXPORT void Method_0()
+     {
+         Env::DocGroup grMethod(Actions::GET_PK);
+         Env::DocAddText(CONTRACT_ID, "ContractID");
++        Env::DocAddText(INDEX, "uint64 (optional; absent or 0 = the legacy key)");
+     }
+     {
+         Env::DocGroup grMethod(Actions::SEND);
+@@ -441,6 +600,7 @@ BEAM_EXPORT void Method_0()
+         Env::DocGroup grMethod(Actions::RECEIVE);
+         Env::DocAddText(CONTRACT_ID, "ContractID");
+         Env::DocAddText(MSG_ID, "uint64");
++        Env::DocAddText(INDEX, "uint64 (optional; absent or 0 = the legacy key)");
+     }
+     {
+         Env::DocGroup grMethod(Actions::PUSH_REMOTE);
+@@ -454,6 +614,9 @@ BEAM_EXPORT void Method_0()
+     {
+         Env::DocGroup grMethod(Actions::VIEW_INCOMING);
+         Env::DocAddText(CONTRACT_ID, "ContractID");
++        Env::DocAddText(START_FROM, "uint64 (optional; first MsgId to list)");
++        Env::DocAddText(MAX_INDEX, "uint64 (optional; keys 1..maxIndex, at most 256; default 64 when no list)");
++        Env::DocAddText(INDEXES, "text (optional; ';'-separated key indexes)");
+     }
+     {
+         Env::DocGroup grMethod(Actions::LOCAL_MSG_COUNT);

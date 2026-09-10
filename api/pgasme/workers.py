@@ -36,7 +36,7 @@ from typing import Any
 
 import httpx
 
-from . import beampay, ethpipe, ledger, scanner, tg, uniswap, xchain
+from . import beampay, ethpipe, ledger, scanner, tg, tokens, uniswap, xchain
 from .assets import ASSETS
 from .config import settings
 from .db import db
@@ -70,6 +70,13 @@ SLA_S: dict[str, float] = {
     "releasing": 15 * 60,
     "bridging": 3 * 3600,
     "delivering": 18 * 3600,
+    # ⛔ `paying` IS AN ACTIVE STATUS TOO (T34b M1). It is the instant path's in-flight state:
+    # the transfer is signed, the ETH has left as far as we can prove, and the row is waiting for
+    # a receipt. It was the one active status with no SLA at all — so a payout whose receipt no
+    # endpoint would answer aged here in silence, which is the outcome every other status on this
+    # list exists to prevent. 15 min is the same figure `PGAS_INSTANT_STUCK_AFTER_S` uses for the
+    # handler's own page; this is the monitor's independent one, for the rows a pass never reached.
+    "paying": 15 * 60,
 }
 TREASURY_SLA_S: dict[str, float] = {"claiming": 30 * 60, "shielding": 2 * 3600}
 NOT_DARK = {"dark": {"$ne": True}}
@@ -508,6 +515,193 @@ async def _reverify(dep: dict[str, Any]) -> None:
         await _set(dep["_id"], verified=True)
 
 
+# ----------------------------------------------------------------------------- the chain's own re-check
+
+
+def unseen_since(dep: dict[str, Any]) -> float:
+    """When this row started waiting to be SEEN. Registration stamps `unseen_since`; a row from
+    before this build falls back to when it was created rather than becoming ageless."""
+    return float(dep.get("unseen_since") or dep.get("created_at") or 0.0)
+
+
+async def _identity_reason(dep: dict[str, Any], tx: dict[str, Any]) -> str | None:
+    """The SAME question POST /v1/deposits asked, asked again now that an endpoint can see the
+    transaction — against the quote the row was built from, because that is where the calldata
+    and the reference live. A row whose quote is gone is checked against what it kept itself."""
+    q = await db().quotes.find_one({"_id": dep.get("quote_id")}) or {
+        "address": dep.get("address"),
+        "pubkey": dep.get("pubkey"),
+        "value_units": (dep.get("eth") or {}).get("value_units"),
+        "relayer_fee_units": (dep.get("eth") or {}).get("relayer_fee_units"),
+        "deposit_ref": dep.get("deposit_ref"),
+    }
+    if xchain.norm_mode(dep.get("mode")) == uniswap.MODE:
+        ref = str(q.get("deposit_ref") or dep.get("deposit_ref") or "")
+        if not ref:
+            return None  # nothing to check it against; the scanner's hook log still decides
+        return scanner.uniswap_identity_reason(tx, q, ref)
+    return scanner.direct_identity_reason(tx, q, ASSETS[dep["asset"]])
+
+
+async def _reverify_chain(dep: dict[str, Any]) -> None:
+    """Prove — or fail — a `direct`/`uniswap` row that was registered before any Ethereum
+    endpoint could see its transaction.
+
+    ⛔ 2026-09-10: registration used to answer 409 "that transaction is not visible on Ethereum
+    yet" whenever the first endpoint of the pool did not hold the hash, and the prod pool's
+    first entry is a private-orderflow relay that never exposes pending transactions. Two real
+    deposits were refused, mined anyway, and landed in `unattributed_locks`. Registration now
+    opens the row unverified; THIS is the other half of that trade — the evidence is asked for
+    again on every pass, so `verified: false` is a state that ends, one way or the other:
+
+      * visible and this quote's       → verified, with what the transaction itself proves;
+      * visible and NOT this quote's   → failed, and the hash is released so the person who
+                                         really signed it can register it (`_mismatch`) —
+                                         but never once money has already landed, because the
+                                         scanner proved that lock's identity independently;
+      * never visible in PGAS_UNSEEN_TX_TTL_S → failed with the reason, paged once, and the
+                                         hash released. If it does turn up later, the scanner
+                                         attributes the lock straight from the quote.
+      * no endpoint could answer       → nothing. An unreadable query is not a verdict.
+    """
+    now = time.time()
+    tx, answered, errors = await ethpipe.visible_tx(get_rpc(), dep["src_tx_hash"])
+    landed = bool((dep.get("eth") or {}).get("tx"))
+    if tx is None:
+        if not answered:
+            return
+        waited = now - unseen_since(dep)
+        if landed or dep["status"] != "submitted" or waited <= settings.unseen_tx_ttl_s:
+            return
+        # the NOTE is what the user reads, so it says what happened and what to do — never
+        # which endpoint said what. The endpoint diagnostics go on the row, where the operator
+        # looks: a refusal must be explainable without being unreadable.
+        note = (
+            f"no Ethereum endpoint has seen this transaction in {int(waited // 60)} min. "
+            "Nothing was credited. If you did send it, register it again."
+        )
+        res = await db().deposits.update_one(
+            {"_id": dep["_id"], "status": "submitted"},
+            {
+                "$set": {
+                    "status": "failed",
+                    "updated_at": now,
+                    "verified": False,
+                    "src_tx_hash_unseen": dep.get("src_tx_hash"),
+                    "unseen_failed_at": now,
+                    # ⛔ operator diagnostics, and they stay ON THE ROW: they carry endpoint URLs
+                    # verbatim. `routers/account.PRIVATE_DEPOSIT_FIELDS` keeps them off the wire.
+                    "unseen_errors": errors[:8],
+                    "note": note,
+                },
+                # the hash goes back: it was never proven to be anyone's, and holding it would
+                # lock the person who did sign it out of registering it forever
+                "$unset": {"src_tx_hash": ""},
+            },
+        )
+        # ONE page per row: the row is not `submitted` any more, so this branch cannot be
+        # reached for it again — and the page follows the WRITE, not the attempt, so a row
+        # another path settled inside this same pass is not announced as failed by this one.
+        # raw text: `tg.format_event` is the ONE place that escapes an event's text, and
+        # escaping it twice here would page the operator in &amp;-speak
+        if res.modified_count:
+            await tg.alert("deposit_unseen", f"Deposit FAILED: {note}", deposit_id=dep["_id"])
+        return
+    why = await _identity_reason(dep, tx)
+    if why:
+        if landed or dep["status"] != "submitted":
+            # money is already in the pipe and the scanner matched it on its own evidence. This
+            # check is the weaker one here; it never fails a row whose deposit has landed.
+            log.warning("reverify: %s is past submitted and %s", dep["_id"], why)
+            return
+        # Was this hash CONTESTED? Several accounts may hold a claim on one hash (a hash is
+        # public; scanner.claims_on), and identity resolves it for exactly one of them. Losing
+        # that is contention, not an incident: the row is failed with a note and NOBODY IS
+        # PAGED. A LONE mismatch — this row is the only claim and the transaction is still not
+        # its quote's — is the incident `_mismatch` announces, and that alert is unchanged.
+        if await scanner.claims_on(str(dep.get("src_tx_hash") or ""), dep["_id"]):
+            await scanner.fail_claims([dep])
+            return
+        await _mismatch(dep, why)
+        return
+    fields: dict[str, Any] = {"verified": True, "verified_at": now, "verified_by": "chain"}
+    if block := tx.get("blockNumber"):
+        try:
+            fields["eth.tx_block"] = int(str(block), 16)
+        except (TypeError, ValueError):
+            pass
+    if dep["status"] == "submitted" and xchain.norm_mode(dep.get("mode")) == "direct":
+        # Before the lock lands, the row's amounts came from the quote. The calldata that is now
+        # readable on-chain is the same numbers from a stronger source — and identity above just
+        # proved they ARE the same. Once `lock_deposit` has written the LOG's numbers they are
+        # the money and nothing here may touch them (law 9: one writer per fact).
+        try:
+            call = ethpipe.decode_send_funds(str(tx.get("input") or tx.get("data") or ""))
+            fields |= {
+                "eth.value_units": str(call["value"]),
+                "eth.relayer_fee_units": str(call["relayer_fee"]),
+            }
+        except (ValueError, KeyError):
+            pass
+    await _set(dep["_id"], **fields)
+    # …and the row stops saying it is waiting to be seen. The note is cleared ONLY when it is
+    # still the one registration wrote (`ethpipe.UNSEEN_NOTE`): any other note on this row was
+    # put there by something that knows more than this pass does.
+    unset: dict[str, str] = {"unseen_since": "", "unseen_reason": ""}
+    if dep.get("note") == ethpipe.UNSEEN_NOTE:
+        unset["note"] = ""
+    await db().deposits.update_one({"_id": dep["_id"]}, {"$unset": unset})
+    # Identity has now spoken for this hash, so every OTHER claim on it is refused — one helper,
+    # called from every path that proves a row (registration does the same at insert time).
+    await scanner.fail_claims(await scanner.claims_on(dep["src_tx_hash"], dep["_id"]))
+    # …and THIS is where a row that was opened unseen becomes a deposit the operator is told
+    # about. Registration writes no event for one (an unproven claim is not a deposit and
+    # paging on one pages on anything anyone types); the transition to verified is the event,
+    # and it happens once because the row is never re-verified afterwards.
+    if dep.get("unseen_since"):
+        await tg.queue(
+            "deposit_submitted",
+            f"Deposit submitted ({xchain.norm_mode(dep.get('mode'))}): {dep.get('asset')} "
+            f"≈ {tg.fmt_groth(int(dep.get('value_groth') or 0))} — seen on Ethereum and verified",
+            deposit_id=dep["_id"],
+        )
+
+
+async def chain_secondary() -> int:
+    """Every `direct`/`uniswap` row still carrying `verified: false`. Bounded and oldest first,
+    because a row that will never be seen must not keep newer ones out of the pass."""
+    cur = (
+        db()
+        .deposits.find(
+            {
+                "mode": {"$in": ["direct", uniswap.MODE]},
+                "verified": {"$ne": True},
+                "src_tx_hash": {"$type": "string"},
+                "status": {"$nin": ["failed"]},
+                "created_at": {"$gte": time.time() - REVERIFY_WINDOW_S},
+            }
+        )
+        .sort("created_at", 1)
+        .limit(100)
+    )
+    n = 0
+    for dep in await cur.to_list(100):
+        try:
+            await _reverify_chain(dep)
+            n += 1
+        except ethpipe.RpcError as e:  # unreadable is never a verdict — try again next pass
+            log.info("reverify %s: %s", dep["_id"], e)
+        except Exception as e:  # noqa: BLE001 — one bad row must not block the others
+            log.exception("reverify %s: %s", dep["_id"], e)
+            await tg.send(
+                f"Re-verification failed on <code>{dep['_id']}</code>: "
+                f"{tg.esc(f'{type(e).__name__}: {e}')[:300]}",
+                key=f"reverify-err:{dep['_id']}",
+                cooldown_s=900,
+            )
+    return n
+
+
 async def xchain_secondary() -> int:
     cur = (
         db()
@@ -558,8 +752,18 @@ async def xchain_secondary() -> int:
 
 
 async def deposit_watcher_once() -> dict[str, Any]:
+    # imported HERE and not at module scope: `payouts` imports this module for the kill switch
+    # and the RPC pool, so a top-level import would be a cycle (`start()` does the same).
+    from . import payouts
+
     rpc = get_rpc()
     out: dict[str, Any] = {"scans": []}
+    # ⛔ **THE ONE WRITER OF THE GAS BASIS** (T45). One reading per pass into `gas_samples`;
+    # `payouts.relayer_fee_for` prices every crossing at `max(the live read, the 24 h p75)` and
+    # never writes. Two writers of one fact will disagree, and this one prices money. It runs
+    # FIRST because it is one RPC call and the answer must not depend on how long the scan took;
+    # it writes no row and raises nothing when the pool will not answer (law 8).
+    out["gas"] = await payouts.record_gas_sample(rpc)
     for asset in ASSETS.values():  # PRIMARY: the chain
         try:
             out["scans"].append(await scanner.scan_pipe(asset, rpc))
@@ -571,6 +775,9 @@ async def deposit_watcher_once() -> dict[str, Any]:
                 cooldown_s=900,
             )
     out["late_attributed"] = await scanner.retry_unattributed(rpc)
+    # the other half of "registration never refuses a hash it cannot see yet": the row opened
+    # unverified is proven, failed, or left alone here, on every pass
+    out["reverified"] = await chain_secondary()
     out["confirmed"] = await confirm_locked()
     await reconcile_credits()
     out["xchain"] = await xchain_secondary()  # SECONDARY: what the chain cannot show
@@ -696,6 +903,11 @@ async def drain_events() -> int:
 
 
 async def stuck_checks() -> None:
+    # local: `payouts` imports this module at module scope, so the status names it owns can only
+    # be read from inside a function. They are read rather than spelled out because a monitor
+    # that has its own copy of a status name is the second implementation of one fact (law 9).
+    from . import payouts
+
     now = time.time()
     d = db()
     # the payout order machine: each status has its own SLA, and only the relayer's own two
@@ -710,8 +922,18 @@ async def stuck_checks() -> None:
                 if status in ("bridging", "delivering")
                 else " — no processor moved it"
             )
+            # …and `paying` is the INSTANT path, which has no relayer and no processor to blame:
+            # its transaction is signed and broadcast, so what is missing is a receipt. A page
+            # that describes the wrong machine is one the operator learns to skim (law 15).
+            what = "instant" if status == payouts.PAYING else "direct"
+            if status == payouts.PAYING:
+                tail = (
+                    " — the transaction is signed and broadcast and no receipt has been read "
+                    "back; the SAME bytes keep being offered"
+                )
             await tg.send(
-                f"STUCK: direct payout {status} for over {mins} min{tail}. <code>{r['_id']}</code>",
+                f"STUCK: {what} payout {status} for over {mins} min{tail}. "
+                f"<code>{r['_id']}</code>",
                 key=f"stuck:req:{r['_id']}:{status}",
                 cooldown_s=6 * 3600,
             )
@@ -740,7 +962,11 @@ async def stuck_checks() -> None:
             # reason mid-sentence, which meant the operator's copy of the alert ended before the
             # `replan-shield` command that resolves it — an instruction cut in half is worse
             # than no instruction. tg.cap() is the one length guard, and it marks its cut.
-            reason = str(r.get("hold_reason") or "no reason was recorded on the row")
+            # ⛔ THE OPERATOR HALF (T52). Since a payout row's `hold_reason` is the sentence
+            # written for the USER, a monitor that read it would page "Someone at Pgas.me is
+            # checking this order" — which is what the operator IS, and tells them nothing.
+            # `payouts.operator_reason` is the one reader of "why, with its numbers".
+            reason = payouts.operator_reason(r) or "no reason was recorded on the row"
             # said only when the row can prove it: a missing stamp is not "held since 1970"
             paged_at = held_paged_at(r)
             since = f" for over {int((now - paged_at) // 3600)} h" if paged_at else ""
@@ -780,13 +1006,54 @@ async def stuck_checks() -> None:
             key=f"stuck:lock:{r['_id']}",
             cooldown_s=6 * 3600,
         )
-    # a scheduled payout whose release_at has passed and which nothing has moved on
-    q = {"status": "scheduled", "release_at": {"$lt": now - PAYOUT_DUE_GRACE_S}, **NOT_DARK}
+    # a payout whose release_at has passed and which nothing has moved on.
+    # ⛔ **`delayed` IS ON THIS LIST TOO** (T40b F3). A gate refusal past the order's promised
+    # arrival now parks the row in `delayed` instead of leaving it `scheduled` with a
+    # `hold_reason` — which is right for the user and would have made this monitor blind: the
+    # rows it exists to catch are exactly the ones that have started refusing. The clock is the
+    # order's own `release_at`, not the ladder's rung, so the question it answers is unchanged —
+    # "this was due hours ago and has still not gone" — and the check below is the different
+    # one: "the ladder itself stopped".
+    q = {
+        "status": {"$in": ["scheduled", payouts.DELAYED]},
+        "release_at": {"$lt": now - PAYOUT_DUE_GRACE_S},
+        **NOT_DARK,
+    }
     for r in await d.payout_requests.find(q).limit(50).to_list(50):
         await tg.send(
-            "STUCK: payout due for over 30 min and still scheduled — no executor moved it. "
-            f"<code>{r['_id']}</code>",
+            tg.cap(
+                f"STUCK: payout due for over 30 min and still {r.get('status')} — no executor "
+                f"moved it. <code>{r['_id']}</code>"
+                + (
+                    f" — {tg.esc(payouts.operator_reason(r))}"
+                    if payouts.operator_reason(r)
+                    else ""
+                )
+            ),
             key=f"stuck:due:{r['_id']}",
+            cooldown_s=6 * 3600,
+        )
+    # ⛔ …AND A DELAYED PAYOUT WHOSE NEXT ATTEMPT NEVER CAME (T40). Nothing fails on the user's
+    # side any more: an internal cause parks the order in `delayed` with a `next_attempt_at`,
+    # and the ladder is what makes that promise good. A rung that came and went with nothing
+    # picking the row up is the ONE failure mode the new design has and the old one did not —
+    # a queue that silently stops retrying looks exactly like a queue that is patiently waiting.
+    # The row's own reason travels with the page, because "delayed" alone says nothing.
+    q = {
+        "status": payouts.DELAYED,
+        "next_attempt_at": {"$lt": now - PAYOUT_DUE_GRACE_S},
+        **NOT_DARK,
+    }
+    for r in await d.payout_requests.find(q).limit(50).to_list(50):
+        late = int((now - float(r.get("next_attempt_at") or now)) // 60)
+        await tg.send(
+            tg.cap(
+                f"STUCK: a delayed payout's next attempt was due {late} min ago and no pass has "
+                f"taken it — the money is still reserved and the user is still being told it is "
+                f"on its way. <code>{r['_id']}</code> — "
+                f"{tg.esc(payouts.operator_reason(r) or 'no reason was recorded on the row')}"
+            ),
+            key=f"stuck:delayed:{r['_id']}",
             cooldown_s=6 * 3600,
         )
 
@@ -885,6 +1152,19 @@ def start() -> list[asyncio.Task]:
         asyncio.create_task(run_forever("monitor", settings.monitor_interval_s, monitor_once)),
         asyncio.create_task(
             run_forever("stats_refresher", settings.stats_interval_s, refresh_pool)
+        ),
+        # T31b item 3 — the hosted token lists (pgasme/tokens.py). C1 specified this loop and
+        # nothing ran it: the deploy's one-shot refresh was the ONLY refresh, so the lists a box
+        # serves froze at whatever the last deploy fetched and `age_s` grew forever.
+        #
+        # `run_forever` calls its body once before the first sleep, so this is also the "once at
+        # boot" pass. `refresh_once` is the body on purpose: an unwritable directory is an
+        # operator condition it logs and pages ONCE per cooldown before returning — never a raise
+        # — and anything else lands in `run_forever`'s own catch-log-alert. Neither can take the
+        # API down, and neither touches money: the worst case is that the client keeps falling
+        # back to /v1/dex/tokens, which is slower and correct.
+        asyncio.create_task(
+            run_forever("token_lists", settings.tokens_refresh_interval_s, tokens.refresh_once)
         ),
     ]
 

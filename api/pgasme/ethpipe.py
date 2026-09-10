@@ -301,10 +301,33 @@ class Rpc:
                 continue
         return heads
 
-    async def receipt(
-        self, tx_hash: str, prefer: str | None = None, pin: bool = False
-    ) -> dict[str, Any] | None:
-        return await self.call("eth_getTransactionReceipt", [tx_hash], prefer=prefer, pin=pin)
+    async def receipt(self, tx_hash: str, prefer: str | None = None) -> dict[str, Any] | None:
+        """The receipt from ANY endpoint that has it — None when every endpoint that ANSWERED
+        says there is none yet, and RAISES when nobody answered at all.
+
+        ⛔ 2026-09-10, the twin of the deposit-visibility bug one method above: this was
+        `call()`, `call()` stops at the FIRST endpoint that answers, and for
+        eth_getTransactionReceipt a `null` IS an answer. `scanner._retry_one` read that null as
+        "not mined yet" and returned False — silently, on every pass — which is one of the two
+        reasons a real 0.0019999 ETH lock (msgId 138) sat unattributed. One endpoint's blindness
+        is not the chain's verdict; the remedy is MORE endpoints, never fewer (law 8).
+
+        There is deliberately NO `pin` here. A pin exists so that an EMPTY RANGE answer comes
+        from a node that actually has the blocks (eth_getLogs, where `[]` from a lagging node
+        would be checkpointed as "no locks"). A receipt is identified by the transaction hash,
+        not by a range: no endpoint's silence about one is evidence of anything, so pinning it
+        could only ever turn one flaky provider into a stalled scan. `prefer` stays as an
+        ordering hint — the endpoint that vouched for the log is asked first.
+        """
+        res, _url, answered, errors = await self._anywhere(
+            "eth_getTransactionReceipt", [tx_hash], prefer=prefer
+        )
+        if res is None and not answered:
+            raise RpcError(
+                f"eth_getTransactionReceipt {tx_hash}: no endpoint answered "
+                f"({'; '.join(errors) or 'no endpoint answered'})"
+            )
+        return res
 
     async def transaction(
         self, tx_hash: str, prefer: str | None = None, pin: bool = False
@@ -312,6 +335,96 @@ class Rpc:
         """eth_getTransactionByHash. None means "no endpoint has this transaction" — which is
         NOT the same as "it does not exist"; a caller that cannot read must not conclude."""
         return await self.call("eth_getTransactionByHash", [tx_hash], prefer=prefer, pin=pin)
+
+    async def transaction_anywhere(
+        self, tx_hash: str
+    ) -> tuple[dict[str, Any] | None, str | None, int, list[str]]:
+        """(tx, the endpoint that had it, how many endpoints ANSWERED, what the rest said).
+        `_anywhere` is the whole implementation — see its contract."""
+        return await self._anywhere("eth_getTransactionByHash", [tx_hash])
+
+    async def _anywhere(
+        self, method: str, params: list[Any], prefer: str | None = None
+    ) -> tuple[Any, str | None, int, list[str]]:
+        """(result, the endpoint that had it, how many endpoints ANSWERED, what the rest said).
+
+        ⛔ `transaction()` / `receipt()` used to be `call()`, and `call()` stops at the first
+        endpoint that ANSWERS. For eth_getTransactionByHash and eth_getTransactionReceipt a
+        `null` result IS an answer, and some endpoints answer `null` for a transaction that
+        exists: rpc.mevblocker.io (the first entry of the prod pool) is a private-orderflow
+        relay that does not expose PENDING transactions at all.
+        On 2026-09-10 that turned two real 0.002 ETH deposits into "that transaction is not
+        visible on Ethereum yet" at registration, while the very same hashes mined and locked
+        minutes later. One endpoint's blindness is not the chain's verdict — so this asks all
+        of them and the FIRST ONE THAT HAS IT wins.
+
+        `answered` is the load-bearing number and it is deliberately separate from "found":
+
+          answered == 0   nobody could be asked. That is an unreadable query and never a
+                          verdict — the caller must retry, not conclude (§the prober must call
+                          the way the caller calls; an unreadable query is not evidence).
+          answered  > 0   at least one endpoint gave a real answer and none of them had it.
+                          Still not proof it does not exist (it may be pending in a mempool
+                          none of these nodes gossips), but it IS enough to open an
+                          unverified row and keep asking.
+
+        The endpoints are asked CONCURRENTLY and the first one that HAS it wins. They are
+        independent questions and this sits in the request path a user is waiting on: asked one
+        after another, four endpoints at the 8 s pool timeout is 32 s of a hanging provider
+        before the answer — long enough for the client to give up and for the operator to read
+        it as an outage. `PGAS_TX_LOOKUP_DEADLINE_S` is the wall-clock ceiling on the whole
+        question; an endpoint still silent when it expires is an ERROR, not a "no", so a pool
+        that ran out of time comes back `answered == 0` — unreadable, never a verdict.
+        """
+        urls = ([prefer] + [u for u in self.urls if u != prefer]) if prefer else list(self.urls)
+        if not urls:  # pragma: no cover — settings always parse at least one endpoint
+            return None, None, 0, ["no Ethereum endpoint is configured"]
+        deadline = max(0.1, float(settings.tx_lookup_deadline_s))
+        per_call = min(float(self.timeout), deadline)
+        answered = 0
+        errors: list[str] = []
+        found: tuple[Any, str] | None = None
+        async with httpx.AsyncClient(timeout=self.timeout) as c:
+
+            async def ask(url: str) -> tuple[str, Any]:
+                return url, await asyncio.wait_for(self._post(c, url, method, params), per_call)
+
+            tasks = {asyncio.ensure_future(ask(u)): u for u in urls}
+            pending = set(tasks)
+            until = asyncio.get_running_loop().time() + deadline
+            while pending and found is None:
+                left = until - asyncio.get_running_loop().time()
+                if left <= 0:
+                    break
+                done, pending = await asyncio.wait(
+                    pending, timeout=left, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not done:
+                    break
+                for t in done:
+                    try:
+                        url, res = t.result()
+                    except RpcError as e:
+                        errors.append(str(e)[:200])  # an RpcError already names its endpoint
+                        continue
+                    except TimeoutError:
+                        errors.append(f"{tasks[t]}: timed out after {per_call:g}s")
+                        continue
+                    except Exception as e:  # noqa: BLE001 — one endpoint's crash is not a verdict
+                        errors.append(f"{tasks[t]}: {type(e).__name__}: {e}"[:200])
+                        continue
+                    answered += 1
+                    if res and found is None:
+                        found = (res, url)
+            for t in pending:  # still silent when the deadline expired: an error, never a "no"
+                t.cancel()
+                if found is None:
+                    errors.append(f"{tasks[t]}: no answer within {deadline:g}s")
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        if found is not None:
+            return found[0], found[1], answered, errors
+        return None, None, answered, errors
 
     async def logs(
         self,
@@ -338,6 +451,74 @@ class Rpc:
         if not isinstance(res, list):
             raise RpcError(f"eth_getLogs: unexpected answer {str(res)[:120]}")
         return res
+
+
+# What a row says while no endpoint of the pool has seen its transaction. ONE string, because
+# two of them disagree: registration writes it and the watcher clears it again once the
+# transaction is readable, and a note nobody clears is a lie that stays on the row forever.
+UNSEEN_NOTE = "waiting for Ethereum to see it"
+
+
+async def visible_tx(rpc: Any, tx_hash: str) -> tuple[dict[str, Any] | None, int, list[str]]:
+    """"Has ANY endpoint of this pool got this transaction?" → (tx, answered, errors).
+
+    ONE reader of that fact, for the three callers that need it: registration
+    (routers/deposits), the watcher's re-verification (workers._reverify_chain) and the
+    scanner's quote attribution. A pool object that cannot fan out — a test double, or any
+    reader that owns a single endpoint — is asked its own way instead of being probed
+    differently from how it is used: `transaction()` is then the whole pool, and one answer is
+    one endpoint answering.
+    """
+    fan_out = getattr(rpc, "transaction_anywhere", None)
+    if fan_out is None:
+        try:
+            return await rpc.transaction(tx_hash), 1, []
+        except RpcError as e:
+            return None, 0, [str(e)[:200]]
+    try:
+        tx, _url, answered, errors = await fan_out(tx_hash)
+    except RpcError as e:  # pragma: no cover — transaction_anywhere swallows per-endpoint errors
+        return None, 0, [str(e)[:200]]
+    return tx, answered, errors
+
+
+async def code_at_head_anywhere(rpc: Any, address: str) -> tuple[str, int, str]:
+    """`(code, head, endpoint)` — the code at `address`, from the FIRST endpoint that will read
+    it. Every endpoint is asked for ITS OWN head and then for the code PINNED to that head.
+    RAISES `RpcError` when every one of them refused: an unreadable chain is not an empty answer,
+    and `"0x"` from a node that cannot see the block is not "this is a wallet".
+
+    ⛔ 2026-09-10. `payouts.dest_code_at_head` asked `head_from()` once and pinned eth_getCode to
+    whichever endpoint answered it. On prod that is publicnode, which serves the head and then
+    refuses a code read at a numeric block with "Archive requests require a personal token" — so
+    the destination re-read raised every 30 s, `_dest_still_a_wallet` refused SILENTLY (correctly:
+    an unreadable chain is not a verdict) and nothing was ever released. The fix for an endpoint
+    that will not serve a query is MORE endpoints, never a lower bar (law 8) — and the head must
+    keep coming from the same endpoint the code is read from, or the pin protects nothing.
+
+    Ordering is the pool's own, first real answer wins; the CALLER compares the head it gets
+    against the one it already proved the destination clear at (a snap-syncing node answering an
+    old block is not evidence in either direction) — that decision does not belong here.
+    """
+    urls = list(getattr(rpc, "urls", None) or [])
+    if not urls:  # pragma: no cover — settings always parse at least one endpoint
+        raise RpcError("eth_getCode: no Ethereum endpoint is configured")
+    errors: list[str] = []
+    for url in urls:
+        try:
+            head = int(await rpc.block_number(prefer=url, pin=True))
+            if head <= 0:
+                raise RpcError(f"{url} reported block {head}", url=url)
+            code = await rpc.call("eth_getCode", [address, hex(head)], prefer=url, pin=True)
+            if not isinstance(code, str):
+                raise RpcError(f"{url} could not read the code at that address", url=url)
+            return code, head, url
+        except Exception as e:  # noqa: BLE001 — one endpoint's refusal is not the chain's answer
+            errors.append(f"{url}: {type(e).__name__}: {e}"[:200])
+    raise RpcError(
+        "eth_getCode: no endpoint would read the code at the head it reported "
+        f"({'; '.join(errors)})"
+    )
 
 
 def _matches(log: dict[str, Any], pipe_address: str, want_pk: str) -> dict[str, Any] | None:

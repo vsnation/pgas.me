@@ -93,6 +93,14 @@ for (const vp of VIEWPORTS) {
     await page.getByLabel('Amount 2').fill('0.02');
     await page.getByLabel('Deliver 2').selectOption('tonight');
     await page.getByTestId('schedule-orders').waitFor();
+    /**
+     * Wait for the API's price for THIS list before capturing. Since 2026-09-10 every number on the
+     * card comes off `POST /v1/withdrawals/preview`, ~300 ms after the last edit — a shot taken
+     * before it lands is a page full of 0.00, which is not what anyone sees a moment later.
+     */
+    await page.getByTestId('row-total-1').waitFor();
+    await expect(page.getByTestId('schedule-totals')).toHaveAttribute('data-busy', 'no');
+    await expect(page.getByTestId('total-debited')).not.toHaveText('0.00 ETH');
     await page.evaluate(() => document.fonts.ready);
     await page.screenshot({ path: `${OUT}/schedule-${vp.name}.png`, fullPage: vp.fullPage });
 

@@ -145,7 +145,6 @@ async def test_a_mined_deposit_needs_both_our_hook_and_the_pipe_in_one_receipt(
         ("sender", 400, "not sent from the wallet"),
         ("to", 400, "not a call to the Pgas router"),
         ("ref", 400, "does not carry this quote's deposit reference"),
-        ("missing", 409, "not visible on Ethereum yet"),
     ],
 )
 async def test_a_transaction_that_is_not_this_quotes_is_refused_before_a_row_exists(
@@ -166,8 +165,26 @@ async def test_a_transaction_that_is_not_this_quotes_is_refused_before_a_row_exi
     )
     assert r.status_code == status and fragment in r.json()["detail"]
     assert await mock_db["pgasme_test"].deposits.count_documents({}) == 0  # nothing was written
-    if status == 400:  # …but the refusal itself IS written: a refusal nobody sees is unalertable
-        assert await mock_db["pgasme_test"].events.count_documents({"kind": "deposit_mismatch"}) == 1
+    # …but the refusal itself IS written: a refusal nobody sees is unalertable
+    assert await mock_db["pgasme_test"].events.count_documents({"kind": "deposit_mismatch"}) == 1
+
+
+async def test_a_gateway_hash_no_endpoint_has_seen_opens_an_unverified_row(
+    client, user, registry, quoter, armed, rpc, mock_db  # noqa: F811
+):
+    """The `uniswap` half of the 2026-09-10 rule: not being able to SEE a transaction is never a
+    refusal. The row is opened unverified and the watcher keeps asking."""
+    q = await quote_and_sign(client, user, rpc)
+    rpc.txs.pop(TX)
+    r = await client.post(
+        "/v1/deposits", json={"quote_id": q["quote_id"], "src_tx_hash": TX}, headers=user["headers"]
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "submitted" and r.json()["verified"] is False
+    assert r.json()["note"] == "waiting for Ethereum to see it"
+    dep = await mock_db["pgasme_test"].deposits.find_one({"_id": r.json()["deposit_id"]})
+    assert dep["verified"] is False and dep["src_tx_hash"] == TX.lower() and dep["unseen_since"]
+    assert await mock_db["pgasme_test"].events.count_documents({"kind": "deposit_mismatch"}) == 0
 
 
 async def test_an_unreadable_endpoint_is_503_and_never_a_rejection(
@@ -178,6 +195,9 @@ async def test_an_unreadable_endpoint_is_503_and_never_a_rejection(
     async def dead(tx_hash: str, prefer: str | None = None, pin: bool = False):
         raise ethpipe.RpcError("eth_getTransactionByHash: no endpoint answered")
 
+    # a pool with no endpoints left to fan out over: the reader falls back to this one, and it
+    # cannot answer either. NOBODY answered is a 503 — never "the transaction does not exist".
+    monkeypatch.setattr(rpc, "urls", [])
     monkeypatch.setattr(rpc, "transaction", dead)
     r = await client.post(
         "/v1/deposits", json={"quote_id": q["quote_id"], "src_tx_hash": TX}, headers=user["headers"]
@@ -312,7 +332,8 @@ async def test_a_lock_for_a_quote_the_user_never_registered_still_reaches_them(
     dep = await d.deposits.find_one({"quote_id": q["quote_id"]})
     assert dep and dep["mode"] == "uniswap" and dep["status"] == "locked"
     assert dep["account_id"] == user["account_id"] and dep["address"] == user["address"]
-    assert dep["deposit_ref"] == q["deposit_ref"] and dep["src_tx_hash"] is None
+    # the swap transaction IS the transaction that locked in the pipe, so the row can name it
+    assert dep["deposit_ref"] == q["deposit_ref"] and dep["src_tx_hash"] == TX
     assert dep["value_groth"] == VALUE_AT_QUOTE // ETH.grid and "scanner" in dep["note"]
     shown = (await client.get("/v1/account", headers=user["headers"])).json()
     assert shown["deposits"][0]["mode"] == "uniswap"

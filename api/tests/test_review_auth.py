@@ -204,8 +204,12 @@ async def test_ensure_indexes_creates_what_the_scanner_queries():
     for k in ((("order_id", 1),), (("quote_id", 1),), (("eth.tx", 1), ("eth.log_index", 1))):
         assert k in keys(deposits), k
     assert deposits[dbmod.DEPOSIT_HASH_INDEX]["unique"] is True
+    # `verified: true` is part of the filter on purpose (2026-09-10, T37c/M1): an unseen hash
+    # opens an UNVERIFIED row, several accounts may claim one hash, and only identity — never
+    # who POSTed first — turns one of them into the owner the index then protects.
     assert deposits[dbmod.DEPOSIT_HASH_INDEX]["partialFilterExpression"] == {
-        "src_tx_hash": {"$type": "string"}
+        "src_tx_hash": {"$type": "string"},
+        "verified": True,
     }
     assert entries[dbmod.CREDIT_REF_INDEX]["unique"] is True
     assert entries[dbmod.CREDIT_REF_INDEX]["partialFilterExpression"] == {"kind": "credit"}
@@ -215,7 +219,7 @@ async def test_ensure_indexes_creates_what_the_scanner_queries():
 
 
 def test_the_index_names_agree_with_the_modules_that_also_create_them():
-    """scanner.py and ledger.py create the SAME four unique indexes at worker start. Mongo
+    """scanner.py and ledger.py create the SAME unique indexes at worker start. Mongo
     refuses an identical spec under a second name (IndexOptionsConflict 85), so a rename on
     either side must fail here, not in production at 03:00."""
     from pgasme import ledger, scanner
@@ -224,6 +228,29 @@ def test_the_index_names_agree_with_the_modules_that_also_create_them():
     assert dbmod.CREDIT_REF_INDEX == ledger.CREDIT_REF_INDEX
     assert dbmod.RELEASE_REF_INDEX == ledger.RELEASE_REF_INDEX
     assert dbmod.FEE_REF_INDEX == ledger.FEE_REF_INDEX
+    assert dbmod.BRIDGE_FEE_REF_INDEX == ledger.BRIDGE_FEE_REF_INDEX
+    assert dbmod.CANCEL_REF_INDEX == ledger.CANCEL_REF_INDEX
+
+
+async def test_the_money_guards_are_built_by_the_api_process_too():
+    """⛔ THE PROCESS THAT WRITES THE ENTRY IS THE PROCESS THAT NEEDS THE INDEX. `ledger.cancel`
+    — the refund — runs in the API (`POST /v1/withdrawals/{id}/cancel`, `_void`, `_roll_back`),
+    and `ledger.ensure_indexes` runs only at WORKER start. A deployment with the workers off, or
+    a boot where they had not started yet, ran every refund on a read-then-write with nothing
+    behind it. Same for the `bridge_fee` half of a release, which was added to ledger.py alone.
+    Both belong in THIS list, under the same names the other module uses."""
+    assert await ensure_indexes() == []
+    info = await db().entries.index_information()
+    for name, kind in (
+        (dbmod.CANCEL_REF_INDEX, "cancel"),
+        (dbmod.BRIDGE_FEE_REF_INDEX, "bridge_fee"),
+    ):
+        assert info[name]["unique"] is True, name
+        assert info[name]["partialFilterExpression"] == {"kind": kind}, name
+    await db().entries.insert_one({"account_id": "a", "ref": "r1", "kind": "cancel"})
+    await db().entries.insert_one({"account_id": "a", "ref": "r1", "kind": "schedule"})  # not one
+    with pytest.raises(DuplicateKeyError):
+        await db().entries.insert_one({"account_id": "a", "ref": "r1", "kind": "cancel"})
 
 
 async def test_quotes_carry_no_ttl_and_an_old_one_is_dropped():
@@ -236,13 +263,19 @@ async def test_quotes_carry_no_ttl_and_an_old_one_is_dropped():
 
 async def test_the_unique_indexes_actually_refuse_a_replay():
     await ensure_indexes()
-    await db().deposits.insert_one({"_id": "d1", "src_tx_hash": "0x" + "ab" * 32})
+    tx = "0x" + "ab" * 32
+    await db().deposits.insert_one({"_id": "d1", "src_tx_hash": tx, "verified": True})
     with pytest.raises(DuplicateKeyError):
-        await db().deposits.insert_one({"_id": "d2", "src_tx_hash": "0x" + "ab" * 32})
+        await db().deposits.insert_one({"_id": "d2", "src_tx_hash": tx, "verified": True})
+    # …but an UNVERIFIED row is a CLAIM, not a title (T37c/M1): a hash is public the moment it
+    # is broadcast, so several accounts may register one and identity picks the owner. Making
+    # the index cover these too meant whoever POSTed first locked the real sender out with a 409.
+    await db().deposits.insert_one({"_id": "d2b", "src_tx_hash": tx, "verified": False})
+    await db().deposits.insert_one({"_id": "d2c", "src_tx_hash": tx, "verified": False})
     # the scanner writes src_tx_hash: null for a lock seen before the hash was registered —
     # a plain unique index would allow exactly one of those in the whole collection
-    await db().deposits.insert_one({"_id": "d3", "src_tx_hash": None})
-    await db().deposits.insert_one({"_id": "d4", "src_tx_hash": None})
+    await db().deposits.insert_one({"_id": "d3", "src_tx_hash": None, "verified": True})
+    await db().deposits.insert_one({"_id": "d4", "src_tx_hash": None, "verified": True})
     await db().entries.insert_one({"kind": "credit", "ref": "lock:1"})
     with pytest.raises(DuplicateKeyError):
         await db().entries.insert_one({"kind": "credit", "ref": "lock:1"})

@@ -77,9 +77,8 @@ const TOP_N = 300; // the list is ordered by relevance; the head is what a walle
 const CHUNK = 150; // tokens per batch-balance / aggregate3 call
 const PER_TOKEN_N = 60; // last resort when neither aggregate helper answers
 const PER_TOKEN_BATCH = 50; // JSON-RPC batch size for that fallback
-const TOKENS_TTL_MS = 6 * 60 * 60 * 1000;
+const TOKENS_TTL_MS = 60 * 60 * 1000; // the hosted lists are rebuilt every 6 h and edge-cached 1 h
 const TOKENS_STORE_CAP = 400; // localStorage keeps the head of each list; memory keeps it all
-const PORTFOLIO_TTL_MS = 2 * 60 * 1000;
 const NATIVE_TTL_MS = 60 * 1000;
 const PRICES_TTL_MS = 5 * 60 * 1000;
 const PRICES_KEY = 'pgas.prices.v1';
@@ -90,35 +89,106 @@ function short(e: unknown): string {
   return t.length > 120 ? t.slice(0, 120) + '…' : t;
 }
 
-// ---------- token lists (from the API), cached ----------
+// ---------- token lists (T31 C3) ----------
+// The catalogue is now OUR file: `GET /tokens/<chain_id>.json`, same origin, gzip-static, edge
+// cached — 1.3 MB and 2.5 s through the API proxy became one cacheable file. `/v1/dex/tokens` stays
+// as the fallback for a box that has not built the files yet, so a missing file is slow, never
+// broken. Both shapes are one fact: the list of tokens on a chain, native first.
+//
+// What the catalogue is FOR changed with it (T31 G): the picker offers the wallet's own holdings,
+// so this list feeds the Refresh scan — what to look for — and never gates a quote.
 const tokenMem = new Map<number, Promise<Token[]>>();
+
+/** `chain_id + updated_at`, so a rebuilt list replaces a cached one rather than ageing beside it. */
+interface CachedTokens {
+  at: number;
+  updated_at?: string | number;
+  tokens: Token[];
+}
+
+function tokensKey(chainId: number): string {
+  return `pgas.tokens.v2.${chainId}`;
+}
+
+function readTokenCache(chainId: number): CachedTokens | null {
+  try {
+    const raw = localStorage.getItem(tokensKey(chainId));
+    if (!raw) return null;
+    const c = JSON.parse(raw) as CachedTokens;
+    if (!c || !Array.isArray(c.tokens) || !c.tokens.length) return null;
+    if (!(typeof c.at === 'number') || Date.now() - c.at > TOKENS_TTL_MS) return null;
+    return c;
+  } catch {
+    return null; // unreadable or unavailable storage: fetch
+  }
+}
+
+function writeTokenCache(chainId: number, tokens: Token[], updatedAt?: string | number): void {
+  try {
+    localStorage.setItem(
+      tokensKey(chainId),
+      JSON.stringify({ at: Date.now(), updated_at: updatedAt, tokens: tokens.slice(0, TOKENS_STORE_CAP) }),
+    );
+  } catch {
+    // quota or no storage: the memory cache still holds it for this page
+  }
+}
+
+/**
+ * The hosted list. Null — never a throw and never an empty list — for every way it can be absent,
+ * because the caller's answer to "no file" is the API, not an empty catalogue.
+ *
+ * ⚠️ The SPA fallback answers EVERY missing path with index.html at **200** (Pgas law 4,
+ * 2026-09-09): status is not evidence that a file exists. The content type is what is checked.
+ */
+async function fetchStaticTokens(chainId: number): Promise<{ tokens: Token[]; updated_at?: string | number } | null> {
+  try {
+    const res = await fetch(`/tokens/${chainId}.json`, { headers: { Accept: 'application/json' } });
+    if (!res.ok) return null;
+    if (!/json/i.test(res.headers.get('content-type') ?? '')) return null;
+    const j = (await res.json()) as { tokens?: unknown; updated_at?: string | number };
+    const list = Array.isArray(j?.tokens) ? (j.tokens as Token[]) : null;
+    return list && list.length ? { tokens: list, updated_at: j.updated_at } : null;
+  } catch {
+    return null;
+  }
+}
 
 export function loadTokens(chainId: number): Promise<Token[]> {
   const existing = tokenMem.get(chainId);
   if (existing) return existing;
-  const key = `pgas.tokens.v1.${chainId}`;
   const p = (async () => {
-    try {
-      const raw = localStorage.getItem(key);
-      if (raw) {
-        const c = JSON.parse(raw) as { at: number; tokens: Token[] };
-        if (Date.now() - c.at < TOKENS_TTL_MS && Array.isArray(c.tokens) && c.tokens.length) return c.tokens;
-      }
-    } catch {
-      // unreadable cache: fetch
+    const cached = readTokenCache(chainId);
+    if (cached) return cached.tokens;
+    const hosted = await fetchStaticTokens(chainId);
+    if (hosted) {
+      writeTokenCache(chainId, hosted.tokens, hosted.updated_at);
+      return hosted.tokens;
     }
     const { tokens } = await api.tokens(chainId);
     const list = Array.isArray(tokens) ? tokens : [];
-    try {
-      localStorage.setItem(key, JSON.stringify({ at: Date.now(), tokens: list.slice(0, TOKENS_STORE_CAP) }));
-    } catch {
-      // quota: the memory cache still holds it
-    }
+    writeTokenCache(chainId, list);
     return list;
   })();
   p.catch(() => tokenMem.delete(chainId));
   tokenMem.set(chainId, p);
   return p;
+}
+
+/**
+ * Warm the lists a wallet is likely to need — its current chain and every chain its chips are on —
+ * in the background, after the page has settled. A prefetch that throws is a prefetch that did
+ * nothing: the real load asks again.
+ */
+export function prefetchTokens(chainIds: Iterable<number>): void {
+  const ids = [...new Set([...chainIds])].filter((id) => Number.isFinite(id) && !tokenMem.has(id));
+  if (!ids.length) return;
+  const run = () => {
+    for (const id of ids) void loadTokens(id).catch(() => undefined);
+  };
+  const idle = (globalThis as { requestIdleCallback?: (cb: () => void, o?: { timeout: number }) => void }).requestIdleCallback;
+  if (typeof idle === 'function') idle(run, { timeout: 3000 });
+  else setTimeout(run, 300);
 }
 
 // ---------- providers ----------
@@ -132,6 +202,11 @@ interface Attempt {
  * buybeam recorded Zerion's injected RPC answering 0 for a real balance, and the screenshot that
  * started this work is Zerion on Ethereum with the Ethereum holding missing. A fallback catches an
  * error, never a lie — so a public read wins and the wallet is the last resort, not the first.
+ *
+ * WHICH public endpoint is not this file's business (T54): `fallbackUrls` hands back the order
+ * `lib/rpc.ts` holds — the app's verified list with the endpoint chosen in the RPC settings popup at
+ * the head of it — so a pick made there applies to the scan, to a single balance re-read and to a
+ * receipt wait alike, and a chain whose only endpoint is one the user typed is readable here too.
  */
 function attemptsFor(chainId: number, wallet: ScanWallet | null): Attempt[] {
   const out: Attempt[] = [];
@@ -277,7 +352,7 @@ async function scanChain(chain: Chain, address: string, wallet: ScanWallet | nul
   }
   const attempts = attemptsFor(chain.chain_id, wallet);
   if (!attempts.length) {
-    result.errors.push('no RPC for this chain (connect the wallet to it to read balances)');
+    result.errors.push('no endpoint for this chain — add one under RPC endpoints, or connect the wallet to this chain');
     return result;
   }
   let provider: Provider | null = null;
@@ -558,7 +633,14 @@ export function sortForDisplay(hs: Holding[]): Holding[] {
   return sortHoldings(hs);
 }
 
-// A short-lived cache so a reload does not hammer public RPCs. bigint is stored as a string.
+// ---------- the scan result, remembered per wallet (T31 F) ----------
+// The admin's rule, 2026-09-10: "cache balances result to avoid update during same or next update
+// session, if user can't see some balances, he can just click refresh btn". So the cache has NO
+// expiry for rendering — a scan is a thing the USER asks for, and the only automatic scan left is
+// the first one for an address nobody has ever scanned. The "as of …" label carries the age, which
+// is what an old number needs: a date on it, not a silent re-read of thirty public RPCs.
+//
+// bigint is stored as a string; the key carries the address, so two wallets keep two caches.
 function portfolioKey(address: string): string {
   return `pgas.portfolio.v1.${address.toLowerCase()}`;
 }
@@ -575,7 +657,12 @@ function savePortfolio(p: Portfolio): void {
   }
 }
 
-export function loadCachedPortfolio(address: string, ttlMs = PORTFOLIO_TTL_MS): Portfolio | null {
+/**
+ * The remembered scan. `ttlMs` defaults to forever: age is shown, never acted on. A caller that
+ * genuinely needs a fresh number (there is exactly one — "Max") reads that ONE balance live rather
+ * than asking for a whole scan nobody requested.
+ */
+export function loadCachedPortfolio(address: string, ttlMs = Number.POSITIVE_INFINITY): Portfolio | null {
   try {
     const raw = localStorage.getItem(portfolioKey(address));
     if (!raw) return null;
@@ -586,6 +673,35 @@ export function loadCachedPortfolio(address: string, ttlMs = PORTFOLIO_TTL_MS): 
   } catch {
     return null;
   }
+}
+
+/**
+ * ONE balance, read live — what "Max" needs and the only read that is allowed to happen without the
+ * user pressing Refresh. Native goes through `getBalance`, an ERC-20 through `balanceOf`, on the
+ * same public-RPC-first providers the scan uses. Null means nothing could read it, which is not the
+ * same as zero: the caller keeps the cached number rather than offering the user a "Max" of 0.
+ */
+export async function readHoldingBalance(
+  chainId: number,
+  token: { address: string; native?: boolean },
+  address: string,
+  wallet: ScanWallet | null,
+): Promise<bigint | null> {
+  const native = token.native || isNativeToken(token.address);
+  for (const a of attemptsFor(chainId, wallet)) {
+    try {
+      const p = await a.get();
+      if (!p) continue;
+      if (native) return await withTimeout(p.getBalance(address), 12_000);
+      const data = ERC20_IFACE.encodeFunctionData('balanceOf', [address]);
+      const res = await withTimeout(p.call({ to: token.address, data }), 12_000);
+      if (!res || res === '0x') continue; // an unreadable answer is not evidence of a zero balance
+      return BigInt(ERC20_IFACE.decodeFunctionResult('balanceOf', res)[0] as bigint);
+    } catch {
+      if (a.label === 'public') invalidateFallback(chainId);
+    }
+  }
+  return null;
 }
 
 // ---------- native-only balances (Wallets page) ----------

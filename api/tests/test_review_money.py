@@ -198,10 +198,15 @@ async def test_direct_hijack_every_way_a_pipe_call_can_fail_to_be_yours(
         "input": ethpipe.encode_send_funds(call["value"] - 10**10, call["relayer_fee"], PUBKEY),
     }
     assert "locks a different amount" in (await register(wrong_amt)).json()["detail"]
-    # (e) a hash no node has seen: retryable, NOT a rejection and NOT an acceptance
-    r = await register("0x" + "55" * 32)
-    assert r.status_code == 409 and "not visible on Ethereum yet" in r.json()["detail"]
-    assert await mock_db["pgasme_test"].deposits.count_documents({}) == 0
+    # (e) a hash no node has seen: NOT a rejection — the row opens unverified and the watcher
+    # keeps asking (2026-09-10: refusing this cost two real deposits, mined and unattributed)
+    unseen = "0x" + "55" * 32
+    r = await register(unseen)
+    assert r.status_code == 200 and r.json()["verified"] is False
+    assert r.json()["note"] == "waiting for Ethereum to see it"
+    row = await mock_db["pgasme_test"].deposits.find_one({"src_tx_hash": unseen})
+    assert row["status"] == "submitted" and row["verified"] is False and row["unseen_since"]
+    await mock_db["pgasme_test"].deposits.delete_one({"_id": row["_id"]})
     # (f) the real thing
     mine = "0x" + "66" * 32
     rpc.txs[mine] = {"from": user["address"].lower(), "to": ETH.pipe.lower(), "input": calldata}
@@ -269,14 +274,21 @@ async def test_the_scanner_checks_the_sender_of_a_direct_lock_too(mock_db, rpc, 
 
 
 async def test_one_deposit_per_source_transaction_is_a_database_rule(mock_db):
+    """One PROVEN deposit per source transaction. The index is deliberately blind to unverified
+    rows (T37c/M1): a hash is public the moment it is broadcast, so registering one is a claim —
+    with the wider filter a stranger watching the mempool took the hash and answered 409 to the
+    person who actually signed it. Identity is what makes a row the owner, and then this."""
     await scanner.ensure_indexes()
     d = mock_db["pgasme_test"]
-    await d.deposits.insert_one({"_id": "a", "src_tx_hash": TX})
+    await d.deposits.insert_one({"_id": "a", "src_tx_hash": TX, "verified": True})
     with pytest.raises(DuplicateKeyError):
-        await d.deposits.insert_one({"_id": "b", "src_tx_hash": TX})
+        await d.deposits.insert_one({"_id": "b", "src_tx_hash": TX, "verified": True})
+    # several unproven claims on one hash are legitimate; exactly one can ever pass identity
+    await d.deposits.insert_one({"_id": "b2", "src_tx_hash": TX, "verified": False})
+    await d.deposits.insert_one({"_id": "b3", "src_tx_hash": TX, "verified": False})
     # the scanner's own rows carry no hash at all; many of those are not a collision
-    await d.deposits.insert_one({"_id": "c", "src_tx_hash": None})
-    await d.deposits.insert_one({"_id": "e", "src_tx_hash": None})
+    await d.deposits.insert_one({"_id": "c", "src_tx_hash": None, "verified": True})
+    await d.deposits.insert_one({"_id": "e", "src_tx_hash": None, "verified": True})
 
 
 # ═══════════════════ defect 2 — a lagging endpoint cannot checkpoint "no locks" ═══════════════
@@ -506,7 +518,9 @@ async def test_the_debit_is_written_before_the_row_it_belongs_to(client, user, m
 
 async def test_concurrent_withdrawals_cannot_overdraw(client, user, mock_db, monkeypatch):
     monkeypatch.setattr(settings, "payout_direct_enabled", True)
-    await fund(user, "ETH", 1_020_000)  # room for exactly ONE 0.01 ETH payout incl. the 2% fee
+    # room for exactly ONE 0.01 ETH payout incl. our 2% AND the bridge fee it funds (an 18_000-
+    # groth relayer fee at 1 gwei × the 1.25 ASAP headroom floor = 22_500)
+    await fund(user, "ETH", 1_042_500)
     dest = EthAccount.create()
     real_balance = ledger.balance
 
@@ -529,12 +543,13 @@ async def test_concurrent_withdrawals_cannot_overdraw(client, user, mock_db, mon
     monkeypatch.setattr(ledger, "balance", real_balance)
     assert await ledger.balance(user["account_id"], "ETH") == {
         "available": 0,
-        "scheduled": 1_020_000,
+        "scheduled": 1_042_500,
         "sent": 0,
     }
     d = mock_db["pgasme_test"]
     assert await d.payout_requests.count_documents({"status": "scheduled"}) == 1
     assert await d.entries.count_documents({"kind": "schedule"}) == 1
+    assert await d.entries.count_documents({"kind": "schedule_bridge_fee"}) == 1
     # the reservation is given back either way — the next withdrawal is not blocked by a ghost
     assert (await d.reservations.find_one({}))["pending"] == 0
 

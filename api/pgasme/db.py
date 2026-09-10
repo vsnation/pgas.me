@@ -15,7 +15,11 @@ from typing import Any
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from pymongo.errors import OperationFailure
 
-from .config import settings
+from .config import GAS_SAMPLE_TTL_S, settings
+
+# the gas-basis series (payouts.record_gas_sample is its ONE writer). Named here because this
+# module builds its TTL and this module must not import `payouts` — `payouts` imports this one.
+GAS_SAMPLES = "gas_samples"
 
 log = logging.getLogger("pgasme.db")
 
@@ -29,16 +33,23 @@ NONCE_TTL_MULT: dict[str, int] = {"siwe_nonces": 1, "dest_nonces": 2}
 # Written only by ensure_indexes(); read by /v1/health.
 INDEX_ERRORS: list[str] = []
 
-# Four unique indexes are ALSO created by the modules that depend on them at worker start
-# (scanner.DEPOSIT_HASH_INDEX, ledger.CREDIT_REF_INDEX / RELEASE_REF_INDEX / FEE_REF_INDEX).
+# These unique indexes are ALSO created by the modules that depend on them at worker start
+# (scanner.DEPOSIT_HASH_INDEX, ledger.CREDIT_REF_INDEX / RELEASE_REF_INDEX / FEE_REF_INDEX /
+# BRIDGE_FEE_REF_INDEX / CANCEL_REF_INDEX).
 # Mongo answers IndexOptionsConflict (85) "Index already exists with a different name" when the
 # same spec is created twice under two names, so these names must stay byte-identical to
 # theirs — an identical create is a silent no-op, a renamed one pages the operator with "the
 # unique guards are NOT in place" every boot. tests/test_review_auth.py pins the agreement.
+# ⛔ AND THE LIST HAS TO BE COMPLETE, because THIS is the one the API process builds (main.py
+# lifespan): `ledger.cancel` — the refund — runs in the API, and `ledger.ensure_indexes` runs
+# only where the workers do. A guard missing from here is a guard a workers-off deployment does
+# not have at all, on the entry that puts money back into Available.
 DEPOSIT_HASH_INDEX = "uniq_src_tx_hash"
 CREDIT_REF_INDEX = "uniq_credit_ref"
 RELEASE_REF_INDEX = "uniq_release_ref"
 FEE_REF_INDEX = "uniq_fee_ref"
+BRIDGE_FEE_REF_INDEX = "uniq_bridge_fee_ref"
+CANCEL_REF_INDEX = "uniq_cancel_ref"
 # The build before this one guarded both kinds with ONE index whose filter was
 # `{"kind": {"$in": ["release", "fee"]}}`. MongoDB supports `$in` inside a
 # partialFilterExpression only from 6.0; PRODUCTION RUNS 5.0 and answers CannotCreateIndex
@@ -76,18 +87,38 @@ def _key_list(keys: Any) -> list[tuple[str, Any]]:
     return [(keys, 1)] if isinstance(keys, str) else [tuple(k) for k in keys]
 
 
+# "this index already exists and it is not the one you asked for". MongoDB answers
+# IndexOptionsConflict (85) / IndexKeySpecsConflict (86); the SAME refusal arrives from
+# mongomock — and from any driver that does not surface a code — as text alone, so a repair
+# keyed only on the number is a repair the offline suite can never prove and a fresh mongo
+# minor version can silently stop reaching. Both are read (§the prober must call the way the
+# caller calls). Every other OperationFailure is a real failure and is re-raised.
+INDEX_CONFLICT_CODES = (85, 86)
+INDEX_CONFLICT_HINTS = ("already exists with different options", "already exists with a different")
+
+
+def is_index_conflict(e: OperationFailure) -> bool:
+    text = str(e).lower()
+    return e.code in INDEX_CONFLICT_CODES or any(h in text for h in INDEX_CONFLICT_HINTS)
+
+
 async def _ensure(coll: Any, keys: Any, **opts: Any) -> None:
     """create_index, repairing an index that already exists with different options.
 
     Mongo answers IndexOptionsConflict (85) / IndexKeySpecsConflict (86) when the same key
     pattern or name already exists with other options (e.g. the non-unique src_tx_hash index
     this build replaces with a unique one). Drop that one and create the intended index.
+    `is_index_conflict` reads the message as well as the code — a repair that only ever fires
+    on a number is a repair the offline suite cannot prove and a box can silently stop getting.
+
+    ⚠️ It drops EVERY index on the same key, so a caller that also wants a plain index on that
+    key must build the repaired one FIRST (see the two src_tx_hash steps below).
     """
     try:
         await coll.create_index(keys, **opts)
         return
     except OperationFailure as e:
-        if e.code not in (85, 86):
+        if not is_index_conflict(e):
             raise
         log.warning("index conflict on %s %s: %s — rebuilding", coll.name, keys, e)
     want = _key_list(keys)
@@ -133,6 +164,14 @@ async def ensure_indexes() -> list[str]:
         "rate_limits.at TTL",
         _ensure(d.rate_limits, "at", expireAfterSeconds=2 * settings.rate_window_s),
     )
+    # the gas basis a bridge crossing is priced on (T45): one row per deposit-watcher pass,
+    # read as a 24 h p75, kept for 48 h so the evidence outlives the window it counts in. `at`
+    # is a tz-aware datetime for exactly the reason the two TTLs above are — a TTL index only
+    # fires on a BSON date — and `at_s` beside it is the epoch second the window is read on.
+    await step(
+        f"{GAS_SAMPLES}.at TTL", _ensure(d[GAS_SAMPLES], "at", expireAfterSeconds=GAS_SAMPLE_TTL_S)
+    )
+    await step(f"{GAS_SAMPLES}.at_s", _ensure(d[GAS_SAMPLES], [("at_s", -1)]))
 
     # quotes: NO TTL. A cross-chain fill can be indexed hours late and the scanner resolves it through
     # quotes.order_id / quotes.metadata; expiring the quote would orphan the deposit.
@@ -141,6 +180,17 @@ async def ensure_indexes() -> list[str]:
     await step("quotes account/at", _ensure(d.quotes, [("account_id", 1), ("at", -1)]))
     await step("quotes.order_id", _ensure(d.quotes, "order_id"))
     await step("quotes.metadata", _ensure(d.quotes, "metadata"))
+    # ── one Beam receiver key per deposit (pgasme/receiver_keys.py). The QUOTE row is the
+    # authority on which quote holds an issued key, and `scanner.attribute_from_quote` looks a
+    # lock's 33 bytes up here on the money path — an unindexed collection scan is what that
+    # lookup becomes on a box with a year of quotes. Sparse, because only an indexed quote
+    # carries the field at all.
+    await step("quotes.receiver_pk", _ensure(d.quotes, "receiver_pk", sparse=True))
+    # the KEY CACHE, read by `issued_pks` (what the scanner will recognise) and `open_indexes`
+    # (what the claim watcher asks view_incoming about) — both bounded, both newest-first
+    await step(
+        "receiver_keys pipe/issued", _ensure(d.receiver_keys, [("pipe_cid", 1), ("issued_at", -1)])
+    )
 
     await step(
         "entries account/asset/at", _ensure(d.entries, [("account_id", 1), ("asset", 1), ("at", 1)])
@@ -185,6 +235,30 @@ async def ensure_indexes() -> list[str]:
             name=FEE_REF_INDEX,
         ),
     )
+    # …one `bridge_fee` per ref (the pass-through half of a release, itemised since 2026-09-10)
+    # and one `cancel` per ref (the REFUND). A fourth and a fifth key pattern for the same
+    # reason the others differ: one equality filter per index, and no two of them sharing a key
+    # pattern. Same specs and same names as ledger.ensure_indexes().
+    await step(
+        "entries bridge_fee/ref unique",
+        _ensure(
+            d.entries,
+            [("ref", 1), ("account_id", 1)],
+            unique=True,
+            partialFilterExpression={"kind": "bridge_fee"},
+            name=BRIDGE_FEE_REF_INDEX,
+        ),
+    )
+    await step(
+        "entries cancel/ref unique",
+        _ensure(
+            d.entries,
+            [("account_id", 1), ("ref", 1)],
+            unique=True,
+            partialFilterExpression={"kind": "cancel"},
+            name=CANCEL_REF_INDEX,
+        ),
+    )
 
     await step(
         "deposits account/created", _ensure(d.deposits, [("account_id", 1), ("created_at", -1)])
@@ -195,21 +269,40 @@ async def ensure_indexes() -> list[str]:
     await step(
         "deposits eth.tx/log_index", _ensure(d.deposits, [("eth.tx", 1), ("eth.log_index", 1)])
     )
-    # one deposit per source transaction. Partial on $type:string because the scanner inserts
-    # rows with src_tx_hash: null (lock seen before the hash was registered) and a plain unique
-    # index would allow only ONE of those in the whole collection. The non-unique src_tx_hash
-    # index stays: a partial index cannot serve a {src_tx_hash: null} lookup. Same spec and
-    # same name as scanner.ensure_indexes().
-    await step("deposits.src_tx_hash", _ensure(d.deposits, "src_tx_hash"))
+    # one VERIFIED deposit per source transaction. Partial on $type:string because the scanner
+    # inserts rows with src_tx_hash: null (lock seen before the hash was registered) and a plain
+    # unique index would allow only ONE of those in the whole collection. The non-unique
+    # src_tx_hash index stays: a partial index cannot serve a {src_tx_hash: null} lookup. Same
+    # spec and same name as scanner.ensure_indexes().
+    # ⛔ `verified: true` IS PART OF THE FILTER, and it is a deliberate weakening. A hash is
+    # public the moment it is broadcast, so registering one is a CLAIM (scanner.claims_on): with
+    # the old, wider filter whoever POSTED first took the hash, and after 2026-09-10 — when an
+    # unseen hash started opening a row instead of being refused — a stranger watching the
+    # mempool could lock the person who actually signed it out with a 409 until the TTL. Several
+    # unverified claims may coexist; identity (the transaction's sender) can prove exactly one,
+    # and from that moment the index is what makes the hash that row's alone.
+    # `_ensure` repairs a box that still carries the old filter under this name
+    # (IndexOptionsConflict 85 → drop → recreate), and this runs in the API process at boot,
+    # before workers.start() calls the scanner's copy.
+    # ⚠️ THE UNIQUE ONE IS BUILT FIRST, and the order is load-bearing: `_ensure`'s repair drops
+    # every index on the same KEY before recreating, so repairing this one after the plain one
+    # would take the plain one with it and leave it missing until the next boot.
     await step(
         "deposits.src_tx_hash unique",
         _ensure(
             d.deposits,
             "src_tx_hash",
             unique=True,
-            partialFilterExpression={"src_tx_hash": {"$type": "string"}},
+            partialFilterExpression={"src_tx_hash": {"$type": "string"}, "verified": True},
             name=DEPOSIT_HASH_INDEX,
         ),
+    )
+    await step("deposits.src_tx_hash", _ensure(d.deposits, "src_tx_hash"))
+    # `receiver_keys.open_indexes` distincts this over the rows whose message is still
+    # unclaimed, once per treasury pass, per asset
+    await step(
+        "deposits asset/receiver_index",
+        _ensure(d.deposits, [("asset", 1), ("receiver_index", 1)], sparse=True),
     )
 
     await step(

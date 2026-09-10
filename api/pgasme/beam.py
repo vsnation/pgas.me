@@ -91,7 +91,7 @@ import httpx
 from . import beampay
 from .assets import ASSETS, Asset, get_asset, usd_prices
 from .beampay import BeamPayError
-from .config import settings
+from .config import relayer_subsidy, settings
 from .db import db
 
 log = logging.getLogger("pgasme.beam")
@@ -161,6 +161,64 @@ def _blob(raw: Any) -> bytes:
     raise BeamError(f"raw_data is a {type(raw).__name__}, not bytes")
 
 
+# ⛔ **`;`, NOT `,`.** The wallet splits the whole `args` string on `,` in
+# `ProcessorManager::AddArgs` (bvm2.cpp:3373) BEFORE the shader ever sees a value, so
+# `indexes=1,2,3` reaches it as three broken pairs — the list would silently become `1`, and a
+# message on index 2 or 3 would then be invisible with the money already burned. The shader
+# treats any non-digit as a separator and `;` is the convention (K1, WO-20260910-3). It lives
+# here once, so the two spellings of one fact cannot drift (law 9).
+INDEX_LIST_SEP = ";"
+
+
+def _index_arg(index: int | None) -> str:
+    """`,index=N` for an issued receiver key — and NOTHING for the legacy one.
+
+    The absence of the argument is the interface's own way of saying "the cid-only blob", so a
+    legacy call must not carry `index=0`: that would be a different string reaching a shader
+    that is entitled to read it differently."""
+    return f",index={int(index)}" if index is not None and int(index) > 0 else ""
+
+
+def _shader_error(built: dict[str, Any]) -> str:
+    """The shader's own refusal text out of an `invoke_contract` answer that carries no
+    `raw_data`. Empty when it did not say — which is not the same thing as it not having
+    refused, so the caller still refuses either way."""
+    err = built.get("error")
+    if isinstance(err, str) and err:
+        return err
+    out = built.get("output")
+    if isinstance(out, str) and out:
+        try:
+            body = json.loads(out)
+        except ValueError:
+            return out[:160]
+        if isinstance(body, dict) and isinstance(body.get("error"), str):
+            return body["error"]
+    return ""
+
+
+def _msg_index(m: dict[str, Any]) -> int | None:
+    """Which receiver key a delivered message matched, or None when the shader did not say.
+
+    The patched shader answers the index beside the MsgId and spells the legacy key either `0`
+    or `"legacy"`. NONE IS NOT ZERO: a shader that answers no index at all is one that has no
+    concept of them, and the row it produced is byte-identical to the rows this call has always
+    returned. That distinction is what keeps `view_incoming` unchanged with the flag off — and
+    an unparseable index is None too, because a value we cannot read is never a value."""
+    if "index" not in m and "Index" not in m:
+        return None
+    raw = m.get("index", m.get("Index"))
+    if raw is None:
+        return None
+    if str(raw).strip().lower() == "legacy":
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        log.warning("view_incoming answered an unreadable index %r — treating it as unknown", raw)
+        return None
+
+
 class Wallet:
     """One dedicated wallet-api. Every method raises BeamError rather than guessing."""
 
@@ -198,6 +256,41 @@ class Wallet:
     # `generate_tx_id`, `create_address` and `validate_address` are BeamPay's (law 10) — the
     # wallet-api answers what the WALLET holds, and what the wallet holds is one shared UTXO
     # pool, not our inventory. `tx_send` is gone with them: a shield is a BeamPay `/withdraw`.
+    #
+    # ⚠️ TWO EXCEPTIONS, BOTH ADDED 2026-09-10 AND BOTH NARROW BY CONSTRUCTION — `get_utxo`,
+    # which reads the coin COUNT, and `tx_split` (see `split()` below), which cuts one of our
+    # own coins into many WITHOUT moving value out of the wallet. Both are about the same fact:
+    # Beam locks a whole UTXO per pending transaction, so the COUNT of coins is what bounds
+    # concurrency, and BeamPay's per-address ledger cannot express a count at all.
+    #
+    # `get_utxo`. It is not a
+    # balance — it is the COUNT of coins, which is the one fact BeamPay's per-address ledger
+    # cannot express and which decides how many transactions the wallet can carry at once (Beam
+    # locks a whole UTXO per pending transaction). BeamPay has no route for it, it moves
+    # nothing, and it is never read as inventory: `payouts.coin_counts` uses it for concurrency
+    # and for nothing else. Two releases 0.7 s apart both died "Not enough inputs" on
+    # 2026-09-10 for want of exactly this number.
+
+    async def utxos(self, page: int = 200, max_pages: int = 25) -> list[dict[str, Any]]:
+        """Every UTXO the wallet knows about, paged — a READ that moves nothing.
+
+        ⛔ RAISES on an unreadable page rather than returning what it managed to collect: a
+        short list is an UNDERCOUNT of coins, and an undercount here reads as "the wallet is
+        busy", which stalls releases silently and for ever. The caller must know it could not
+        look. A walk that hits `max_pages` says so in the log for the same reason."""
+        out: list[dict[str, Any]] = []
+        for _ in range(max_pages):
+            rows = await self.rpc("get_utxo", {"count": int(page), "skip": len(out)})
+            if not isinstance(rows, list):
+                raise BeamError(f"get_utxo: unexpected shape {str(rows)[:120]}")
+            out.extend(r for r in rows if isinstance(r, dict))
+            if len(rows) < page:
+                return out
+        log.warning(
+            "get_utxo: stopped after %d pages (%d coins) — the count may be short, which reads "
+            "as a busier wallet than it is", max_pages, len(out),
+        )
+        return out
 
     async def invoke(self, args: str) -> dict[str, Any]:
         """`invoke_contract` with **create_tx: false**, always — one of the only two wallet-api
@@ -229,20 +322,49 @@ class Wallet:
             raise BeamError(f"{args}: output is not an object ({str(out)[:80]})")
         return body
 
-    async def get_pk(self, cid: str) -> str:
-        body = await self.view(f"role=user,action=get_pk,cid={cid}")
+    async def get_pk(self, cid: str, index: int | None = None) -> str:
+        """The receiver pubkey of this pipe. `index` absent → the LEGACY blob (the cid alone),
+        which is the only key the shipped pipe app can derive; `index` ≥ 1 → `KeyID{cid, index}`
+        on the patched app (WO-20260910-3).
+
+        ⚠️ THE SHIPPED APP IGNORES `index=` AND ANSWERS THE LEGACY KEY FOR ANY VALUE OF IT
+        (measured on the box, T41 §1). A 33-byte answer is therefore NOT evidence that an
+        indexed key was derived — `receiver_keys.pk_for_index` is where that is checked, by
+        refusing an answer equal to the pipe's configured legacy key."""
+        body = await self.view(f"role=user,action=get_pk,cid={cid}{_index_arg(index)}")
         pk = body.get("pk") or body.get("pubkey")
         if not isinstance(pk, str) or not pk:
             raise BeamError(f"get_pk({cid[:12]}…): no pk in {str(body)[:120]}")
+        # ⛔ THE ANSWER MUST BE FOR THE INDEX WE ASKED FOR. The patched app echoes it; the
+        # shipped one answers no index at all. A key derived from a different blob than the one
+        # we will later SIGN with is a receiver whose message we can never claim, so an answer
+        # that names another index is refused rather than trusted for its 33 bytes.
+        echoed = _msg_index(body)
+        if echoed is not None and echoed != int(index or 0):
+            raise BeamError(
+                f"get_pk({cid[:12]}…): asked for index {int(index or 0)}, the shader answered "
+                f"index {echoed}"
+            )
         return pk
 
-    async def view_incoming(self, cid: str) -> list[dict[str, int]]:
-        """What the relayer has delivered to OUR key on this pipe and we have not claimed.
+    async def view_incoming(
+        self, cid: str, indexes: list[int] | None = None
+    ) -> list[dict[str, int]]:
+        """What the relayer has delivered to OUR keys on this pipe and we have not claimed.
 
         ⚠️ The keys are `MsgId` / `amount` — capital M, capital I. Matching `msgId` yields −1 for
         every row, `mine` is always empty, and a genuinely claimable transfer waits forever
-        (bridge_watcher.py:559, verified against the live pipe)."""
-        body = await self.view(f"role=manager,action=view_incoming,startFrom=0,cid={cid}")
+        (bridge_watcher.py:559, verified against the live pipe).
+
+        `indexes` is the EXACT set of receiver indexes to match against, legacy (0) included.
+        The patched shader derives a bounded window per call, so an index the caller does not
+        ask about is INVISIBLE — never "not delivered yet". Empty or None asks exactly the
+        question this call asked before indexed keys existed, and every row then answers
+        `index: 0`."""
+        args = f"role=manager,action=view_incoming,startFrom=0,cid={cid}"
+        if indexes:
+            args += ",indexes=" + INDEX_LIST_SEP.join(str(int(i)) for i in indexes)
+        body = await self.view(args)
         rows = body.get("incoming")
         if rows is None:
             raise BeamError(f"view_incoming({cid[:12]}…): no 'incoming' key in {str(body)[:120]}")
@@ -250,7 +372,10 @@ class Wallet:
         for m in rows:
             for k in ("MsgId", "msgId", "msg_id", "id"):
                 if k in m:
-                    out.append({"msg_id": int(m[k]), "amount": int(m.get("amount") or 0)})
+                    row = {"msg_id": int(m[k]), "amount": int(m.get("amount") or 0)}
+                    if (i := _msg_index(m)) is not None:
+                        row["index"] = i
+                    out.append(row)
                     break
         return out
 
@@ -327,23 +452,89 @@ class Wallet:
             raise BeamError(f"{what}: process_invoke_data returned no txid ({str(res)[:120]})")
         return txid
 
-    async def build_receive(self, cid: str, msg_id: int) -> tuple[Any, str]:
+    async def split(self, coins: list[int], asset_id: int, txid: str) -> str:
+        """`tx_split` — the wallet cutting ONE of its own coins into many, in one transaction.
+
+        ⚠️ THE THIRD WALLET-API CARVE-OUT, and it is the only one that WRITES. Law 10 says
+        BeamPay is the only interface that moves value, and this does not move value: sender and
+        receiver are one address the wallet makes for itself (`v6_api_handle.cpp:513` calls
+        `walletDB->createAddress`, and `CreateSplitTransactionParameters` sets MyID **and**
+        PeerID to it), every output stays in the same wallet, and the only thing that leaves is
+        the kernel fee. BeamPay has no `/withdraw` shape that can express it — the equivalent it
+        DOES have is a self-transfer, which is nine transactions, nine fees and three Telegram
+        notifications per leg for one coin. See `pgasme/utxo.py` for the whole argument and for
+        what the fee costs the ledger.
+
+        ⛔ **`txid` IS MANDATORY HERE ALTHOUGH THE WALLET MAKES IT OPTIONAL.** It is the whole
+        idempotency of this call: `v6_api_handle.cpp:518` refuses a txId the wallet already
+        holds (`ApiError::InvalidTxId`, *"Provided transaction ID already exists in the
+        wallet."*), so a caller that derives the id from its plan CANNOT make a second split by
+        retrying — the wallet says no, and it says it without signing anything. `submit()` has
+        no such parameter and is therefore never repeatable; this one is safe to retry by
+        construction, which is the opposite property and worth naming.
+
+        ⛔ **NO `fee` GOES ON THE WIRE** (§WE-SET-IT-WE-DONT-READ-IT). `v6_api_parse.cpp:589`
+        defaults it to the wallet's own minimum for this many outputs; `utxo.split_min_fee`
+        PREDICTS that number so a dry run can price the plan, and the charged fee is read back
+        off BeamPay's record of the transaction and compared with the prediction.
+
+        The kill switch is checked HERE, inside the mover, exactly as `submit` checks it."""
+        if not coins or any(int(c) <= 0 for c in coins):
+            raise BeamError(
+                f"tx_split: `coins` must be a non-empty list of NON-ZERO amounts (got {coins!r})"
+                f" — v6_api_parse.cpp:571 refuses a zero amount outright"
+            )
+        if not re.fullmatch(r"[0-9a-f]{32}", str(txid or "")):
+            raise BeamError(
+                f"tx_split: {str(txid)[:40]!r} is not a Beam transaction id — 16 bytes, 32 "
+                f"lower-case hex characters (wallet/core/common.h:56, parse_utils.h:215)"
+            )
+        if _paused():
+            raise Halted(f"tx_split: the kill switch is set ({settings.stop_file})")
+        res = await self.rpc(
+            "tx_split",
+            {"coins": [int(c) for c in coins], "asset_id": int(asset_id), "txId": str(txid)},
+        )
+        got = res.get("txId") if isinstance(res, dict) else None
+        if not isinstance(got, str) or got.lower() != str(txid).lower():
+            raise BeamError(
+                f"tx_split: the wallet answered txId {str(got)[:40]!r} and we asked for "
+                f"{str(txid)[:40]!r} — a transaction that is not the one we named is not ours"
+            )
+        return str(got).lower()
+
+    async def build_receive(
+        self, cid: str, msg_id: int, index: int | None = None
+    ) -> tuple[Any, str]:
         """(raw_data, args) for a CLAIM, with the pipe CID proven present in the bytes.
 
         Split from `receive` on purpose: this half is a `create_tx:false` read and CANNOT have
-        signed anything, so a caller that fails here knows it is safe to plan again."""
-        args = f"role=user,action=receive,cid={cid},msgId={int(msg_id)}"
+        signed anything, so a caller that fails here knows it is safe to plan again.
+
+        `index` is the receiver key the message was delivered to — the SIGNING blob, not the
+        contract. `GenerateKernel`'s cid stays the real pipe cid either way; only the key the
+        signature is made with changes. Absent (a legacy row) means the cid-only blob, and the
+        args are then byte-identical to every claim made before indexed keys existed."""
+        args = f"role=user,action=receive,cid={cid},msgId={int(msg_id)}{_index_arg(index)}"
         built = await self.invoke(args)
         raw = built.get("raw_data")
         if not raw:
-            raise BeamError(f"claim msg {msg_id}: no raw_data ({str(built)[:160]})")
+            # ⛔ NO raw_data IS A REFUSAL AND IS NEVER RETRIED WITH ANOTHER INDEX. The patched
+            # app checks the message's stored receiver against the key of the index it was given
+            # and refuses BEFORE signing ("receiver key mismatch: …"). Walking indexes until one
+            # is accepted is a search for somebody else's message with our signature on it; the
+            # right index is the one on the row, and a mismatch is a human's problem.
+            raise BeamError(
+                f"claim msg {msg_id}: the shader refused to build the claim "
+                f"({_shader_error(built) or str(built)[:160]})"
+            )
         if bytes.fromhex(cid) not in _blob(raw):
             raise BeamError(f"claim msg {msg_id}: the pipe CID is NOT in the calldata — refusing")
         return raw, args
 
-    async def receive(self, cid: str, msg_id: int) -> str:
+    async def receive(self, cid: str, msg_id: int, index: int | None = None) -> str:
         """CLAIM one delivered message. Returns the Beam txid."""
-        raw, _args = await self.build_receive(cid, msg_id)
+        raw, _args = await self.build_receive(cid, msg_id, index)
         return await self.submit(raw, f"claim msg {msg_id}")
 
     def bridge_args(self, cid: str, groth: int, receiver_eth: str, relayer_fee_groth: int) -> str:
@@ -477,13 +668,27 @@ async def _explorer_height() -> tuple[int | None, str]:
 
 
 async def cmd_status(out: Any = print) -> int:
-    """Everything here is read from **BeamPay** — the wallet-api is not called at all.
+    """Every BALANCE here is read from **BeamPay**; the wallet-api answers exactly one thing.
 
     That is the point of law 10: a per-address ledger balance is the only per-address truth
     that exists on Beam, and a raw wallet balance is one shared UTXO pool that includes value
     that is not ours to spend. The treasury address holds claimed-but-not-yet-shielded value
     and the BEAM every claim, shield and pipe send is paid for with; the max-privacy address
-    holds the shielded float a payout may actually cross with."""
+    holds the shielded float a payout may cross with.
+
+    ⚠️ THREE TABLES, AND THEY SAY DIFFERENT THINGS (2026-09-10):
+      * the **LEDGER** — what we OWN, per address, from BeamPay.
+      * the **WALLET** — what it can SPEND today, from `/wallet_status.totals` (still BeamPay,
+        which proxies it). The two parted company on 2026-09-10: the registry summed 0.02652864
+        bETH and the wallet could spend none of it, because a max-privacy output is locked for
+        up to 72 h after it settles. A release gated on the first alone signs a send the wallet
+        refuses.
+      * the **COINS** — how many spendable UTXOs those buckets are, from the wallet-api's
+        `get_utxo` (the one wallet-api READ this project makes; BeamPay has no route for it and
+        it moves nothing). Beam locks a whole coin per pending transaction and every contract
+        invocation also needs a BEAM coin for its fee, so this is how many crossings can be in
+        flight at once — two releases 0.7 s apart died "Not enough inputs" for want of it.
+    Plus the working float the shield policy keeps unshielded, and what it is protecting."""
     from . import payouts  # local: payouts imports this module
 
     bp = beampay.beampay()
@@ -522,6 +727,7 @@ async def cmd_status(out: Any = print) -> int:
     else:
         out(f"  BEAM (fees): {_fmt(beam_fees)}  (treasury, asset 0)")
     out("")
+    out("  BeamPay LEDGER — what we OWN (per address; the only per-address truth on Beam)")
     out("  asset   aid  treasury(unshielded)  FLOAT(shielded)  locked")
     for key, asset in ASSETS.items():
         try:
@@ -536,6 +742,62 @@ async def cmd_status(out: Any = print) -> int:
             f"{(_fmt(floated) if floated is not None else '—'):<16} {_fmt(locked)}"
         )
     out("")
+    # ⛔ AND WHAT THE WALLET CAN SPEND, WHICH IS A DIFFERENT FACT. The table above is the ledger:
+    # value that is ours. This one is `/wallet_status.totals` — value that can MOVE today.
+    # 2026-09-10: the registry said 0.02652864 bETH and the wallet said it could spend none of
+    # it (three shield chunks settled ten hours earlier, still inside the max-privacy lock).
+    # Read through the ONE reader the release gate itself uses (law 8: the prober must call the
+    # way the caller calls).
+    out("  WALLET spendable — what a send can actually fund NOW (the release gate reads this)")
+    out("  asset   regular              shielded             maturing(mp lock)    spendable coins")
+    for key, asset in ASSETS.items():
+        try:
+            spend = await payouts.wallet_spendable(bp, asset)
+        except BeamPayError as e:
+            out(f"  {key:6}  unreadable: {e}   ← that is 'we cannot see', never 'nothing to spend'")
+            continue
+        # ⛔ AND THE COIN COUNTS, WHICH ARE NOT THE BALANCE. Beam locks a whole UTXO per
+        # pending transaction, so these are how many crossings can be in flight at once — two
+        # releases 0.7 s apart died "Not enough inputs" on 2026-09-10 for want of this number.
+        coins = (
+            "coins unreadable" if spend["coins_regular"] is None
+            else f"{spend['coins_regular']} coin(s) regular · "
+                 f"{spend['coins_shielded']} coin(s) shielded"
+        )
+        out(
+            f"  {key:6}  {_fmt(spend['regular']):<19} {_fmt(spend['shielded']):<20} "
+            f"{_fmt(spend['maturing']):<19} {coins}"
+        )
+        fee_coins = spend["fee_coins"]
+        if fee_coins is None or spend["coins_regular"] is None:
+            out("          concurrency: UNKNOWN — the wallet's coin list could not be read, so "
+                "a release defers rather than guessing at how many inputs are free")
+        else:
+            out(f"          concurrency: at most "
+                f"{min(spend['coins_regular'], fee_coins)} regular / "
+                f"{min(spend['coins_shielded'], fee_coins)} shielded release(s) in flight "
+                f"({fee_coins} BEAM fee coin(s), one per invocation)")
+    out(f"  source     : {'regular first, then shielded' if payouts.spend_unshielded() else 'shielded ONLY'}"
+        f"  (PGAS_PAYOUT_SPEND_UNSHIELDED={int(payouts.spend_unshielded())}; it also decides "
+        f"whether the §9.3/S2 gate runs)")
+    out("")
+    await _print_coin_targets(bp, out)
+    out("")
+    # what the shield policy is protecting: the orders already promised out of the unshielded
+    # float, and the floor under it. Printed from the same helpers the policy itself calls.
+    out("  the working float the shield keeps unshielded (a shielded output is locked ≤ 72 h):")
+    keep_floor = max(0, int(settings.shield_keep_groth or 0))
+    for key, asset in ASSETS.items():
+        owed = await payouts.scheduled_liability_groth(asset)
+        with_buffer = payouts.liability_reserve_groth(owed)
+        if not owed and key != "ETH":
+            continue  # only the asset that has orders, plus ETH which always shows its floor
+        out(
+            f"  {key:6}  scheduled-but-unreleased {_fmt(owed)} → {_fmt(with_buffer)} with the "
+            f"{settings.shield_liability_buffer_bps} bps buffer · floor {_fmt(keep_floor)} "
+            f"→ keeps {_fmt(max(keep_floor, with_buffer))}"
+        )
+    out("")
     try:
         ready = await bp.expectation_route_ready()
         out(f"  attribution: direct available={ready.get('available')} "
@@ -546,8 +808,101 @@ async def cmd_status(out: Any = print) -> int:
     out(f"  flags      : claim={int(settings.claim_enabled)} shield={int(settings.shield_enabled)} "
         f"payout_direct={int(settings.payout_direct_enabled)} "
         f"payout_instant={int(settings.payout_instant_enabled)} paused={int(_paused())}")
+    out("")
+    await _print_distributor(out)
     await _print_intents(out)
     return 0
+
+
+async def _print_coin_targets(bp: beampay.BeamPay, out: Any) -> None:
+    """Target vs actual COINS, per asset, and the one line that says what to do about it (T36).
+
+    ⛔ The counts are the release gate's own (`utxo.coin_targets` → `payouts.wallet_spendable`),
+    not a second implementation of them: an operator who reads a different number here than the
+    number that held the payout has been told a story, not a fact. A count that could not be
+    read prints UNREADABLE and never 0 — "we cannot see" is not "there are none" (law 8)."""
+    from . import utxo  # local: utxo imports payouts, which imports this module
+
+    out("  COIN TARGETS — how many coins the policy wants free, and how many there are")
+    out("  asset   have  target  state                                       what they fund")
+    try:
+        targets = await utxo.coin_targets(bp)
+    except (BeamPayError, BeamError) as e:
+        out(f"  ⛔ unreadable ({e}) — that is 'we cannot see', never 'the wallet has none'")
+        return
+    for key in (utxo.BEAM_KEY, *ASSETS):
+        row = targets.get(key) or {}
+        have, target = row.get("have"), int(row.get("target") or 0)
+        note = ""
+        if have is None:
+            note = f"UNREADABLE — {row.get('why') or 'no reason recorded'}"
+        elif int(have) < target and int(row.get("spendable_groth") or 0) > 0:
+            note = "← below target"
+        elif int(have) < target:
+            note = "(holds none of this asset — not a shortage)"
+        what = "fee coins, one per BEAM-spending leg" if key == utxo.BEAM_KEY else "payout coins"
+        out(
+            f"  {key:6} {('—' if have is None else have):>5}  {target:>6}  "
+            f"{note:<44}{what}"
+        )
+    need = utxo.split_needed(targets)
+    out(f"  split needed: {', '.join(need) if need else 'none'}")
+    if need:
+        out(
+            f"               → python -m pgasme.beam split --asset {need[0]}   (dry run; add "
+            f"--apply to make it. BEAM first: every other split pays its fees in BEAM coins)"
+        )
+
+
+async def _print_distributor(out: Any) -> None:
+    """The INSTANT payout distributor (T34): which address, how much ETH it can still pay out
+    of, which nonce it will sign next, and when it was last topped up.
+
+    ⛔ THE FLOAT PRINTED HERE IS THE LAST ONE A PASS READ, not a fresh read — the same number
+    /v1/health serves, from the same row, so an operator and a monitor can never disagree about
+    it. The gates read the chain; this is evidence. The KEY FILE'S PATH is printed and its
+    CONTENT never is."""
+    from . import distributor  # local: distributor imports config/db, not this module
+
+    if not distributor.configured():
+        out("  distributor: — (PGAS_DISTRIBUTOR_KEY_FILE is not set; instant payouts have no float)")
+        return
+    try:
+        addr = distributor.address()
+    except distributor.KeyFileError as e:
+        out(f"  distributor: ⛔ the key file could not be loaded — {e}")
+        return
+    row = await distributor.active_row()
+    if not row:
+        out(f"  distributor: {addr}  (key {distributor.key_path()})")
+        out("               no row yet — the first instant payout or refill pass registers it "
+            "and seeds its nonce from the chain")
+        return
+    have = int(str(row.get("float_wei") or "0"))
+    low = int(settings.distributor_float_min_wei)
+    mark = "⛔ BELOW THE FLOOR" if have < low else "ok"
+    age = f"{int(time.time() - float(row.get('float_at') or 0))}s ago" if row.get("float_at") else "never read"
+    out(f"  distributor: {addr}  state={row.get('state')}  (key {row.get('key_file')})")
+    out(f"               float {have} wei ({have / 1e18:.6f} ETH, {age}) · floor {low} · "
+        f"target {int(settings.distributor_float_target_wei)}  {mark}")
+    out(f"               next nonce {row.get('nonce_next')} "
+        f"(seeded from the chain at {row.get('nonce_seeded_from_chain')}) · gas "
+        f"{int(settings.instant_gas_limit)} × {settings.instant_gas_headroom:g} headroom")
+    last = row.get("last_refill") or {}
+    if last:
+        out(f"               last refill {last.get('wei')} wei as {last.get('ref')} "
+            f"{int(time.time() - float(last.get('at') or 0))}s ago")
+    else:
+        out("               last refill: none — the float was funded by hand, or not at all")
+    d = db()
+    paying = await d.payout_requests.count_documents({"status": "paying"})
+    # ⛔ `failed` is not a payout status any more (T40): nothing in the processor writes it, so
+    # a filter that excludes it is excluding a state that cannot occur — and would silently miss
+    # the two that CAN, `delayed` and `held`, both of which are still crossings in flight.
+    refills = await d.payout_requests.count_documents(
+        {"mode": "refill", "status": {"$nin": ["sent", "cancelled"]}}
+    )
+    out(f"               in flight: {paying} instant payout(s) on the wire · {refills} refill(s) crossing")
 
 
 async def _print_intents(out: Any) -> None:
@@ -560,6 +915,7 @@ async def _print_intents(out: Any) -> None:
     held_d = await d.deposits.count_documents({"treasury": "held"})
     out(f"  pending intents: {len(rows)} payout · {len(deps)} treasury"
         + (f"   ⚠️ HELD FOR A HUMAN: {held_p} payout · {held_d} deposit" if held_p or held_d else ""))
+    await _print_waiting(out)
     for r in rows:
         out(
             f"    payout   {r['_id']} {r.get('status')} amount {_fmt(int(r.get('amount_groth', 0)))} "
@@ -571,6 +927,45 @@ async def _print_intents(out: Any) -> None:
             f"    treasury {r['_id']} {r.get('treasury')} claim_txid={r.get('claim_txid') or '—'} "
             f"shield_txids={len(r.get('shield_txids') or [])}/{len(r.get('shield_plan') or [])}"
         )
+
+
+async def _print_waiting(out: Any) -> None:
+    """⛔ **NOTHING FAILS ANY MORE, SO SOMETHING HAS TO SAY WHAT IS WAITING** (T40). An order
+    the user was told is "delayed" is one an operator has to be able to see in one command: the
+    reason in the processor's own words, how many rungs of the ladder it has climbed, and when
+    it will be tried again. A `held` row is the same thing with nobody retrying it.
+
+    The ETA comes from `payouts.eta_for` — the SAME function the user's own page reads — so an
+    operator and the person asking them never see two different answers (law 9)."""
+    from . import payouts  # local: payouts imports this module
+
+    d = db()
+    delayed = await d.payout_requests.find({"status": payouts.DELAYED}).to_list(50)
+    held = await d.payout_requests.find({"status": payouts.HELD}).to_list(50)
+    if not delayed and not held:
+        return
+    now = time.time()
+    out("")
+    out("  DELAYED / HELD payout orders — the money is RESERVED and nothing was refunded")
+    for r in delayed:
+        nxt = float(r.get("next_attempt_at") or 0)
+        when = f"in {int(nxt - now)}s" if nxt > now else "now (due)"
+        eta_at, tail_s, _note = payouts.eta_for(r)
+        out(
+            f"    delayed  {r['_id']} {_fmt(int(r.get('amount_groth') or 0))} "
+            f"{r.get('asset') or 'ETH'} · attempt {len(payouts.attempts_of(r)) + 1} "
+            f"(delay {int(r.get('delays') or 0)}, from {r.get('delayed_from') or '—'}) · "
+            f"next try {when} · arrives ≈ "
+            f"{int(eta_at - now) if eta_at else '—'}s (tail {int(tail_s // 3600)}h)"
+        )
+        out(f"             why: {r.get('hold_reason') or 'no reason was recorded on the row'}")
+    for r in held:
+        out(
+            f"    HELD     {r['_id']} {_fmt(int(r.get('amount_groth') or 0))} "
+            f"{r.get('asset') or 'ETH'} · from {r.get('held_from') or '—'} · nothing retries "
+            f"this; the user still sees it as delayed"
+        )
+        out(f"             why: {r.get('hold_reason') or 'no reason was recorded on the row'}")
 
 
 async def cmd_dry_run_payout(request_id: str, out: Any = print) -> int:
@@ -590,8 +985,16 @@ async def cmd_dry_run_payout(request_id: str, out: Any = print) -> int:
     out(f"  pipe cid     : {asset.beam_cid}")
     out(f"  receiver W   : {row['W']}")
     out(f"  amount       : {_fmt(amount)} {asset.key}  ({amount} groth)")
-    charged = int(row.get("fee_groth") or 0)
-    out(f"  our fee (2%) : {_fmt(charged)} — already debited at schedule")
+    # ⛔ THE NUMBERS THE GATES READ, READ THROUGH THE GATES' OWN HELPERS (law 8: the prober must
+    # call the way the caller calls). Our 2% is revenue; what the release measures its cost
+    # against is the bridge fee THIS order funded — `payouts.bridge_budget_groth`, with the
+    # pre-2026-09-10 fallback in one place. Printed apart so an operator can see both.
+    ours = int(row.get("fee_groth") or 0)
+    charged = payouts.bridge_budget_groth(row)
+    modern = payouts.funds_its_own_crossing(row)
+    out(f"  our fee (2%) : {_fmt(ours)} — already debited at schedule (revenue, not a budget)")
+    out(f"  bridge fee funded: {_fmt(charged)} — what the subsidy gate measures against"
+        + ("" if modern else "  [legacy row: our 2% WAS the budget]"))
     try:
         fee_groth, floor_groth, detail = await payouts.relayer_fee_for(asset, payouts.get_rpc())
     except Exception as e:  # noqa: BLE001 — a CLI prints the failure, it never tracebacks
@@ -604,16 +1007,29 @@ async def cmd_dry_run_payout(request_id: str, out: Any = print) -> int:
            if fee_groth > int(detail.get("fee_before_floor_groth") or fee_groth) else ""))
     out(f"  treasury pays: {_fmt(amount + fee_groth)} (amount + relayerFee)")
     share = fee_groth / amount if amount else 1.0
-    out(f"  relayer share: {share:.3%} (max {settings.max_relayer_share:.0%}) "
-        f"{'OK' if share <= settings.max_relayer_share else '⛔ TOO HIGH'}")
+    if modern:
+        # the share gate does not run for a row that paid for its own crossing: at a 1-groth
+        # floor it would hold every small payout, which is the defect it became on 2026-09-10
+        out(f"  relayer share: {share:.3%} — not a gate for this row (it funded its crossing)")
+    else:
+        out(f"  relayer share: {share:.3%} (max {settings.max_relayer_share:.0%}) "
+            f"{'OK' if share <= settings.max_relayer_share else '⛔ TOO HIGH'}")
+    limit = relayer_subsidy()  # the ONE reader — 0 / unset / below 1 all mean 1×
     subsidy = fee_groth / charged if charged else float("inf")
-    out(f"  vs the 2% charged: {_fmt(fee_groth)} paid against {_fmt(charged)} collected "
-        f"({subsidy:.2f}×, limit {settings.max_relayer_subsidy:g}×) "
-        f"{'OK' if fee_groth <= charged * settings.max_relayer_subsidy else '⛔ LOSS-MAKING'}")
+    out(f"  vs the bridge fee funded: {_fmt(fee_groth)} paid against {_fmt(charged)} funded "
+        f"({subsidy:.2f}×, limit {limit:g}×) "
+        f"{'OK' if fee_groth <= charged * limit else '⛔ LOSS-MAKING'}")
     bp = beampay.beampay()
     mp = await payouts.float_address()
     out(f"  float address : {mp or '— none configured; the release would hold'}  (BeamPay; "
-        f"the address this crossing BOOKS to)")
+        f"the shielded float's primary — where a SHIELDED crossing books)")
+    # ⛔ **WHERE A CROSSING BOOKS IS ITS SOURCE, NOT THE MAX-PRIVACY ADDRESS** (law 8: the prober
+    # must call the way the caller calls). Step 4 below printed `mp` whatever the source was, so
+    # a dry run of a regular-funded crossing previewed the registration that drives MP negative
+    # and leaves the treasury untouched — the drift `attribution_address` exists to make
+    # impossible, shown to the operator as if it were the plan. `attribution_address` is the ONE
+    # reader: the row once `_payout_scheduled` has decided, the primary as its only fallback.
+    reg_addr = await payouts.attribution_address(row)
     try:
         treasury = beampay.treasury_address()
         registry = await payouts.mp_registry()
@@ -622,17 +1038,72 @@ async def cmd_dry_run_payout(request_id: str, out: Any = print) -> int:
             f"SUM over them (one per shield chunk)")
         reserved = await payouts.inflight_groth(asset, request_id)
         need = amount + fee_groth + settings.float_min_groth
+        parts = await payouts.payout_float(bp, asset)
         out(f"  shielded float: {_fmt(fl)} · {_fmt(reserved)} committed to crossings in flight "
-            f"· needs {_fmt(need)} → {'ENOUGH' if fl - reserved >= need else 'NOT ENOUGH'}")
+            f"· needs {_fmt(need)} → "
+            f"{'ENOUGH' if int(parts['total']) - reserved >= need else 'NOT ENOUGH'}")
         reg = await bp.available_groth(treasury, asset.aid)
-        out(f"  unshielded    : {_fmt(reg)} {asset.key} (treasury) · inputs proven="
+        out(f"  unshielded    : {_fmt(reg)} {asset.key} (treasury) · counted as float="
+            f"{int(payouts.spend_unshielded())} · inputs proven="
             f"{int(settings.beam_send_inputs_proven)} → "
-            f"{'OK' if settings.beam_send_inputs_proven or reg <= settings.beam_regular_tolerance_groth else '⛔ REFUSES (spec S2 unanswered)'}")
+            f"{'OK' if payouts.spend_unshielded() or settings.beam_send_inputs_proven or reg <= settings.beam_regular_tolerance_groth else '⛔ REFUSES (spec S2 unanswered)'}")
+        # ⛔ THE BUCKET THE WALLET CAN ACTUALLY SPEND — the gate the dry run exists to preview.
+        # Asked through `payouts.wallet_spendable`, the same reader the release calls, so an
+        # operator reading this sees the number the gate will see (law 8).
+        try:
+            spend = await payouts.wallet_spendable(bp, asset)
+        except BeamPayError as e:
+            out(f"  wallet spendable: unreadable ({e}) — the release would HOLD, never send")
+        else:
+            order = [s for s in payouts.SOURCES
+                     if s != payouts.SOURCE_REGULAR or payouts.spend_unshielded()]
+            owned = [s for s in order if int(parts[s]) >= need]
+            source = next((s for s in owned if int(spend[s]) - reserved >= need), None)
+            out(f"  wallet spendable: {_fmt(spend['regular'])} regular · "
+                f"{_fmt(spend['shielded'])} shielded · {_fmt(spend['maturing'])} maturing "
+                f"(max-privacy lock, up to 72 h after a shield settles)")
+            addr = (
+                treasury if source == payouts.SOURCE_REGULAR
+                else (mp if source == payouts.SOURCE_SHIELDED else "")
+            )
+            # a row that has not been released yet has decided nothing, so the SOURCE this dry
+            # run just picked is what the release would register; a row that HAS decided keeps
+            # its own answer, because the row is the authority (`attribution_address`)
+            if not row.get("source_address"):
+                reg_addr = addr or reg_addr
+            out(f"  source        : {source or '⛔ NONE — the release would HOLD'}"
+                + (f" → books to {addr}" if addr else ""))
         budget, why = await payouts.fee_budget("send", bp)
         out(f"  BEAM for fees : {_fmt(await bp.available_groth(treasury, 0))} (treasury, asset 0)"
             f" · this call reserves {payouts.fee_budget_line('send', budget, why)}")
     except BeamPayError as e:
         out(f"  shielded float: unreadable ({e}) — that is 'we cannot see', never 'no float'")
+    # ⛔ **THE STEP THAT COMES BEFORE THE CROSSING** (T40): a regular-funded crossing is sent
+    # from an address created for THIS order and nothing else, and the dry run has to preview it
+    # or an operator reading this is being shown a release that no longer exists. A SHIELDED
+    # crossing is unchanged — its value is already inside Lelantus.
+    fund_need = payouts.crossing_groth(row) + fee_groth
+    out("")
+    if row.get("source") == payouts.SOURCE_SHIELDED:
+        out("  the crossing is SHIELDED-funded: no fresh address, it books to the max-privacy "
+            "primary (that pool is never refilled — shielding is off)")
+    else:
+        out("  a FRESH Beam address for this crossing (the treasury never sends from itself):")
+        out("   0a) POST " + bp.url + "/create_wallet   " + json.dumps(
+            {"note": payouts.crossing_note(request_id), "wallet_type": "regular",
+             "expiration": "never"}
+        ) + (f"   ← already created: {row['source_address']}" if row.get("source_address")
+             else "   ← created ONCE per order; a retry reuses it"))
+        out("   0b) POST " + bp.url + "/withdraw   " + json.dumps(
+            {"from_address": "<the treasury>",
+             "to_address": row.get("source_address") or "<the address 0a answers>",
+             "asset_id": asset.aid, "amount": fund_need,
+             "comment": payouts.fund_comment(request_id)}
+        ))
+        out(f"       exactly {_fmt(fund_need)} = amount + relayerFee, so the address ends at "
+            f"ZERO once the crossing burns it. /withdraw is NOT idempotent and answers no "
+            f"txid — the comment is its identity and a lost answer is resolved from history")
+        out("       the release WAITS for that transfer to settle before it signs anything")
     args = w.bridge_args(asset.beam_cid, amount, row["W"], fee_groth)
     out("")
     out("  the exact JSON-RPC calls (nothing is sent):")
@@ -648,11 +1119,12 @@ async def cmd_dry_run_payout(request_id: str, out: Any = print) -> int:
     out("   4) POST " + bp.url + "/internal/expect_contract_tx   (X-API-Key: "
         "PGAS_BEAMPAY_INTERNAL_KEY, scope ledger:adjust)")
     out("      " + json.dumps(
-        {"txid": "<the txid step 3 returns>", "address": mp or "<PGAS_BEAM_MP_ADDRESS>",
+        {"txid": "<the txid step 3 returns>", "address": reg_addr or "<PGAS_BEAM_MP_ADDRESS>",
          "trade_ref": request_id}
     ) + "   ← the registration, BEFORE the row advances")
-    out("      the float that funds the crossing is the max-privacy address, so the flow books "
-        "there; without this the whole invocation books to __house__")
+    out("      the flow books to the address that FUNDS the crossing (the treasury for a "
+        "regular source, the max-privacy primary for a shielded one); without this the whole "
+        "invocation — the bETH and its BEAM fee — books to __house__")
     try:
         raw, _args, blob = await w.build_bridge_send(asset.beam_cid, amount, row["W"], fee_groth)
         out(f"  calldata verified: receiver ✅  cid ✅  ({len(blob):,} bytes) — step 2 passes")
@@ -685,15 +1157,35 @@ async def cmd_dry_run_claim(deposit_id: str, out: Any = print) -> int:
     if msg_id is None:
         out("  ⛔ this deposit has no pipe message id — nothing to claim")
         return 1
+    # ⛔ THE DRY RUN MUST ASK THE SAME QUESTION THE LIVE PASS ASKS. A message delivered to an
+    # indexed receiver key is invisible to a `view_incoming` that was not told about that index,
+    # so a dry run without them would report "not yet" for a claim the processor can make — a
+    # dry run that reports LESS than the live run is how a real drain once logged "nothing moved".
+    from .receiver_keys import claim_index, open_indexes  # local: it imports this module
+
+    index = claim_index(dep)
     try:
-        incoming = await w.view_incoming(asset.beam_cid)
+        indexes = await open_indexes(asset)
+    except Exception as e:  # noqa: BLE001 — an unreadable database is not "no indexes"
+        out(f"  ⛔ could not read the open receiver indexes: {e}")
+        return 1
+    view_args = f"role=manager,action=view_incoming,startFrom=0,cid={asset.beam_cid}" + (
+        ",indexes=" + INDEX_LIST_SEP.join(str(i) for i in indexes) if indexes else ""
+    )
+    out(f"  receiver key: {'legacy (cid blob)' if index is None else f'index {index}'}"
+        f"   · view_incoming asks about {indexes or '[legacy only]'}")
+    try:
+        incoming = await w.view_incoming(asset.beam_cid, indexes)
     except BeamError as e:
         out(f"  ⛔ view_incoming unreadable: {e} (that is 'we cannot see', never 'not delivered')")
         return 1
     mine = [m for m in incoming if m["msg_id"] == int(msg_id)]
     out(f"  view_incoming: {len(incoming)} claimable · ours {'PRESENT' if mine else 'not yet'}"
         + (f" (amount {mine[0]['amount']})" if mine else ""))
-    args = f"role=user,action=receive,cid={asset.beam_cid},msgId={int(msg_id)}"
+    args = (
+        f"role=user,action=receive,cid={asset.beam_cid},msgId={int(msg_id)}"
+        + _index_arg(index)
+    )
     out("")
     out("  the exact JSON-RPC calls (nothing is sent):")
     out("   0) " + json.dumps(
@@ -701,7 +1193,7 @@ async def cmd_dry_run_claim(deposit_id: str, out: Any = print) -> int:
             "jsonrpc": "2.0", "id": 1, "method": "invoke_contract",
             "params": {
                 "contract_file": w.shader,
-                "args": f"role=manager,action=view_incoming,startFrom=0,cid={asset.beam_cid}",
+                "args": view_args,
                 "create_tx": False,
             },
         }
@@ -1011,6 +1503,65 @@ async def cmd_replan_shield(deposit_id: str, apply: bool = False, out: Any = pri
     return 0
 
 
+def _opt(argv: list[str], name: str) -> str | None:
+    """`--name value` out of an argv, or None. Raises ValueError when the flag is there with
+    nothing after it — a flag whose value silently became the next flag is a money bug."""
+    if name not in argv:
+        return None
+    i = argv.index(name)
+    if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+        raise ValueError(f"{name} needs a value")
+    return argv[i + 1]
+
+
+async def cmd_split(argv: list[str], out: Any = print) -> int:
+    """`split --asset BEAM|ETH|DAI|WBTC [--coins N] [--size <groth>] [--method M] [--apply]`
+    or `split --abandon <plan id> [--reason "…"]`.
+
+    Dry run by default and refusing on every gate at `--apply` — the whole policy, the plan and
+    every guard live in `pgasme/utxo.py`; this is the argv."""
+    from . import utxo  # local: utxo imports payouts, which imports this module
+
+    try:
+        asset = _opt(argv, "--asset")
+        coins = _opt(argv, "--coins")
+        size = _opt(argv, "--size")
+        method = _opt(argv, "--method")
+        abandon = _opt(argv, "--abandon")
+        why = _opt(argv, "--reason")
+    except ValueError as e:
+        out(str(e))
+        return 2
+    if abandon:
+        # ⛔ THE ONLY WAY OUT OF THE RESUME SET, and it spends nothing: `utxo.abandon_plan`
+        # refuses unless every leg is settled or refused and the split address is empty in every
+        # asset. Without it an open plan whose work is over captures every later split of that
+        # asset and there is nothing to do but edit Mongo by hand, which is forbidden.
+        if "--apply" in argv or asset or coins or size or method:
+            out("--abandon takes only a plan id and an optional --reason; it changes nothing "
+                "on chain, so there is no --apply and no --asset to give it")
+            return 2
+        return await utxo.abandon_plan(abandon, why, out=out)
+    if not asset:
+        out("split needs --asset BEAM|ETH|DAI|WBTC (or --abandon <plan id>)")
+        return 2
+    if method and method not in utxo.SPLIT_METHODS:
+        out(f"--method takes {' or '.join(utxo.SPLIT_METHODS)} (got {method!r})")
+        return 2
+    try:
+        return await utxo.cmd_split(
+            asset,
+            coins=int(coins) if coins else None,
+            size=int(size) if size else None,
+            method=method or None,
+            apply="--apply" in argv,
+            out=out,
+        )
+    except ValueError:
+        out("--coins and --size take whole numbers (--size is in groths)")
+        return 2
+
+
 USAGE = """python -m pgasme.beam <command>
 
   status                        wallet height vs node, balances per asset, float, pending intents
@@ -1020,6 +1571,22 @@ USAGE = """python -m pgasme.beam <command>
                                 which FAILED chunks a re-plan would hand back to the processor
                                 [--apply]  clear the hold and mark them unsent, so they are
                                            re-sent to FRESH max-privacy addresses
+  split --asset <A>             make the treasury MORE COINS of one asset (BEAM|ETH|DAI|WBTC).
+                                Beam locks a whole coin per pending transaction, so the coin
+                                COUNT is what bounds concurrency — `status` says when one is
+                                short. The default cuts them in ONE wallet transaction
+                                (`tx_split`): one fee, no transfers, no notifications
+                                [--coins N]        how many to end with (default: the policy's)
+                                [--size <groth>]   each coin's size (default: derived)
+                                [--method M]       tx_split (default) | beampay (the FALLBACK:
+                                                   2 transfers per coin, 2 fees, and three
+                                                   Telegram notifications for every one of them)
+                                [--apply]          make it; without it nothing is sent
+  split --abandon <plan id>     close an OPEN plan whose work is over so it stops capturing every
+                                new split of that asset (a resume adopts the open plan's METHOD).
+                                Refuses unless every leg is settled/refused and its split address
+                                is empty in every asset. Changes nothing on chain.
+                                [--reason "…"]     recorded on the plan and on an event row
   repair-fee --txid <txid>      the ledger/adjust that books an unregistered contract tx's BEAM
                                 fee leg off __house__ (a one-off for the OLD claim path)
                                 [--apply]           post it; without it nothing is sent
@@ -1028,8 +1595,11 @@ USAGE = """python -m pgasme.beam <command>
                                                     replay idempotent)
 
 Every command reads only, EXCEPT `repair-fee --apply`, which posts one zero-sum BeamPay
-ledger adjustment, and `replan-shield --apply`, which writes one transition on one deposit row.
-Nothing here ever reaches the wallet's signing path.
+ledger adjustment, `replan-shield --apply`, which writes one transition on one deposit row, and
+`split --apply`, which asks the WALLET to cut one of its own coins into several (`tx_split`;
+value never leaves the wallet — only the kernel fee is spent), or with `--method beampay`
+makes a series of BeamPay `/withdraw` transfers between two addresses of our own wallet.
+`split --apply` is the ONLY command here that reaches the wallet's signing path.
 """
 
 
@@ -1055,6 +1625,8 @@ async def cli_main(argv: list[str], out: Any = print) -> int:
             return await cmd_dry_run_claim(argv[i + 1], out)
         out("dry-run needs --payout <id> or --claim <deposit id>")
         return 2
+    if cmd == "split":
+        return await cmd_split(argv, out)
     if cmd == "replan-shield":
         if "--deposit" not in argv or argv.index("--deposit") + 1 >= len(argv):
             out("replan-shield needs --deposit <deposit id>")

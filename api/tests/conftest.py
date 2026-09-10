@@ -336,6 +336,13 @@ class FakeRpc:
         self.logs_: list[dict[str, Any]] = []
         self.receipts: dict[str, dict[str, Any]] = {}
         self.txs: dict[str, dict[str, Any]] = {}
+        # eth_getTransactionByHash PER ENDPOINT: `txs` is what a listed endpoint answers unless
+        # it has its own table here, and an endpoint in `dead_urls` answers nothing at all.
+        # This is how "the first endpoint of the pool hides pending transactions" is written
+        # down — the 2026-09-10 incident, where mevblocker's `null` was read as "no such
+        # transaction" and two real deposits were refused.
+        self.txs_by_url: dict[str, dict[str, Any]] = {}
+        self.dead_urls: set[str] = set()
         self.fail_ranges: set[tuple[int, int]] = set()
         self.calls: list[tuple[Any, ...]] = []
         # eth_getCode: address (lowercase) -> code hex. Anything not listed is an EOA ("0x");
@@ -352,6 +359,13 @@ class FakeRpc:
         self.gas_gwei: float | None = 1.0
 
     async def block_number(self, prefer: str | None = None, pin: bool = False) -> int:
+        # ⛔ THE DOUBLE HAS TO BE DEAD WHERE THE CALLER READS (T40b F13). `head_dead` used to
+        # stop `head_from` only, and the destination re-read has moved to
+        # `ethpipe.code_at_head_anywhere`, which asks each ENDPOINT for its own head through
+        # here — so a "dead pool" that still answered this one was a pool the guard could not
+        # meet. The prober must call the way the caller calls, and so must the fake.
+        if self.head_dead:
+            raise ethpipe.RpcError("eth_blockNumber: no endpoint answered")
         if prefer is not None and prefer in self.heads:
             return self.heads[prefer]
         return self.head
@@ -427,6 +441,23 @@ class FakeRpc:
         self, tx: str, prefer: str | None = None, pin: bool = False
     ) -> dict[str, Any] | None:
         return self.txs.get(tx)
+
+    async def transaction_anywhere(
+        self, tx: str
+    ) -> tuple[dict[str, Any] | None, str | None, int, list[str]]:
+        """Every endpoint in order; the first that HAS it wins. `answered` counts the endpoints
+        that gave a real answer — 0 means nobody could be asked, which is never a verdict."""
+        answered = 0
+        errors: list[str] = []
+        for url in self.urls:
+            if url in self.dead_urls:
+                errors.append(f"{url}: RpcError: no answer")
+                continue
+            answered += 1
+            got = self.txs_by_url.get(url, self.txs).get(tx)
+            if got:
+                return got, url, answered, errors
+        return None, None, answered, errors
 
 
 @pytest.fixture(autouse=True)

@@ -308,6 +308,9 @@ export function initWalletConnect(): Promise<Eip1193Provider> {
       ),
     ]);
     const chains = listed.length ? listed : WC_FALLBACK_CHAINS;
+    // The endpoint WalletConnect will read each chain through: the head of the same order every
+    // other read in this app uses, so a pick in the RPC settings popup is not quietly ignored by
+    // the one reader that is configured up front rather than per call (T54).
     const rpcMap: Record<number, string> = {};
     for (const id of chains) {
       const url = fallbackUrls(id)[0];

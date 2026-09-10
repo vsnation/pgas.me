@@ -69,6 +69,10 @@ def beam_pay(monkeypatch: pytest.MonkeyPatch) -> FakeBeamPay:
     beampay.set_beampay(bp)
     monkeypatch.setattr(settings, "beam_treasury_address", TREASURY)
     monkeypatch.setattr(settings, "beam_mp_address", MP)
+    # the working-float policy (PGAS_SHIELD_KEEP_GROTH) has its own file
+    # (test_beam_payout_spendable); this one tests the shield MECHANICS, so the
+    # policy is pinned out of the way rather than silently deciding these cases
+    monkeypatch.setattr(settings, "shield_keep_groth", 0)
     monkeypatch.setattr(settings, "hold_backoff_s", 0.0)
     yield bp
     beampay.set_beampay(None)
@@ -271,15 +275,20 @@ async def test_nothing_is_signed_until_beampay_can_accept_the_registration(
     await payouts.process_once()
 
     row = await payout(mock_db)
-    assert row["status"] == "scheduled" and "cannot accept a contract-tx registration" in row["hold_reason"]
+    assert row["status"] == "scheduled" and "cannot accept a contract-tx registration" in row["hold_detail"]
     dep = await deposit(mock_db)
     assert dep["treasury"] == "claiming" and "cannot accept a contract-tx registration" in dep["hold_reason"]
     assert beam.wallet().methods().count("process_invoke_data") == 0  # NOTHING was signed
 
     beam_pay.missing_routes.clear()
     await payouts.process_once()
-    assert (await payout(mock_db))["status"] == "releasing"
-    assert beam_pay.expectations["beamtx-1"]["address"] == MP
+    row = await payout(mock_db)
+    assert row["status"] == "releasing"
+    # the registration goes to the address the SOURCE decided (2026-09-10): this pass has a
+    # claimed deposit sitting unshielded at the treasury, so the crossing is regular-funded —
+    # and since T40 that means this order's OWN fresh Beam address, never the treasury itself.
+    assert beam_pay.expectations[row["beam_txid"]]["address"] == row["source_address"]
+    assert row["source_address"] not in (TREASURY, MP) and row["crossing_address"] is True
 
 
 async def test_an_unset_internal_key_is_a_refusal_before_the_burn_not_after_it(
@@ -294,7 +303,7 @@ async def test_an_unset_internal_key_is_a_refusal_before_the_burn_not_after_it(
     await payouts.process_once()
     row = await payout(mock_db)
     assert row["status"] == "scheduled"
-    assert "PGAS_BEAMPAY_INTERNAL_KEY is not configured" in row["hold_reason"]
+    assert "PGAS_BEAMPAY_INTERNAL_KEY is not configured" in row["hold_detail"]
     assert beam.wallet().methods().count("process_invoke_data") == 0
 
 
@@ -370,8 +379,14 @@ async def test_the_beam_fee_gate_reads_the_address_the_payout_fee_books_to(
     asset-0 balance, which `_beam_fees_ok` read, never falls for a payout however many
     crossings drain the wallet. The gate that exists to stop a fee-starved wallet failing
     mid-chain drifted high without bound."""
-    # 0.155 BEAM: enough for ONE derived send budget (the 0.15 floor) and not for two
-    beam_pay.addresses[TREASURY]["available"]["0"] = 15_500_000
+    # ⚠️ 2026-09-10 (T33): the numbers moved because a SECOND gate now stands in front of this
+    # one — how many BEAM coins the wallet has free (`payouts.coin_capacity`), not just how much
+    # BEAM. Both refuse a starving wallet; only this one can see the MP drain, which is what
+    # this test is about. So the wallet is given enough coins for two concurrent releases and
+    # the drain is made large enough to be the binding constraint — the law is unchanged: the
+    # fee gate SUMS the registered address, and a payout fee never touches the treasury's own
+    # asset-0 balance.
+    beam_pay.addresses[TREASURY]["available"]["0"] = 40_000_000  # 0.4 BEAM, 8 coins of 0.05
     eth.start = {ETH.pipe.lower(): 5 * 10**18}
     await make_payout(mock_db, rid="r1")
     await payouts.process_once()
@@ -381,17 +396,20 @@ async def test_the_beam_fee_gate_reads_the_address_the_payout_fee_books_to(
     deltas = beam_pay.book_attribution("beamtx-1")
     assert deltas["0"] == -1_100_000  # the fee, off the REGISTERED address
     assert beam_pay.addresses[MP]["available"]["0"] == -1_100_000
-    assert beam_pay.addresses[TREASURY]["available"]["0"] == 15_500_000  # never moved
+    assert beam_pay.addresses[TREASURY]["available"]["0"] == 40_000_000  # never moved
 
+    # …and a crossing history that has really drained the max-privacy address: the treasury's
+    # own balance still says 0.4 BEAM, and the wallet is nearly out
+    beam_pay.addresses[MP]["available"]["0"] = -30_000_000
     await make_payout(mock_db, rid="r2")
     await payouts.process_once()
     row = await payout(mock_db, "r2")
     assert row["status"] == "scheduled"  # the drain is VISIBLE to the gate now
-    assert row["hold_reason"] == (
-        "the wallet holds 0.144 BEAM and this call reserves 0.15 BEAM for a send "
+    assert row["hold_detail"] == (
+        "the wallet holds 0.1 BEAM and this call reserves 0.15 BEAM for a send "
         "(1 settled send(s) read back, worst 0.011 × 1.5, floor 0.15)"
     )
-    assert any("max-privacy address's BEAM balance is -0.011" in t for t in paged)
+    assert any("max-privacy address's BEAM balance is -0.3" in t for t in paged)
 
 
 # ============================================ §F · the kill switch lives in the mover
@@ -595,7 +613,7 @@ async def test_a_held_release_stays_reserved_against_the_float(mock_db, eth, arm
     await make_payout(mock_db, rid="fresh", amount=2 * GROTH)
     await payouts.process_once()
     row = await payout(mock_db, "fresh")
-    assert row["status"] == "scheduled" and "already committed to crossings in flight" in row["hold_reason"]
+    assert row["status"] == "scheduled" and "already committed to crossings in flight" in row["hold_detail"]
 
     # only an operator's explicit resolution frees it
     await mock_db["pgasme_test"].payout_requests.update_one(
@@ -615,8 +633,8 @@ async def test_the_hold_says_the_float_is_now_wrong_by_a_known_amount(mock_db, e
     await payouts.process_once()
     row = await payout(mock_db)
     assert row["status"] == "held"
-    assert "stays RESERVED against the shielded float" in row["hold_reason"]
-    assert "float_resolved" in row["hold_reason"]
+    assert "stays RESERVED against the shielded float" in row["hold_detail"]
+    assert "float_resolved" in row["hold_detail"]
 
 
 # ============================================ §I · a delivery is identified, never assumed
@@ -686,7 +704,7 @@ async def test_an_unattributable_block_is_held_and_never_scanned_past(mock_db, e
     await payouts.process_once()
     row = await payout(mock_db)
     assert row["status"] == "delivering"
-    assert "cannot be attributed" in row["hold_reason"]
+    assert "cannot be attributed" in row["hold_detail"]
     assert row["eth_scan_from"] == block - 1  # ⛔ NOT past it
 
     # the sibling that explains the rest turns up, and both settle from the same block
@@ -744,7 +762,7 @@ async def test_a_second_row_claiming_one_message_holds_instead_of_crashing(
     await payouts.process_once()  # → bridging
     await payouts.process_once()  # the kernel: message 1 is already somebody's evidence
     row = await payout(mock_db)
-    assert row["status"] == "bridging" and "already booked to another payout" in row["hold_reason"]
+    assert row["status"] == "bridging" and "already booked to another payout" in row["hold_detail"]
     assert await ledger.find_entry("release", "req1") is None
 
 

@@ -1,5 +1,12 @@
-"""POST /v1/quote, mode "uniswap": the registry, the Quoter read, the calldata the user signs,
-and every way this route refuses.
+"""POST /v1/quote, mode "uniswap" — THE ONE-TRANSACTION HOOK SHAPE (the reviewed reference).
+
+⚠️ NOT WHAT SHIPS. `PGAS_UNISWAP_HOOK_ENABLED` is off by default and off on the box, because
+neither the hook nor `PgasRouter` is deployed (admin, 2026-09-10: "don't deploy, make it 2
+clicks"). What `uniswap` means in production is the TWO-STEP route through Uniswap's own
+Universal Router — `tests/test_uniswap_two_step.py`. The `registry` fixture below turns the hook
+flag ON, which is what keeps this suite meaningful and keeps it from describing the live shape.
+
+The registry, the Quoter read, the calldata the user signs, and every way this route refuses.
 
 The whole point of the mode is that the transaction the user signs IS the deposit — one
 signature, no intermediate balance — so what is asserted here is that the bytes we hand over
@@ -95,9 +102,27 @@ def no_router_orders(monkeypatch):
 
 @pytest.fixture
 def registry(monkeypatch):
-    """The flag on, the three addresses set, one registered pair."""
+    """The flag on, the three addresses set, one registered pair — and this route as the DEFAULT.
+
+    ⚠️ The default matters here from T31b item 1 on. `route:"auto"` (which is what an omitted
+    route means) resolves through `uniswap.wants_uniswap` → `PGAS_INGRESS_DEFAULT_ROUTE`, so a
+    quote body with no `route` answers whatever the operator's default is, NOT "uniswap because
+    the pair happens to be registered". Every test in this file is about the Uniswap route, so
+    the fixture makes it the default and the bodies stay as they were; what `auto` resolves to
+    with the OTHER default is asserted in tests/test_default_route.py, which is where that
+    question belongs."""
 
     def install(rows: list[dict[str, Any]] | None = None, **flags: Any) -> None:
+        monkeypatch.setattr(
+            settings, "ingress_default_route", flags.pop("ingress_default_route", uniswap.MODE)
+        )
+        # ⚠️ THE HOOK SHAPE, EXPLICITLY. `PGAS_UNISWAP_HOOK_ENABLED` is OFF by default and off on
+        # the box — `uniswap` means the two-step route (tests/test_uniswap_two_step.py). This file
+        # is the reference path's suite: it turns the flag on, and it is the only reason any of
+        # these assertions still describe a gateway pool.
+        monkeypatch.setattr(
+            settings, "uniswap_hook_enabled", flags.pop("uniswap_hook_enabled", True)
+        )
         monkeypatch.setattr(settings, "ingress_uniswap", flags.pop("ingress_uniswap", True))
         monkeypatch.setattr(settings, "uniswap_hook", flags.pop("hook", HOOK))
         monkeypatch.setattr(settings, "uniswap_router", flags.pop("router", ROUTER))
@@ -511,8 +536,15 @@ async def test_health_assets_and_account_state_which_ways_in_are_open(
     client, user, registry, quoter, armed_eth
 ):
     """A flag the API does not state is a flag the client treats as off, so all three say it."""
+    registry(ingress_default_route="xchain")  # the shipped default; the flags are what is asserted
     health = (await client.get("/v1/health")).json()
-    assert health["ingress"] == {"uniswap": True, "xchain": True, "direct": True}
+    assert health["ingress"] == {
+        "uniswap": True,
+        "xchain": True,
+        "direct": True,
+        # which route `route:"auto"` resolves to (T31 D1) — stated wherever the flags are
+        "default_route": "xchain",
+    }
 
     assets = (await client.get("/v1/assets")).json()
     assert assets["ingress"]["uniswap"] is True and assets["ingress"]["direct"] is True
@@ -522,16 +554,29 @@ async def test_health_assets_and_account_state_which_ways_in_are_open(
     assert (await client.get("/v1/dex/assets")).json() == assets  # one handler, two paths
 
     acct = (await client.get("/v1/account", headers=user["headers"])).json()
-    assert acct["ingress"] == {"armed": True, "near": False, "uniswap": True, "xchain": True}
+    assert acct["ingress"] == {
+        "armed": True,
+        "near": False,
+        "uniswap": True,
+        "xchain": True,
+        "default_route": "xchain",
+    }
 
 
 async def test_with_the_flags_off_nothing_advertises_a_route_that_would_refuse(
     client, user, registry, monkeypatch
 ):
-    registry(ingress_uniswap=False)
+    registry(ingress_uniswap=False, ingress_default_route="xchain")
     monkeypatch.setattr(settings, "ingress_xchain", False)
     health = (await client.get("/v1/health")).json()
-    assert health["ingress"] == {"uniswap": False, "xchain": False, "direct": False}
+    assert health["ingress"] == {
+        "uniswap": False,
+        "xchain": False,
+        "direct": False,
+        # nothing is open: the default is stated as configured, and the flags beside it are
+        # what tell the client that no route is selectable
+        "default_route": "xchain",
+    }
     assets = (await client.get("/v1/assets")).json()
     assert assets["ingress"]["uniswap"] is False and assets["ingress"]["uniswap_tokens"] == []
     acct = (await client.get("/v1/account", headers=user["headers"])).json()

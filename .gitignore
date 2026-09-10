@@ -24,6 +24,7 @@ web/playwright-report/
 .fable/
 *.md
 !README.md
+!FEEDBACK.md
 !api/.env.example
 deploy/
 

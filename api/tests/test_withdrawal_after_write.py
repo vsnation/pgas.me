@@ -21,6 +21,7 @@ would need to cancel with, so the ordinary retry-on-500 schedules the whole batc
 from __future__ import annotations
 
 import json
+import math
 import time
 from typing import Any
 
@@ -35,6 +36,14 @@ from pgasme.routers import withdrawals as w
 
 ETH = 100_000_000  # groth
 DB = "pgasme_test"
+# FakeRpc answers 1 gwei → an 18_000-groth b2e relayer fee. An order released NOW no longer
+# carries 1× headroom: since 2026-09-10 the curve has a FLOOR (`PGAS_BRIDGE_HEADROOM_MIN`, 1.25)
+# because two ASAP orders quoted at exactly today's gas were held by a 7% base-fee tick seconds
+# later. So the bridge fee an ASAP order is charged is derived here from the one function that
+# prices it, never re-spelled as a literal (law 9).
+RELAYER = 18_000
+BRIDGE = math.ceil(RELAYER * w.headroom_for(0))
+TOTAL_1M = 1_000_000 + 20_000 + BRIDGE  # amount + our 2% + the bridge fee it funds
 JSON_CT = {"Content-Type": "application/json"}
 
 
@@ -97,8 +106,8 @@ async def test_an_event_that_will_not_write_still_answers_200_with_the_ids(
     rows = await d.payout_requests.find({"_id": {"$in": ids}}).to_list(10)
     assert len(rows) == 2 and {x["status"] for x in rows} == {"scheduled"}
     assert await ledger.balance(user["account_id"], "ETH") == {
-        "available": ETH - 2_040_000,
-        "scheduled": 2_040_000,
+        "available": ETH - 2 * TOTAL_1M,
+        "scheduled": 2 * TOTAL_1M,
         "sent": 0,
     }
     # ONE page, sent immediately, naming exactly the orders whose event is missing…
@@ -161,6 +170,10 @@ async def test_a_belt_that_reads_negative_reverses_the_batch_and_names_what_it_r
     assert sorted(e["ref"] for e in scheduled) == sorted(ids)
     assert sorted(e["ref"] for e in cancels) == sorted(ids)
     assert all(e["refund_of"] == f"schedule:{e['ref']}" for e in cancels)
+    # the bridge-fee half of the debit is reversed too, in the one `cancel` that mirrors both
+    bridges = await d.entries.find({"kind": "schedule_bridge_fee"}).to_list(10)
+    assert sorted(e["ref"] for e in bridges) == sorted(ids)
+    assert all(c["groth"] == TOTAL_1M for c in cancels)
     assert (await ledger.balances(user["account_id"]))["ETH"] == {
         "available": ETH,
         "scheduled": 0,
@@ -302,6 +315,7 @@ async def _poisoned_order(user: dict[str, Any], rid: str = "legacy-nan") -> str:
             "updated_at": now,
         }
     )
+    # a legacy row: written before the bridge fee was itemised, so its debit is amount + fee only
     await ledger.schedule(user["account_id"], "ETH", 1_020_000, rid, "legacy row")
     return rid
 

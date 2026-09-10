@@ -10,6 +10,50 @@
     />
     <link rel="canonical" href="https://pgas.me/" />
     <meta name="robots" content="index,follow,max-image-preview:large" />
+    <!-- Two things a crawler must get from the SERVED HTML, before a byte of the app is parsed.
+         /admin is the operator panel: never linked, never in sitemap.xml, never indexable (the
+         bundle sets this too, in pages/Admin.tsx). /how-it-works is a public page with its own
+         title, description and social preview. -->
+    <script>
+      (function () {
+        var path = location.pathname.replace(/\/+$/, '').toLowerCase();
+        if (path === '/admin') {
+          document.querySelector('meta[name="robots"]').setAttribute('content', 'noindex,nofollow,noarchive,nosnippet');
+          return;
+        }
+        // /how-it-works is a page of its own (T44). The bundle sets these too — that is what a
+        // client-side navigation gets — but a social-preview crawler never runs the bundle, and
+        // the SPA fallback hands it THIS file for every path, so the deep link would otherwise be
+        // shared with the home page's title and picture. The two copies of these strings are
+        // pinned together by e2e/how-it-works.spec.ts, which reads the served HTML.
+        if (path !== '/how-it-works') return;
+        var title = 'How Pgas.me works — every step, with screenshots';
+        var description =
+          'Connect a wallet, pay with anything you already hold on any chain, and schedule ETH into fresh wallets at the times you choose. Seven steps in the real screens, what the privacy mechanism does, and what it does not.';
+        var url = 'https://pgas.me/how-it-works';
+        // This script runs BEFORE the module bundle (module scripts are deferred), so by the time
+        // the page component mounts, "what it was" is already this page's own title — and the
+        // restore on the way out would be a no-op, leaving the deposit page titled "How Pgas.me
+        // works". So the values being replaced are stashed here, keyed exactly as the component
+        // asks for them, and it puts THESE back.
+        var defaults = { title: document.title };
+        var set = function (selector, attr, value) {
+          var el = document.querySelector(selector);
+          if (!el) return;
+          defaults[selector + '|' + attr] = el.getAttribute(attr);
+          el.setAttribute(attr, value);
+        };
+        document.title = title;
+        set('meta[name="description"]', 'content', description);
+        set('link[rel="canonical"]', 'href', url);
+        set('meta[property="og:title"]', 'content', title);
+        set('meta[property="og:description"]', 'content', description);
+        set('meta[property="og:url"]', 'content', url);
+        set('meta[name="twitter:title"]', 'content', title);
+        set('meta[name="twitter:description"]', 'content', description);
+        window.__PGAS_META_DEFAULTS__ = defaults;
+      })();
+    </script>
     <meta name="application-name" content="Pgas.me" />
     <meta name="apple-mobile-web-app-title" content="Pgas.me" />
 
@@ -29,9 +73,9 @@
       property="og:description"
       content="Private gas funding for fresh EVM wallets, settled on Beam. Pay any token on any chain; your new wallets get ETH, DAI or WBTC with no on-chain link to the source."
     />
-    <meta property="og:image" content="https://pgas.me/og-image.png" />
-    <meta property="og:image:secure_url" content="https://pgas.me/og-image.png" />
-    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image" content="https://pgas.me/og-image.jpg" />
+    <meta property="og:image:secure_url" content="https://pgas.me/og-image.jpg" />
+    <meta property="og:image:type" content="image/jpeg" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
     <meta
@@ -45,7 +89,7 @@
       name="twitter:description"
       content="Private gas funding for fresh EVM wallets, settled on Beam. Pay any token on any chain; your new wallets get ETH, DAI or WBTC with no on-chain link to the source."
     />
-    <meta name="twitter:image" content="https://pgas.me/og-image.png" />
+    <meta name="twitter:image" content="https://pgas.me/og-image.jpg" />
     <meta
       name="twitter:image:alt"
       content="The Pgas.me pegasus mascot in sunglasses flying above a padlocked wallet, beside the words: Pgas.me — Private gas funding for fresh EVM wallets, settled on Beam."

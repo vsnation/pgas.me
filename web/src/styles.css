@@ -1235,6 +1235,14 @@ details.plain summary {
 .sched-row .sched-foot {
   grid-column: 1 / -1;
 }
+/* The API's price for one row: three small numbers, and its refusal if it has one, on one line
+   that wraps rather than pushing the row's own controls around. */
+.sched-row .sched-price {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  align-items: baseline;
+}
 .sched-row .input.mono {
   font-family: var(--font-mono);
   font-size: 13px;
@@ -1353,11 +1361,14 @@ details.plain summary {
     color: var(--teal);
     background: var(--teal-soft);
   }
-  /* the bar is fixed, so the last thing on the page needs room to clear it */
+  /* The footer is the LAST thing on the page, so it is the one that has to end above BOTH fixed
+     things — the 64px tab bar and the totals strip that sits on top of it (F7, 2026-09-10: 70px
+     cleared the tabs only, which was right while the strip was sticky inside .page and stopped at
+     the end of it, and wrong the moment it became fixed). */
   .footer {
-    padding-bottom: calc(70px + env(safe-area-inset-bottom));
+    padding-bottom: calc(112px + env(safe-area-inset-bottom));
   }
-  /* and the page ends above BOTH fixed things: the tab bar, and the totals bar floating over it */
+  /* and the page's own content stops there too, so a card never ends underneath either of them */
   .main {
     padding-bottom: calc(112px + env(safe-area-inset-bottom));
   }
@@ -1479,20 +1490,57 @@ details.plain summary {
   .sticky-totals.sticky-totals-off {
     display: none;
   }
+  /* F7 (2026-09-10): it used to be a CARD — opaque surface, its own border, a drop shadow — and a
+     card that lands mid-form over an amount field reads as broken layout, which is exactly what
+     schedule-mobile.png showed. It is not content; it is chrome, and it is drawn as chrome: a
+     full-bleed strip sitting flush on top of the tab bar, translucent and blurred like that bar
+     and the header, so what it passes over stays legible underneath and the two fixed things read
+     as one band at the bottom of the screen rather than as something dropped on the page.
+
+     FLUSH IS MEASURED, NOT GUESSED. `bottom` was the constant 64px while the tab bar is 50.5px
+     tall at 390×844 (its font metrics + padding + the home-indicator inset — not a number that
+     can be written down), so the strip floated with 13.5px of daylight under it and the form
+     scrolled through the gap: in schedule-mobile.png a delivery select showed between the two
+     bars, cut in half by both. `--tabbar-h` is published by the tab bar itself (App.tsx) and
+     already includes `env(safe-area-inset-bottom)`, so nothing is added to it here; the constant
+     survives only as the fallback for the first frame. */
   .sticky-totals {
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 12px;
-    position: sticky;
-    bottom: calc(64px + env(safe-area-inset-bottom));
-    z-index: 10;
-    padding: 10px 14px;
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: var(--tabbar-h, calc(64px + env(safe-area-inset-bottom)));
+    z-index: 25; /* under the tab bar (30): the tabs are pressable, this is not */
+    padding: 8px 20px; /* 20px = the .container gutter, so it lines up with the page */
     font-size: 13px;
-    background: var(--surface);
-    border: 1px solid var(--line);
-    border-radius: var(--radius-sm);
-    box-shadow: var(--shadow);
+    background: color-mix(in srgb, var(--bg) 94%, transparent);
+    backdrop-filter: blur(10px);
+    border-top: 1px solid var(--line);
+    /* It repeats a number and is aria-hidden: it must never take a tap meant for the row it is
+       floating over. */
+    pointer-events: none;
+  }
+  /* And it must never be the reason a row cannot be READ. Three things make that true:
+     · scroll-padding on the scrollport — the browser's own "this much of the bottom is spoken
+       for". EVERY scroll-into-view lands above it: a tapped field, a Tab, an anchor. Measured at
+       390×844 the two fixed things occupy the last 87px of the viewport (strip top 757 → 844,
+       with the tab bar's 50.5 underneath it), so this clears them with room to spare, and it
+       covers the tab bar on every other page too.
+     · scroll-margin on the row, so bringing the ROW (not a field inside it) into view clears the
+       bar as well.
+     · room at the end of the form, so the last row can be scrolled clear the same way every other
+       row can — without it the list ends where the page does, and its last row has nowhere to go. */
+  html {
+    scroll-padding-bottom: calc(118px + env(safe-area-inset-bottom));
+  }
+  .sched-row {
+    scroll-margin-bottom: calc(118px + env(safe-area-inset-bottom));
+  }
+  .schedule-form {
+    padding-bottom: calc(76px + env(safe-area-inset-bottom));
   }
 }
 
@@ -1574,5 +1622,1043 @@ details.plain summary {
   }
   .paste-lines li > :last-child {
     grid-column: 2 / -1;
+  }
+}
+
+/* ---------- operator panel (/admin, T38) ----------
+   Additive only: every rule below is prefixed `.admin`, so nothing here can reach the public app.
+   The panel is built out of the tokens above — same surfaces, same lines, same two themes — with
+   four things the public pages never needed: a tab strip that scrolls on a phone, tables that may
+   be twenty columns wide, an expandable JSON drawer, and a key gate on an otherwise empty page. */
+.admin-gate {
+  max-width: 460px;
+  margin: 8vh auto 0;
+}
+.admin-head .brand {
+  gap: 8px;
+}
+.admin .header-right {
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+/* Seven tabs do not fit on a 390 px screen and must not wrap into a second bar: the strip scrolls,
+   which is what a phone user expects of a row of tabs. */
+.admin-tabs {
+  align-self: flex-start;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+}
+.admin-tabs button {
+  white-space: nowrap;
+  flex: none;
+}
+.admin-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+.admin-search {
+  flex: 1 1 220px;
+  min-width: 160px;
+  max-width: 420px;
+}
+.admin-filter {
+  width: auto;
+  flex: 0 0 auto;
+}
+.admin-auto {
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.admin-auto input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+}
+/* A row is a button: click or Enter opens its raw drawer underneath. */
+.admin-table .admin-row {
+  cursor: pointer;
+}
+.admin-table .admin-row:hover > td,
+.admin-table .admin-row.open > td {
+  background: var(--surface-2);
+}
+.admin-table .admin-row:focus-visible {
+  outline: 2px solid var(--indigo);
+  outline-offset: -2px;
+}
+.admin-table .admin-detail > td {
+  background: var(--surface-2);
+  white-space: normal;
+  padding: 0;
+}
+/* The drawer lives in a cell of a table that may be several thousand pixels wide. It takes the
+   width the table's scroll container PUBLISHES (--wrap-w, set by ListTable) and sticks to the left
+   edge of it, so the JSON and the nested tables are where the eye already is, at any scroll. */
+.admin-drawer {
+  position: sticky;
+  left: 0;
+  width: var(--wrap-w, 100%);
+  max-width: 100%;
+  padding: 14px;
+}
+.admin-drawer h3 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+.admin-json {
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre;
+}
+.admin-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-left: 12px;
+  border-left: 2px solid var(--line);
+}
+.admin-sub > h3 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+.admin-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 10px;
+}
+.admin-tiles .tile-value {
+  font-size: 20px;
+}
+.admin-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+/* `.kv` is `max-content 1fr`, and a value that cannot wrap — a UTC stamp with its relative reading
+   beside it — sets the minimum width of that second track. At 390 px it pushed the whole PAGE 10 px
+   sideways (caught by the phone test, not by eye). Here a stamp may take two lines; inside a table
+   cell it still may not, because tables scroll in their own box. */
+.admin .kv dd {
+  min-width: 0;
+}
+@media (max-width: 860px) {
+  .admin .kv .nowrap {
+    white-space: normal;
+  }
+}
+@media (max-width: 860px) {
+  /**
+   * The operator's phone. `.header-inner` does not wrap in the public app because its contents fit;
+   * this header carries four controls and a timestamp, which do not — unwrapped they pushed the
+   * stamp past the right edge and gave the whole PAGE a horizontal scrollbar. Two rows: the brand,
+   * then the stamp and the buttons. The stamp drops its date (the operator knows what day it is)
+   * and the buttons shrink, so those four fit on one line at 390 px.
+   */
+  .admin .header-inner {
+    flex-wrap: wrap;
+    row-gap: 6px;
+    padding-top: 8px;
+    padding-bottom: 8px;
+    min-height: 0;
+  }
+  .admin .header-right {
+    flex: 1 1 100%;
+    justify-content: flex-end;
+  }
+  .admin-updated {
+    margin-right: auto;
+  }
+  .admin-updated-long {
+    display: none;
+  }
+  .admin .header-right .btn {
+    padding: 5px 9px;
+    font-size: 12px;
+  }
+  .admin .main {
+    padding: 16px 0 32px;
+  }
+  .admin-json {
+    font-size: 11.5px;
+    max-height: 300px;
+  }
+  /* 150 px tiles fit ONE to a row inside a card inside a sub-section at 390 px, which turns five
+     counts into five screens. 120 px fits two, and the numbers are two digits. */
+  .admin-tiles {
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 8px;
+  }
+  .admin-tiles .tile {
+    padding: 10px 12px;
+  }
+  .admin-sub {
+    padding-left: 8px;
+  }
+  .admin-search {
+    flex-basis: 100%;
+    max-width: none;
+  }
+}
+
+/* ==========================================================================
+   T31 / U2 (2026-09-10) — the explainer, the route toggle, the holdings picker
+   ==========================================================================
+   Same tokens, same cards, same type scale as everything above: no new colours,
+   no gradients, no illustrations. Every colour here is a var() defined on
+   `:root` and re-stated in both dark blocks, so nothing has its only definition
+   inside a theme. */
+
+/* ---- "What is Pgas.me" (T31 B/B′) --------------------------------------- */
+.explainer {
+  margin-bottom: 16px;
+}
+.explainer-collapsed {
+  margin-bottom: 12px;
+}
+.explainer-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  gap: 10px;
+}
+.explainer-step {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.explainer-step > button {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  text-align: left;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  cursor: pointer;
+}
+.explainer-step > button:hover {
+  border-color: var(--teal);
+}
+.explainer-step.current > button {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+}
+.explainer-step .n {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--teal);
+  color: var(--teal-ink);
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.explainer-step-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* ---- the route toggle (T31 D2) ------------------------------------------ */
+.seg.seg-sm button {
+  padding: 5px 10px;
+  font-size: 12.5px;
+}
+
+/* ---- "Pay with" as the portfolio (T31 G) -------------------------------- */
+.pw-group + .pw-group {
+  margin-top: 4px;
+}
+.pw-group-head {
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 6px 8px 2px;
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+}
+.combo-item.pw-holding {
+  gap: 8px;
+}
+/* the chip's own icon pair inside a picker row: the token at 24 px with the chain badge on its
+   corner. `.combo-item img` above sizes every image in a row, so the badge states its size again
+   here — the same 13 px the "Pay with" button uses, one shape in two places. */
+.combo-item .pw-icons {
+  position: relative;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+}
+.combo-item .pw-icons img.pw-chain-badge {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--bg);
+  border: 1.5px solid var(--surface);
+  box-sizing: content-box;
+}
+.combo-item.pw-holding .ci-name {
+  flex: 1 1 auto;
+}
+.pw-bal {
+  margin-left: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  line-height: 1.25;
+  white-space: nowrap;
+}
+.pw-empty-note {
+  border-top: 1px solid var(--line);
+  padding: 6px 8px 2px;
+}
+
+@media (max-width: 720px) {
+  /* the three steps stack on a phone — a row of three cards at 390 px is three ellipses */
+  .explainer-steps {
+    flex-direction: column;
+  }
+}
+
+/* ---- the /how-it-works page (T44) ---------------------------------------
+   Same cards, same tokens, same type scale as the app itself. One rule is
+   its own: every step picture is a screenshot of a card, captured with the
+   page background around it, so the figure gets NO frame of its own — a
+   border here would be a second border a few pixels outside the card's. */
+.how-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  counter-reset: none;
+}
+.how-step {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 520px);
+  gap: 24px;
+  align-items: start;
+}
+/* step 7 is the desktop-width Payouts table: text above, picture across the
+   whole card, because shrinking seven columns into 520 px makes 13 px type
+   into 6 px and a picture of nothing */
+.how-step-wide {
+  grid-template-columns: minmax(0, 1fr);
+}
+.how-step-text {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 62ch;
+}
+.how-step-text p {
+  font-size: 14.5px;
+}
+.how-step-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.how-step-head h2 {
+  font-size: 18px;
+}
+.how-step-head .n {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--teal);
+  color: var(--teal-ink);
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.how-shot {
+  margin: 0;
+  min-width: 0;
+}
+.how-shot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: var(--radius-sm);
+}
+.how-list {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-size: 14px;
+}
+.how-list li::marker {
+  color: var(--teal);
+}
+.how-faq {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.how-faq-item dt {
+  font-weight: 600;
+  margin-bottom: 3px;
+}
+.how-faq-item dd {
+  margin: 0;
+}
+.how-cta {
+  padding-bottom: 8px;
+}
+@media (max-width: 860px) {
+  /* the picture goes under the words: a 520 px figure beside 200 px of text
+     is two columns of neither */
+  .how-step {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+}
+
+/* ═══ T53 — the swap panel (Deposit + Schedule) ═══════════════════════════════════════════════
+   Admin 2026-09-10 15:40Z: "Let's match Deposit page and Withdrawal page. Quote block I don't
+   think is actually needed when you can make it in What to deposit, to look like DEX Swap."
+
+   One column, one card, two legs and a detail strip. The column is narrow ON PURPOSE: a deposit
+   is one decision with three inputs, and stretching it across 1120 px is what made it read as a
+   form to fill in rather than a price to accept. Everything below is layout — no new colour, no
+   new radius, no new font: the tokens at the top of this file are the whole palette. */
+
+.swap-col {
+  max-width: 620px;
+  width: 100%;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+/* a two-column block inside the narrow column is two columns of nothing */
+.swap-col .grid-2 {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.sw {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.sw-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.sw-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+.sw-head-main {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  min-width: 0;
+}
+.sw-head h2 {
+  font-size: 17px;
+}
+.sw-head-aside {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+/* ---- the legs ---- */
+.sw-legs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sw-leg {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  padding: 12px 14px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+/* the arriving side is the answer, not the question: same geometry, quieter ground */
+.sw-leg-out {
+  background: color-mix(in srgb, var(--surface-2) 55%, var(--surface));
+}
+.sw-leg-top,
+.sw-leg-sub {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px 12px;
+  font-size: 12px;
+  color: var(--muted);
+  min-width: 0;
+}
+.sw-leg-label {
+  font-weight: 600;
+}
+.sw-leg-aside,
+.sw-leg-subaside {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  text-align: right;
+  white-space: nowrap;
+}
+.sw-leg-sub {
+  min-height: 16px;
+  flex-wrap: wrap;
+}
+.sw-leg-subtext {
+  display: inline-flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  min-width: 0;
+}
+.sw-leg-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.sw-leg-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 28px;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  font-weight: 500;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sw-leg-value .muted {
+  color: color-mix(in srgb, var(--muted) 70%, transparent);
+}
+/* the number the user types: no box of its own — the leg IS the box */
+.sw-amount {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  min-height: 34px;
+}
+.sw-amount:focus {
+  outline: none;
+}
+.sw-amount::placeholder {
+  color: color-mix(in srgb, var(--muted) 65%, transparent);
+}
+/* focus lands on the leg, so the ring is around the thing the eye is on */
+.sw-leg:focus-within {
+  border-color: var(--indigo);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--indigo) 30%, transparent);
+}
+.sw-leg[data-invalid='yes'] {
+  border-color: var(--red);
+}
+.sw-leg-control {
+  flex: 0 0 auto;
+  max-width: 58%;
+}
+.sw-leg-control .combo-btn {
+  width: auto;
+  min-height: 44px;
+  border-radius: 999px;
+  padding: 5px 14px 5px 8px;
+  gap: 8px;
+  background: var(--surface);
+}
+.sw-leg-control .pay-with-btn {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  align-items: center;
+  column-gap: 8px;
+  row-gap: 0;
+}
+.sw-leg-control .pay-with-btn .pw-icons {
+  grid-row: 1 / span 2;
+}
+.sw-leg-control .pay-with-btn .strong {
+  font-size: 15px;
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sw-leg-control .pay-with-btn .pw-on {
+  margin-left: 0;
+  font-size: 11.5px;
+  line-height: 1.2;
+}
+/* the popup belongs to the pill, but a list of holdings does not fit in a pill */
+.sw-leg-control .combo-pop {
+  left: auto;
+  right: 0;
+  width: min(360px, calc(100vw - 40px));
+}
+.sw-leg-control .seg {
+  border-radius: 999px;
+}
+.sw-leg-control .seg button {
+  padding: 9px 13px;
+  font-size: 13px;
+}
+
+/* ---- the seam between the legs ---- */
+.sw-seam {
+  position: relative;
+  height: 0;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+.sw-seam-node {
+  position: absolute;
+  top: -13px;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ---- the detail strip ---- */
+.sw-details {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+  margin: 0;
+}
+/* a strip that opens the card has no hairline above it — the card's own edge is the line */
+.sw > .sw-details:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+/* The summary is the strip's title AND its disclosure — one element doing the job a heading and
+   a chevron would do separately. It is a control on every width; a phone is only where putting
+   the strip away is worth anything. */
+.sw-details-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  padding-bottom: 8px;
+}
+.sw-details-summary::-webkit-details-marker {
+  display: none;
+}
+/* title left, whatever the page puts beside it right, the chevron last */
+.sw-details-summary > span:first-child {
+  flex: 1;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.sw-details-chevron {
+  transform: rotate(-90deg);
+  transition: transform 0.12s;
+  flex: none;
+  opacity: 0.7;
+}
+.sw-details[open] .sw-details-chevron {
+  transform: none;
+}
+.sw-details-body {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.sw-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 14px;
+  font-size: 12.5px;
+  min-width: 0;
+}
+.sw-row-label {
+  color: var(--muted);
+  white-space: nowrap;
+}
+.sw-row-value {
+  margin-left: auto;
+  text-align: right;
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px 8px;
+  min-width: 0;
+}
+.sw-note {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+.sw-note-good {
+  color: var(--teal);
+}
+.sw-note-warn {
+  color: var(--amber);
+}
+
+/* ---- the action ---- */
+/* The hairline is the division the panel is built on: everything above it is what this costs,
+   everything below it is what pressing the button does. Without it the strip's muted sentences
+   and the step's muted sentences ran together (T53 self-critique, the two-step Uniswap shot). */
+.sw-action {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+.sw-action .btn-lg {
+  width: 100%;
+}
+.sw-status {
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+  min-height: 16px;
+}
+.sw-fresh {
+  font-size: 11.5px;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.sw-fresh .link-btn {
+  font-size: 11.5px;
+}
+
+/* ---- schedule: the order rows, in the panel's language ---- */
+/* The asset the panel spends. It is not a picker — ETH is the only asset a payout crosses in —
+   so it is a pill that says which, at the size the Deposit page's token pill is, and nothing
+   about it invites a click that has nowhere to go. */
+.sw-asset {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+  padding: 5px 16px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  font-weight: 600;
+  font-size: 15px;
+}
+.sw-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sw-rows-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.sw-rows-head .sw-leg-label {
+  font-weight: 600;
+}
+.sw-rows-head .paste-actions {
+  padding: 0;
+  margin-left: auto;
+}
+.sw-rows .paste-panel {
+  padding: 0;
+}
+/* each order is its own block, the way each leg is: the list's single outer box made five
+   orders read as one thing with lines through it */
+.sw-rows .list {
+  border: 0;
+  border-radius: 0;
+  overflow: visible;
+  background: transparent;
+  gap: 8px;
+}
+.sw-rows .sched-row {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  padding: 10px 12px;
+}
+.sw-rows .sched-row:focus-within {
+  border-color: var(--indigo);
+}
+/* ⛔ "Use max" (T45) is part of the amount, not a line of its own: `.field`'s column dropped it
+   under the hint, centred, reading as a stray link in the middle of the row. Two columns — the
+   hint under the box, the button beside it — put it where the number it fills is. */
+.sw-rows .sched-amt {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 4px 8px;
+}
+/* …and the column has to be wide enough to hold both on one line: at the page's own 132 px the
+   hint broke into "any / amount" beside the button */
+.sw-rows .sched-row {
+  grid-template-columns: 168px minmax(0, 1fr) 36px;
+}
+.sw-rows .sched-amt > .input-wrap {
+  grid-column: 1 / -1;
+}
+.sw-rows .sched-amt > .help,
+.sw-rows .sched-amt > .error-text {
+  grid-column: 1;
+}
+.sw-rows .sched-amt > .btn {
+  grid-column: 2;
+  justify-self: end;
+  padding: 2px 6px;
+}
+/* the amount box is narrow inside the panel; 70px of right padding for a 3-letter suffix ate the
+   number itself on a phone (the placeholder rendered as "0.0(") */
+.sw-rows .input-wrap .input {
+  padding-right: 44px;
+}
+
+@media (max-width: 640px) {
+  .sw {
+    padding: 14px;
+  }
+  /* ⛔ the panel's rows do NOT stack their amount and their time on a phone (the page's own
+     `.sched-row` rule does). Two fields on one line keep the cost strip below the list inside
+     the first screen, which is what the sticky totals bar is measured against. */
+  .sw-rows .sched-row {
+    grid-template-columns: minmax(0, 140px) minmax(0, 1fr) 30px;
+    padding: 10px;
+    gap: 6px 8px;
+  }
+  .sw-rows .sched-row .sched-addr {
+    grid-column: 1 / 3;
+    grid-row: 1;
+  }
+  .sw-rows .sched-row .sched-rm {
+    grid-column: 3;
+    grid-row: 1;
+  }
+  .sw-rows .sched-row .sched-amt {
+    grid-column: 1;
+    grid-row: 2;
+  }
+  .sw-rows .sched-row .sched-when {
+    grid-column: 2 / 4;
+    grid-row: 2;
+  }
+  .sw-leg-value {
+    font-size: 25px;
+  }
+  .sw-leg-control {
+    max-width: 62%;
+  }
+  /* ⛔ the ARRIVING amount must not be the thing that gets clipped. At 390 px a three-asset
+     segmented control took 62 % of the leg and "0.062313" rendered as "0.0623…" — the number the
+     user is deciding on, elided to make room for a control they are not looking at. The control
+     gets smaller; the number does not. */
+  .sw-leg-control .seg button {
+    padding: 9px 9px;
+    font-size: 12.5px;
+  }
+  /* on a phone the strip is worth putting away — it opens by default all the same, because the
+     fee and the wait are what the user came to check */
+  .sw-details-summary {
+    font-size: 12.5px;
+    padding-bottom: 9px;
+  }
+}
+
+/* ═══ T53 — the money table (Payouts, Scheduled orders) ══════════════════════════════════════
+   T44 measured it: 1110 px of table inside a 1036 px scroll box, so "Arrives" — the arrival
+   estimate AND the bridge-explorer link — sat permanently behind a sideways scroll on a 1280 px
+   screen. The columns had no widths of their own, so the widest sentence in each cell set them,
+   and the widest sentence kept growing ("Returned to balance", "bridge fee: 0.00001955 ETH back
+   in Available", a hold reason, an ETA note).
+
+   So the TABLE owns the widths and the sentences wrap inside them. Seven columns, `table-layout:
+   fixed`, percentages that add to 100: nothing a future sentence can do makes this table wider
+   than the card it is in. On a phone it stops being a table at all — one card per order, each
+   value labelled by the header it lost. */
+.data.orders {
+  table-layout: fixed;
+  min-width: 0;
+}
+.data.orders th,
+.data.orders td {
+  padding: 8px 10px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+/* the two clock columns are short and must never break mid-time */
+.data.orders td.nowrap,
+.data.orders th.nowrap {
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+/* figures line up column-wise without dragging the mono family into a date */
+.data.orders th,
+.data.orders td {
+  font-variant-numeric: tabular-nums;
+}
+/* The widths, measured against the widest thing each column can hold: the status pill says
+   "Returned to balance" (T48), the wallet is a 12-character short address, and the two clock
+   columns are one "10 Sept, 20:30" each. They add to 100, so the table is exactly its card. */
+.data.orders th:nth-child(1) {
+  width: 17%;
+}
+.data.orders th:nth-child(2) {
+  width: 12%;
+}
+.data.orders th:nth-child(3) {
+  width: 13%;
+}
+.data.orders th:nth-child(4) {
+  width: 13%;
+}
+.data.orders th:nth-child(5) {
+  width: 12%;
+}
+.data.orders th:nth-child(6) {
+  width: 12%;
+}
+.data.orders th:nth-child(7) {
+  width: 21%;
+}
+/* the status cell is a stack: the pill, then its reason, then the one action it permits */
+.data.orders td:first-child .btn {
+  margin-top: 6px;
+}
+.data.orders .status-sub {
+  max-width: none;
+}
+/* a number is right-aligned; the sentence under it is not — four right-ragged lines of "of 0.05
+   ETH asked · fees taken from the amount" is not a number and does not read like one */
+.data.orders td.num .status-sub {
+  text-align: left;
+}
+
+@media (max-width: 860px) {
+  /* one card per order. The header row is gone, so every value says what it is: `data-label` on
+     the cell is the column it came from. */
+  .data.orders,
+  .data.orders tbody,
+  .data.orders tr,
+  .data.orders td {
+    display: block;
+    width: auto;
+  }
+  .data.orders thead {
+    display: none;
+  }
+  .data.orders tr {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .data.orders tr:last-child {
+    border-bottom: 0;
+  }
+  .data.orders td {
+    border: 0;
+    padding: 4px 0 0;
+    display: block;
+    text-align: left;
+  }
+  .data.orders td::before {
+    content: attr(data-label);
+    display: block;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.35;
+  }
+  /* the notes under a value belong to the value, not to the next label */
+  .data.orders td .status-sub,
+  .data.orders td .tiny {
+    text-align: left;
+    max-width: none;
+  }
+  .data.orders td.num,
+  .data.orders td.nowrap.num {
+    text-align: left;
+  }
+  /* the status leads the card, at full width, with no label of its own */
+  .data.orders td[data-label='Status'] {
+    display: block;
+    margin-bottom: 4px;
+  }
+  .data.orders td[data-label='Status']::before {
+    display: none;
   }
 }

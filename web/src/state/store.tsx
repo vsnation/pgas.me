@@ -15,7 +15,7 @@ import {
   setSession,
   type Session,
 } from '../lib/api';
-import { CHAIN_META, chainIdHex } from '../lib/chains';
+import { chainIdHex, chainMeta } from '../lib/chains';
 import { checksum, hexValue } from '../lib/format';
 import { ingressPartial, uniswapTokenList, type IngressPartial } from '../lib/ingress';
 import { buildSiweMessage } from '../lib/siwe';
@@ -269,7 +269,9 @@ function useWalletState(onDisconnect: () => void): WalletState {
       if (rejectedByUser(e)) throw e;
       const unknownChain = code === 4902 || /unrecognized|not (been )?added|4902|unsupported chain|unknown chain/i.test(err?.message ?? '');
       if (!unknownChain) throw e;
-      const meta = CHAIN_META[target];
+      // `chainMeta` and not the raw table: the parameters carry the endpoint this browser actually
+      // reads the chain through (T54), so a wallet that adds the chain lands on the same node.
+      const meta = chainMeta(target);
       if (!meta) throw new Error(`Your wallet does not know chain ${target} and Pgas.me has no parameters to add it`);
       await p.request({ method: 'wallet_addEthereumChain', params: [{ chainId: hex, ...meta }] });
       if ((await readChain()) !== target) await p.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: hex }] });
@@ -654,7 +656,7 @@ function useDataState(): DataState {
 }
 
 // ---------- route ----------
-export type Tab = 'deposit' | 'balance' | 'schedule';
+export type Tab = 'deposit' | 'balance' | 'schedule' | 'how';
 
 // Three tabs, one intention each: put money in, look at it, send it out (admin 2026-09-09).
 // The Wallets tab went with the destination registry earlier the same day — an address is typed on
@@ -666,6 +668,22 @@ export const TABS: { id: Tab; label: string; path: string }[] = [
   { id: 'schedule', label: 'Schedule', path: '/schedule' },
 ];
 
+/**
+ * `/how-it-works` (T44) is a ROUTE but not a TAB, and the difference is load-bearing: `TABS` is the
+ * three things you DO with money, rendered twice — as the header tabs and as the phone's bottom bar,
+ * which is a three-column grid a thumb reaches. A fourth entry there would put a page you read once
+ * beside the three you use every time, and shrink each of them by a quarter. So the explainer page
+ * is linked from the header (desktop), the footer (everywhere) and the "What is Pgas.me" card, and
+ * `TABS` still means what it meant.
+ */
+export const HOW_PATH = '/how-it-works';
+const PATHS: Record<Tab, string> = {
+  deposit: '/',
+  balance: '/balance',
+  schedule: '/schedule',
+  how: HOW_PATH,
+};
+
 export interface RouteState {
   tab: Tab;
   navigate(tab: Tab): void;
@@ -674,7 +692,8 @@ export interface RouteState {
 function tabFromPath(path: string): Tab {
   const p = path.replace(/\/+$/, '') || '/';
   if (p === '/activity') return 'balance'; // the old bookmark still lands on the timeline
-  return TABS.find((t) => t.path === p)?.id ?? 'deposit';
+  const hit = (Object.keys(PATHS) as Tab[]).find((t) => PATHS[t] === p);
+  return hit ?? 'deposit';
 }
 
 function useRouteState(): RouteState {
@@ -685,7 +704,7 @@ function useRouteState(): RouteState {
     return () => window.removeEventListener('popstate', onPop);
   }, []);
   const navigate = useCallback((t: Tab) => {
-    const path = TABS.find((x) => x.id === t)?.path ?? '/';
+    const path = PATHS[t] ?? '/';
     if (window.location.pathname !== path) window.history.pushState(null, '', path);
     setTab(t);
     window.scrollTo({ top: 0 });

@@ -57,8 +57,14 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> list[Call]:
 
 
 def held(calls: list[Call]) -> list[str]:
-    """Only the HELD pages: a stuck-check pass legitimately says other things too."""
-    return [t for t, _, _ in calls if t.startswith("HELD:")]
+    """Only the HELD pages: a stuck-check pass legitimately says other things too.
+
+    ⚠️ NOT `startswith` (T47, 2026-09-10): `_hold_for_a_human`'s own page goes through
+    `tg.format_event`, which now leads every message with the step and the order it is about
+    (`deposit dep1 — HELD: …`), while the stuck-check reminder builds its text itself and still
+    opens with the word. Anchoring on the first character counted the reminder and silently
+    stopped counting the page — which is the one this file exists to pin."""
+    return [t for t, _, _ in calls if "HELD:" in t]
 
 
 async def hold_a_deposit(mock_db: Any, dep_id: str = "dep1") -> None:

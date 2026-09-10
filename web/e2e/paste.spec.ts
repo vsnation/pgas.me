@@ -38,6 +38,9 @@ async function boot(page: Page) {
   await blockExternal(page);
   await api.install(page);
   await installMockWallet(page);
+  // the API prices against the same instant the page reads, so `release_at` and the headroom on it
+  // are one arithmetic rather than two clocks
+  api.nowOverrideS = Math.floor(FIXED / 1000);
   await page.clock.setFixedTime(FIXED);
   await page.goto('/schedule');
   await connectAndSignIn(page);
@@ -157,23 +160,28 @@ test('a bad line among good ones is marked, and nothing can be scheduled while i
   expect(pageErrors).toEqual([]);
 });
 
-test('duplicates and below-minimum amounts are flagged but allowed through', async ({ page }) => {
+test('a duplicate is flagged; a tiny amount is not — there is no minimum any more', async ({ page }) => {
   await boot(page);
-  await paste(page, [`${A},0.05`, `${A.toLowerCase()},0.02`, `${B},0.001`].join('\n'));
+  await paste(page, [`${A},0.05`, `${A.toLowerCase()},0.02`, `${B},0.0001`].join('\n'));
   await expect(page.getByTestId('paste-summary')).toHaveText('3 parsed · 3 ok · 0 errors');
   await expect(lines(page).nth(1)).toHaveAttribute('data-status', 'warn');
   await expect(lines(page).nth(1)).toContainText('⚠');
   await expect(page.getByTestId('paste-note-1')).toHaveText('duplicate address'); // lowercase is the same wallet
-  await expect(lines(page).nth(2)).toHaveAttribute('data-status', 'warn');
-  await expect(page.getByTestId('paste-note-2')).toHaveText('below the 0.01 ETH minimum');
+  // 0.0001 ETH used to be flagged "below the 0.01 ETH minimum" (the economic floor). The bridge is
+  // charged explicitly now, so `min_amount_groth` is the 1-groth grid and the line is simply an order.
+  await expect(lines(page).nth(2)).toHaveAttribute('data-status', 'ok');
+  await expect(page.getByTestId('paste-note-2')).toHaveText('ASAP');
+  await expect(page.locator('body')).not.toContainText('minimum');
 
   await expect(page.getByTestId('paste-apply')).toBeEnabled();
   await page.getByTestId('paste-apply').click();
   await expect(rows(page)).toHaveCount(3);
-  // the duplicate is a real order; the one under the minimum is the row's own error, in the API's words
+  // the duplicate is a real order, and so is the small one — priced by the API, not refused here
   await expect(addressAt(page, 2)).toHaveValue(A);
-  await expect(page.getByTestId('amount-error-2')).toHaveText('minimum 0.01 ETH');
-  await expect(page.getByTestId('schedule-submit')).toBeDisabled();
+  await expect(page.getByTestId('amount-error-2')).toHaveCount(0);
+  await expect(page.getByTestId('amount-hint-2')).toHaveText('any amount');
+  await expect(page.getByTestId('row-total-2')).toContainText('fee 0.000002 · bridge 0.0002 · total 0.000302 ETH');
+  await expect(page.getByTestId('schedule-submit')).toBeEnabled();
   expect(pageErrors).toEqual([]);
 });
 

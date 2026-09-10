@@ -23,8 +23,14 @@ export interface IngressFlags {
   xchain: boolean;
 }
 
+/**
+ * Which ingress the API would pick for itself when both are open (`PGAS_INGRESS_DEFAULT_ROUTE`,
+ * T31 D1). It is a PREFERENCE, not a flag: it says nothing about whether either path is open.
+ */
+export type IngressRoute = 'xchain' | 'uniswap';
+
 /** What one payload actually STATES. A key nobody states is absent — never `true`, never `false`. */
-export type IngressPartial = Partial<IngressFlags>;
+export type IngressPartial = Partial<IngressFlags> & { default_route?: IngressRoute };
 
 /**
  * What a path is when nobody states it. `uniswap` off: the API is the only thing that knows whether
@@ -67,8 +73,50 @@ export function ingressPartial(src: unknown): IngressPartial {
     for (const k of FLAG_KEYS) {
       if (out[k] === undefined && typeof o[k] === 'boolean') out[k] = o[k] as boolean;
     }
+    if (out.default_route === undefined && (o.default_route === 'xchain' || o.default_route === 'uniswap')) {
+      out.default_route = o.default_route;
+    }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// The route toggle (T31 D2)
+// ---------------------------------------------------------------------------
+// Two ingresses open at once is the first time this client has had to CHOOSE. Three facts, and one
+// reader each: what the API prefers (`ingress.default_route`), what the user last picked (stored
+// here), and what this pair can actually take (Ethereum, and a registered Uniswap pair).
+
+const ROUTE_KEY = 'pgas.route.v1';
+
+/** The user's own choice, or null when they have never made one (or storage is unavailable). */
+export function storedRoute(): IngressRoute | null {
+  try {
+    const v = localStorage.getItem(ROUTE_KEY);
+    return v === 'xchain' || v === 'uniswap' ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+export function storeRoute(route: IngressRoute): void {
+  try {
+    localStorage.setItem(ROUTE_KEY, route);
+  } catch {
+    // storage unavailable: the choice lives for this page only
+  }
+}
+
+/**
+ * Which route the page starts on: the user's own choice, else the API's stated default, else the
+ * path this client has always led with when it is open.
+ *
+ * ⚠️ An API that states NO default is not saying "cross-chain": it is a build from before the
+ * setting existed, and every one of those led with Uniswap the moment the flag was on. Silence
+ * leaves behaviour where it was — the same rule as the flags above, applied to a preference.
+ */
+export function initialRoute(stated: IngressRoute | null | undefined, stored: IngressRoute | null): IngressRoute {
+  return stored ?? stated ?? 'uniswap';
 }
 
 /** First source that states a flag wins; a flag nobody states takes its default above. */

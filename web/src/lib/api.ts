@@ -16,6 +16,9 @@ import type {
   VerifyResponse,
   WithdrawalBody,
   WithdrawalFees,
+  WithdrawalPreview,
+  WithdrawalPreviewBody,
+  WithdrawalPreviewItem,
   WithdrawalResponse,
 } from './types';
 
@@ -66,13 +69,57 @@ export function clearSession(): void {
 // ---------- transport ----------
 export class ApiError extends Error {
   status: number;
+  /** ONE sentence, always safe to put on the screen — never a serialised object (see `detailOf`). */
   detail: string;
-  constructor(status: number, detail: string) {
+  /**
+   * The per-item verdicts a batch refusal carries (`detail.items`, 422 from `POST /v1/withdrawals`)
+   * — the same dicts `POST /v1/withdrawals/preview` returns, so the caller renders a refusal with
+   * the code that renders a quote, on the row it belongs to.
+   */
+  items?: WithdrawalPreviewItem[];
+  /** the floor those items were ruled against, when the refusal states one */
+  minAmountGroth?: number;
+  constructor(status: number, detail: string, extra?: { items?: WithdrawalPreviewItem[]; minAmountGroth?: number }) {
     super(detail);
     this.name = 'ApiError';
     this.status = status;
     this.detail = detail;
+    if (extra?.items) this.items = extra.items;
+    if (typeof extra?.minAmountGroth === 'number') this.minAmountGroth = extra.minAmountGroth;
   }
+}
+
+/**
+ * The sentence inside a FastAPI `detail`, in every shape this API sends one.
+ *
+ * ⛔ NEVER `JSON.stringify` it. A structured refusal (the 422 of a batch: `{message, items,
+ * min_amount_groth}`) went to the screen as a raw JSON blob that listed EVERY destination address
+ * in the batch — §9.7, the one thing this product must not put in front of anyone. The structured
+ * halves travel as fields on `ApiError`; only prose is ever rendered, and a shape with no prose in
+ * it becomes the status line rather than its own serialisation.
+ */
+function detailOf(d: unknown, status: number, statusText: string): string {
+  const fallback = `${status} ${statusText || 'error'}`;
+  if (typeof d === 'string') return d || fallback;
+  // pydantic's own 422: a list of {loc, msg, type}. Its `msg`s are the sentence.
+  if (Array.isArray(d)) {
+    const msgs = d.map((e) => (e as { msg?: unknown })?.msg).filter((m): m is string => typeof m === 'string' && !!m);
+    return msgs.length ? msgs.join('; ') : fallback;
+  }
+  if (d && typeof d === 'object') {
+    const m = (d as { message?: unknown }).message;
+    if (typeof m === 'string' && m) return m;
+  }
+  return fallback;
+}
+
+/** The structured halves of a refusal, when it has any — never rendered as text. */
+function extraOf(d: unknown): { items?: WithdrawalPreviewItem[]; minAmountGroth?: number } | undefined {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return undefined;
+  const o = d as { items?: unknown; min_amount_groth?: unknown };
+  const items = Array.isArray(o.items) ? (o.items as WithdrawalPreviewItem[]) : undefined;
+  const min = typeof o.min_amount_groth === 'number' && Number.isFinite(o.min_amount_groth) ? o.min_amount_groth : undefined;
+  return items || min !== undefined ? { items, minAmountGroth: min } : undefined;
 }
 
 interface RequestOptions {
@@ -115,8 +162,7 @@ async function request<T>(path: string, opts: RequestOptions = {}): Promise<T> {
   }
   if (!res.ok) {
     const d = (data as { detail?: unknown } | null)?.detail;
-    const detail = typeof d === 'string' ? d : d ? JSON.stringify(d) : `${res.status} ${res.statusText || 'error'}`;
-    throw new ApiError(res.status, detail);
+    throw new ApiError(res.status, detailOf(d, res.status, res.statusText), extraOf(d));
   }
   return data as T;
 }
@@ -188,11 +234,27 @@ export const api = {
    * behind the Deposit click (T2b). Idempotent: a second call returns the stored tx while fresh.
    */
   armQuote: (quote_id: string) => request<ArmedQuote>(`/quote/${quote_id}/arm`, { method: 'POST', auth: true }),
+  /**
+   * Registers a transaction the wallet has already sent. Since T37 (2026-09-10) a hash Ethereum has
+   * not shown the API yet is answered 200 `{status:"submitted", verified:false, note}` and proven
+   * later — so `verified === false` is a row still being checked, never a failure.
+   */
   registerDeposit: (quote_id: string, src_tx_hash: string) =>
-    request<{ deposit_id: string; status: string }>('/deposits', { method: 'POST', body: { quote_id, src_tx_hash }, auth: true }),
+    request<{ deposit_id: string; status: string; verified?: boolean; note?: string }>('/deposits', {
+      method: 'POST',
+      body: { quote_id, src_tx_hash },
+      auth: true,
+    }),
   deposit: (id: string) => request<Deposit>(`/deposits/${id}`, { auth: true }),
 
   withdrawalFees: (asset: AssetKey) => request<WithdrawalFees>(`/withdrawals/fees?asset=${asset}`, { auth: true }),
+  /**
+   * What this list of orders costs, priced by the API and written nowhere — no rows, no
+   * reservation, no ledger (API_CONTRACT.md § Withdrawals — fee model, 2026-09-10). `POST
+   * /v1/withdrawals` prices the same list with the same function, so the quote is the charge.
+   */
+  previewWithdrawal: (body: WithdrawalPreviewBody, signal?: AbortSignal) =>
+    request<WithdrawalPreview>('/withdrawals/preview', { method: 'POST', body, auth: true, signal }),
   withdraw: (body: WithdrawalBody) => request<WithdrawalResponse>('/withdrawals', { method: 'POST', body, auth: true }),
   cancelWithdrawal: (id: string) =>
     request<{ cancelled: string; refunded_groth?: number }>(`/withdrawals/${id}/cancel`, { method: 'POST', auth: true }),

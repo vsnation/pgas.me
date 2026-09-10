@@ -1,16 +1,19 @@
 // App chrome — header (brand, tabs on desktop, theme switch, one account control), the mobile tab
 // bar, notices, the wallet picker dialog, the one-line footer — and the tab switch. Page bodies
 // live in pages/.
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { Modal } from './components/Modal';
+import { RpcSettingsButton } from './components/RpcSettings';
 import { errorText } from './lib/api';
 import { chainName } from './lib/chains';
 import { shortAddr } from './lib/format';
 import type { WalletOption } from './lib/wallet';
+import { AdminPage, isAdminPath } from './pages/Admin';
 import { BalancePage } from './pages/Balance';
 import { DepositPage } from './pages/Deposit';
+import { HowItWorksPage } from './pages/HowItWorks';
 import { SchedulePage } from './pages/Schedule';
-import { StoreProvider, TABS, useStore, type Tab } from './state/store';
+import { HOW_PATH, StoreProvider, TABS, useStore, type Tab } from './state/store';
 
 /** Sun and moon, drawn rather than fetched: two paths beat a webfont for one icon. */
 function ThemeIcon({ dark }: { dark: boolean }) {
@@ -164,8 +167,27 @@ function Header() {
         </a>
         <nav className="nav" aria-label="Sections">
           <TabButtons where="header" />
+          {/* T44 — a link, not a tab: the phone's bottom bar is a three-column grid of the three
+              things you DO with money, and a page you read once does not belong in it. Here on
+              desktop, in the footer everywhere, and on the "What is Pgas.me" card. */}
+          <a
+            className={`nav-tab${route.tab === 'how' ? ' active' : ''}`}
+            href={HOW_PATH}
+            aria-current={route.tab === 'how' ? 'page' : undefined}
+            data-testid="nav-how"
+            onClick={(e) => {
+              e.preventDefault();
+              route.navigate('how');
+            }}
+          >
+            How it works
+          </a>
         </nav>
         <div className="header-right">
+          {/* T54 — which endpoints THIS BROWSER reads chains through. App chrome, like the theme
+              switch: it is not about the money on screen, it is about whether the numbers can be
+              read at all, so it belongs beside the switch and not inside a card. */}
+          <RpcSettingsButton />
           <ThemeToggle />
           <AccountControl />
         </div>
@@ -174,10 +196,35 @@ function Header() {
   );
 }
 
-/** Phones get the three tabs where a thumb reaches them; CSS hides this above 860 px. */
+/**
+ * Phones get the three tabs where a thumb reaches them; CSS hides this above 860 px.
+ *
+ * It also PUBLISHES ITS OWN HEIGHT as `--tabbar-h`, because anything else drawn at the bottom of
+ * a phone screen has to sit exactly on top of it and that height is not a number anyone can write
+ * down: it is this element's font metrics plus its padding plus the device's home-indicator inset.
+ * A constant guessed it at 64px while the bar measures 50.5 at 390×844, and the 13.5px of daylight
+ * that left between the two fixed things is what the Schedule totals strip was seen floating above
+ * in schedule-mobile.png — with the form scrolling through the gap underneath it (F7, 2026-09-10).
+ * One writer for one fact: the element that HAS the height states it, and the strip reads it.
+ */
 function TabBar() {
+  const ref = useRef<HTMLElement | null>(null);
+  // measured BEFORE the first paint (useLayoutEffect), so nothing is ever drawn at the fallback
+  // offset and then moved — a strip that jumps 13.5px on load is the same defect, briefly
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const publish = () => document.documentElement.style.setProperty('--tabbar-h', `${el.getBoundingClientRect().height}px`);
+    publish();
+    if (typeof ResizeObserver === 'undefined') return;
+    // hidden on desktop → height 0, which is the truth there and what the observer reports the
+    // moment a resize crosses the breakpoint in either direction
+    const ro = new ResizeObserver(publish);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
   return (
-    <nav className="tabbar" aria-label="Sections" data-testid="tabbar">
+    <nav className="tabbar" aria-label="Sections" data-testid="tabbar" ref={ref}>
       <TabButtons where="bar" />
     </nav>
   );
@@ -286,11 +333,23 @@ function Notices() {
  * the strip gone the app stopped fetching `GET /v1/stats` at all (2026-09-09).
  */
 function Footer() {
+  const { route } = useStore();
   return (
     <footer className="footer">
       <div className="container">
         <div className="footer-note">
           <span>Settled on Beam — a confidential ledger: no addresses on-chain, blinded amounts.</span>
+          {/* the only route to the explainer page on a phone, where the header's nav is hidden */}
+          <a
+            href={HOW_PATH}
+            data-testid="footer-how"
+            onClick={(e) => {
+              e.preventDefault();
+              route.navigate('how');
+            }}
+          >
+            How it works
+          </a>
         </div>
       </div>
     </footer>
@@ -305,12 +364,20 @@ function Page() {
       return <BalancePage />;
     case 'schedule':
       return <SchedulePage />;
+    case 'how':
+      return <HowItWorksPage />;
     default:
       return <DepositPage />;
   }
 }
 
 export default function App() {
+  /**
+   * `/admin` is the operator panel (T38): its own key gate, its own chrome, nothing public. It is
+   * answered BEFORE the store provider mounts, so on that route no wallet is discovered, no session
+   * is polled and no reference data is fetched — and nothing in the public UI links to it.
+   */
+  if (isAdminPath(window.location.pathname)) return <AdminPage />;
   return (
     <StoreProvider>
       <div className="app">

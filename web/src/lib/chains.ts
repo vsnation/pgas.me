@@ -1,8 +1,14 @@
 // Chain constants for the client-side scanner and wallet chain switching, plus the health-checked
-// public RPC fallbacks. Ported from buybeam.my: batch-balance contracts, ordered public endpoints
-// (the first entry takes every health check, so the most tolerant goes first), CoinGecko ids and
-// this app's own chain icons.
+// public RPC fallbacks. Ported from buybeam.my: batch-balance contracts, CoinGecko ids and this
+// app's own chain icons.
+//
+// The endpoint list itself lives in `lib/rpc.ts` since 2026-09-10 (T54), because it is no longer a
+// constant: it is the app's verified order with whatever this browser's owner picked in the RPC
+// settings popup at the head of it. This file asks `rpcUrls()` for that order and health-checks it
+// exactly as it always did — the first entry takes every health check, so the pick is a starting
+// point and never a restriction.
 import { JsonRpcProvider, Network } from 'ethers';
+import { activeRpcUrl, onRpcChange, probeMatches, probeRpcUrl, rpcUrls } from './rpc';
 
 export const NATIVE_ADDRESS = '0x0000000000000000000000000000000000000000';
 const NATIVE_ALIASES = new Set([
@@ -47,77 +53,6 @@ export const BATCH_BALANCE_CONTRACTS: Record<number, string> = {
  * falls back to per-token balanceOf.
  */
 export const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
-
-// Verified 2026-09-09, twice per URL: (a) curl eth_chainId returns this chain's id, (b) fetch() from
-// a page on http://127.0.0.1:4173 succeeds (CORS). Only URLs passing BOTH are listed. Every EVM
-// chain on the list has at least two. Dropped for CORS: eth.merkle.io (1), op-pokt.nodies.app (10). Dropped for
-// auth/rate limits: rpc.ankr.com/*, *.llamarpc.com, bsc.drpc.org, polygon-rpc.com, story.drpc.org,
-// injective.drpc.org, monad-rpc.publicnode.com, rpc.arrowrpc.com.
-const FALLBACK_RPCS: Record<number, string[]> = {
-  // ---- the 15 EVM chains the cross-chain order router offers today ----
-  // rpc.flashbots.net is NOT here: it answers eth_chainId and eth_getCode and then refuses eth_call
-  // with "rpc method is not whitelisted" — it is a transaction relay, not a reader.
-  1: [
-    'https://ethereum-rpc.publicnode.com',
-    'https://eth.drpc.org',
-    'https://cloudflare-eth.com',
-    'https://1rpc.io/eth',
-    'https://rpc.mevblocker.io',
-  ],
-  10: ['https://mainnet.optimism.io', 'https://optimism-rpc.publicnode.com', 'https://optimism.drpc.org', 'https://1rpc.io/op'],
-  56: [
-    'https://bsc-dataseed.binance.org',
-    'https://bsc-dataseed1.binance.org',
-    'https://bsc-dataseed2.binance.org',
-    'https://bsc-dataseed3.binance.org',
-    'https://bsc-dataseed4.binance.org',
-    'https://bsc-rpc.publicnode.com',
-    'https://bsc-dataseed1.defibit.io',
-    'https://bsc-dataseed1.ninicoin.io',
-  ],
-  137: ['https://polygon-bor-rpc.publicnode.com', 'https://polygon.drpc.org', 'https://1rpc.io/matic'],
-  4663: ['https://rpc.mainnet.chain.robinhood.com', 'https://robinhood-rpc.publicnode.com'],
-  8453: ['https://mainnet.base.org', 'https://base-rpc.publicnode.com', 'https://base.drpc.org', 'https://1rpc.io/base'],
-  42161: ['https://arb1.arbitrum.io/rpc', 'https://arbitrum-one-rpc.publicnode.com', 'https://arbitrum.drpc.org', 'https://1rpc.io/arb'],
-  43114: [
-    'https://api.avax.network/ext/bc/C/rpc',
-    'https://avalanche-c-chain-rpc.publicnode.com',
-    'https://avalanche.drpc.org',
-    'https://1rpc.io/avax/c',
-  ],
-  59144: ['https://rpc.linea.build', 'https://linea-rpc.publicnode.com', 'https://linea.drpc.org', 'https://1rpc.io/linea'],
-  1514: ['https://mainnet.storyrpc.io', 'https://story-mainnet-evm.itrocket.net', 'https://evm-rpc.story.mainnet.dteam.tech'],
-  25: [
-    'https://evm.cronos.org',
-    'https://cronos-evm-rpc.publicnode.com',
-    'https://cronos.drpc.org',
-    'https://1rpc.io/cro',
-    'https://rpc.vvs.finance',
-  ],
-  999: [
-    'https://rpc.hyperliquid.xyz/evm',
-    'https://hyperliquid.drpc.org',
-    'https://rpc.hyperlend.finance',
-    'https://hyperliquid-json-rpc.stakely.io',
-  ],
-  1776: ['https://sentry.evm-rpc.injective.network', 'https://injectiveevm-rpc.polkachu.com'],
-  143: ['https://rpc.monad.xyz', 'https://monad.drpc.org'],
-  4326: ['https://mainnet.megaeth.com/rpc', 'https://megaeth.rpc.thirdweb.com', 'https://megaeth.drpc.org'],
-  // ---- not on the list today: kept so a chain added later is not blind (unverified) ----
-  250: ['https://rpc.ftm.tools', 'https://fantom-rpc.publicnode.com'],
-  100: ['https://rpc.gnosischain.com', 'https://gnosis-rpc.publicnode.com'],
-  324: ['https://mainnet.era.zksync.io'],
-  146: ['https://rpc.soniclabs.com'],
-  80094: ['https://rpc.berachain.com'],
-  1329: ['https://evm-rpc.sei-apis.com'],
-  5000: ['https://rpc.mantle.xyz'],
-  2741: ['https://api.mainnet.abs.xyz'],
-  130: ['https://mainnet.unichain.org'],
-  1868: ['https://rpc.soneium.org'],
-  57073: ['https://rpc-gel.inkonchain.com'],
-  480: ['https://worldchain-mainnet.g.alchemy.com/public'],
-  9745: ['https://rpc.plasma.to'],
-};
 
 // CoinGecko asset-platform ids, read from GET /api/v3/asset_platforms by chain_identifier
 // (2026-09-09): every EVM chain on the list has one.
@@ -346,6 +281,20 @@ export const CHAIN_META: Record<number, ChainMeta> = {
   },
 };
 
+/**
+ * `wallet_addEthereumChain` parameters for a chain, with the endpoint THIS BROWSER reads through at
+ * the head of `rpcUrls` — a wallet that adds the chain then uses the same node the page does, and a
+ * user who picked one because the default is blocked where they are does not get the default handed
+ * back to them by the Add-chain prompt. `chainIdHex` stays the only writer of the chain id itself.
+ */
+export function chainMeta(chainId: number): ChainMeta | undefined {
+  const meta = CHAIN_META[chainId];
+  if (!meta) return undefined;
+  const picked = activeRpcUrl(chainId);
+  if (!picked) return meta;
+  return { ...meta, rpcUrls: [...new Set([picked, ...meta.rpcUrls])] };
+}
+
 export function chainName(chainId: number | null | undefined, fromApi?: { chain_id: number; name: string }[]): string {
   if (chainId === null || chainId === undefined) return '–';
   return fromApi?.find((c) => c.chain_id === chainId)?.name ?? CHAIN_META[chainId]?.chainName ?? `Chain ${chainId}`;
@@ -379,27 +328,15 @@ export function withTimeout<T>(p: Promise<T>, ms: number, label = 'timed out'): 
   });
 }
 
-async function probeChainId(url: string, ms = 4000): Promise<number> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), ms);
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_chainId', params: [] }),
-      signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const j = (await res.json()) as { result?: string };
-    if (typeof j.result !== 'string') throw new Error('no result');
-    return parseInt(j.result, 16);
-  } finally {
-    clearTimeout(t);
-  }
-}
-
+/**
+ * The endpoints for a chain IN READING ORDER. `lib/rpc.ts` owns that order — the app's own verified
+ * list, with the endpoint this browser's owner picked in the settings popup moved to the front. One
+ * reader: everything on the client that reads a chain (the portfolio scan, a single balance
+ * re-read, a receipt wait, an allowance read) comes through here, so a pick applies to all of them
+ * or to none of them.
+ */
 export function fallbackUrls(chainId: number): string[] {
-  return FALLBACK_RPCS[chainId] ?? [];
+  return rpcUrls(chainId);
 }
 
 async function healthyUrl(chainId: number): Promise<string | null> {
@@ -409,14 +346,13 @@ async function healthyUrl(chainId: number): Promise<string | null> {
   const p = (async () => {
     const urls = fallbackUrls(chainId);
     for (let i = cursor.get(chainId) ?? 0; i < urls.length; i++) {
-      try {
-        if ((await probeChainId(urls[i])) !== chainId) continue;
-        healthy.set(chainId, urls[i]);
-        cursor.set(chainId, i);
-        return urls[i];
-      } catch {
-        // next URL
-      }
+      // ONE prober (T54): the same `probeRpcUrl` the settings popup's dots come from, so a dot is
+      // the reader's own experience of an endpoint and not a second opinion about it. It never
+      // throws — a failure is a recorded probe — so the loop reads its verdict rather than a catch.
+      if (!probeMatches(await probeRpcUrl(urls[i], 4000), chainId)) continue;
+      healthy.set(chainId, urls[i]);
+      cursor.set(chainId, i);
+      return urls[i];
     }
     healthy.set(chainId, null);
     return null;
@@ -445,6 +381,31 @@ export async function getFallbackProvider(chainId: number, batchMaxCount = 1): P
   providers.set(key, prov);
   return prov;
 }
+
+/**
+ * A new pick in the settings popup makes every cached provider for that chain the WRONG endpoint,
+ * and the cursor an index into a list that no longer starts where it did. So the cache for that
+ * chain is dropped and the next read starts again at the head of the new order. `chainId === null`
+ * is "Reset to defaults": everything goes.
+ */
+onRpcChange((e) => {
+  if (e.kind !== 'selection') return;
+  if (e.chainId === null) {
+    for (const [, prov] of providers) prov.destroy();
+    providers.clear();
+    healthy.clear();
+    cursor.clear();
+    return;
+  }
+  for (const [key, prov] of providers) {
+    if (key.startsWith(`${e.chainId}|`)) {
+      prov.destroy();
+      providers.delete(key);
+    }
+  }
+  healthy.delete(e.chainId);
+  cursor.delete(e.chainId);
+});
 
 export function invalidateFallback(chainId: number): void {
   for (const [key, prov] of providers) {

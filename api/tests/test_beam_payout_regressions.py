@@ -62,6 +62,10 @@ def beam_pay(monkeypatch: pytest.MonkeyPatch) -> FakeBeamPay:
     beampay.set_beampay(bp)
     monkeypatch.setattr(settings, "beam_treasury_address", TREASURY)
     monkeypatch.setattr(settings, "beam_mp_address", MP)
+    # the working-float policy (PGAS_SHIELD_KEEP_GROTH) has its own file
+    # (test_beam_payout_spendable); this one tests the shield MECHANICS, so the
+    # policy is pinned out of the way rather than silently deciding these cases
+    monkeypatch.setattr(settings, "shield_keep_groth", 0)
     yield bp
     beampay.set_beampay(None)
 
@@ -322,7 +326,7 @@ async def test_the_release_is_not_booked_without_our_own_pipe_message(
     await payouts.process_once()
     row = await payout(mock_db)
     assert row["status"] == "bridging" and "kernel_at" not in row
-    assert "refusing to book the release" in row["hold_reason"]
+    assert "refusing to book the release" in row["hold_detail"]
     assert await ledger.find_entry("release", "req1") is None
     bal = await ledger.balance("acct1", "ETH")
     assert bal["sent"] == 0 and bal["scheduled"] == 510_000
@@ -415,7 +419,7 @@ async def test_one_on_chain_delivery_settles_exactly_one_payout(mock_db, eth, ar
     a, b = await payout(mock_db, "reqA"), await payout(mock_db, "reqB")
     assert sorted([a["status"], b["status"]]) == ["delivering", "sent"]
     loser = a if a["status"] == "delivering" else b
-    assert "already booked to another payout request" in loser["hold_reason"]
+    assert "already booked to another payout request" in loser["hold_detail"]
     rows = await mock_db["pgasme_test"].deliveries.find({}).to_list(10)
     assert len(rows) == 1 and rows[0]["block"] == block
 
@@ -626,7 +630,7 @@ async def test_the_shielded_float_is_reserved_across_one_pass(mock_db, eth, arme
     rows = [await payout(mock_db, r) for r in ("req1", "req2", "req3")]
     assert sorted(r["status"] for r in rows) == ["releasing", "scheduled", "scheduled"]
     waiting = [r for r in rows if r["status"] == "scheduled"]
-    assert all("already committed to crossings in flight" in r["hold_reason"] for r in waiting)
+    assert all("already committed to crossings in flight" in r["hold_detail"] for r in waiting)
 
 
 async def test_the_beam_fee_budget_is_the_passs_own_not_one_calls(mock_db, eth, armed, beam_wallet, beam_pay):
@@ -712,12 +716,18 @@ async def test_a_release_refuses_while_unshielded_inventory_exists(
     unanswered. Either the invocation cannot spend max-privacy inputs (a gate that passed
     produces "not enough inputs", i.e. the lost-response state) or it quietly funds from
     freshly-claimed regular outputs — the on-chain claim → payout link §9.3 forbids. Refuse
-    rather than assume."""
+    rather than assume.
+
+    ⚠️ **RETIRED 2026-09-10 under `PGAS_PAYOUT_SPEND_UNSHIELDED`** (`payouts.s2_unshielded_gate`
+    carries the whole reasoning and what privacy it gave up). It is pinned here in its OFF
+    posture, because a flag-gated guard nobody exercises is a guard that has already rotted:
+    the stricter deployment has to keep working."""
+    monkeypatch.setattr(settings, "payout_spend_unshielded", False)
     beam_pay.addresses[TREASURY]["available"]["36"] = 1_000  # unshielded, at the treasury
     await make_payout(mock_db)
     await payouts.process_once()
     row = await payout(mock_db)
-    assert row["status"] == "scheduled" and "spec S2" in row["hold_reason"]
+    assert row["status"] == "scheduled" and "spec S2" in row["hold_detail"]
     assert "process_invoke_data" not in beam_wallet.methods()
 
     monkeypatch.setattr(settings, "beam_send_inputs_proven", True)
@@ -728,16 +738,250 @@ async def test_a_release_refuses_while_unshielded_inventory_exists(
 # ================================================== §12 · the relayer's cut (14)
 
 
-async def test_a_crossing_that_costs_more_than_the_fee_charged_is_refused(mock_db, eth, armed):
+async def test_a_crossing_that_costs_more_than_the_fee_charged_is_refused(
+    mock_db, eth, armed, monkeypatch
+):
     """The only economic gate was the relayer's share of the AMOUNT. `fee_groth` — the 2%
     debited from the user, the money that is supposed to pay the relayer — was never read, so
     at ordinary mainnet gas the treasury paid several times what it collected, silently, on
-    every minimum payout."""
+    every minimum payout.
+
+    ⚠️ THE SUBSIDY IS PINNED OFF HERE (T45 moved the default to 4×). This test is about WHAT the
+    gate measures against — the budget the order funded — and at any subsidy above 1 the same
+    numbers cross legitimately. What the 4× default does is a test of its own
+    (`test_gas_basis_and_refund.test_a_spike_inside_the_subsidy_crosses_instead_of_holding`);
+    the property here is "never cross at a loss when nothing is being subsidised"."""
+    monkeypatch.setattr(settings, "max_relayer_subsidy", 1.0)
     await make_payout(mock_db, fee_groth=1_000)  # 3600 groth of relayer against 1000 collected
     await payouts.process_once()
     row = await payout(mock_db)
-    assert row["status"] == "scheduled" and "refusing to cross at a loss" in row["hold_reason"]
+    assert row["status"] == "scheduled" and "refusing to cross at a loss" in row["hold_detail"]
     assert "invoke_contract" not in beam.wallet().methods()
+
+
+async def test_the_subsidy_gate_measures_the_bridge_fee_the_order_funded(
+    mock_db, eth, armed, monkeypatch
+):
+    """2026-09-10: the user pays the crossing explicitly (`bridge_fee_groth`), so the gate that
+    stops the treasury crossing at a loss must read THAT, not our 2%.
+
+    Reading `fee_groth` after the change is the same class of defect the gate was added for: a
+    payout with a fat 2% and a bridge fee quoted at a much lower gas price would cross at a loss,
+    and a payout with a tiny 2% and a fully-funded crossing would be held for no reason at all.
+
+    ⚠️ The subsidy is pinned off for the reason the test above pins it: the multiple is a
+    separate decision from WHICH number it multiplies, and only the second is asserted here."""
+    monkeypatch.setattr(settings, "max_relayer_subsidy", 1.0)
+    # a big 2% and a bridge fee that does NOT cover the live relayer fee → HELD
+    await make_payout(mock_db, rid="reqLow", fee_groth=1_000_000, bridge_fee_groth=1_000)
+    # a tiny 2% and a bridge fee that does → crosses
+    await make_payout(mock_db, rid="reqOk", fee_groth=1, bridge_fee_groth=3_600)
+    await payouts.process_once()
+    held = await payout(mock_db, "reqLow")
+    assert held["status"] == "scheduled" and "refusing to cross at a loss" in held["hold_detail"]
+    assert "of bridge fee" in held["hold_detail"]
+    assert (await payout(mock_db, "reqOk"))["status"] == "releasing"
+
+
+async def test_a_row_written_before_the_bridge_fee_was_itemised_still_has_a_budget(
+    mock_db, eth, armed
+):
+    """`bridge_budget_groth` is ONE reader with a legacy fallback: a row from before 2026-09-10
+    carries no `bridge_fee_groth`, and under the model it was written under its 2% WAS the budget
+    for the crossing. Reading a missing field as 0 would hold every one of those rows forever."""
+    await make_payout(mock_db, rid="reqOld")  # fee_groth 10_000, no bridge_fee_groth at all
+    assert "bridge_fee_groth" not in await payout(mock_db, "reqOld")
+    assert payouts.bridge_budget_groth(await payout(mock_db, "reqOld")) == 10_000
+    await payouts.process_once()
+    assert (await payout(mock_db, "reqOld"))["status"] == "releasing"
+
+
+async def test_an_order_that_funded_its_own_crossing_is_not_gated_on_the_share_of_the_amount(
+    mock_db, eth, armed
+):
+    """2026-09-10 (T30c/F1): the share-of-amount gate is a LEGACY-ROW gate now.
+
+    It was written when the floor under a payout was `ceil(relayer_fee × 10000 / fee_bps)` — 50×
+    the relayer fee — so a relayer fee above 10% of the amount could not happen and the gate was
+    unreachable. The floor is 1 groth since the bridge fee became an itemised charge, so EVERY
+    payout in [1 .. 10× the relayer fee] now trips it: accepted, debited amount + 2% + the whole
+    bridge fee, and then held at release forever, for a crossing the user has already paid for.
+    What the crossing costs the treasury is measured by the subsidy gate against what THIS order
+    funded; the share of the amount says nothing about it."""
+    await ledger.credit("acct1", "ETH", 1_000_000, "seed-extra")
+    # 0.0002 ETH funding a 3,600-groth crossing: 18% of the amount, and fully paid for
+    await make_payout(mock_db, rid="reqSmall", amount=20_000, bridge_fee_groth=3_600)
+    # the extreme the 1-groth floor now admits — the whole crossing is the bridge fee
+    await make_payout(mock_db, rid="reqOneGroth", amount=1, bridge_fee_groth=3_600)
+    await payouts.process_once()
+    for rid in ("reqSmall", "reqOneGroth"):
+        row = await payout(mock_db, rid)
+        assert row["status"] == "releasing", (rid, row.get("hold_reason"))
+    assert payouts.funds_its_own_crossing(await payout(mock_db, "reqSmall")) is True
+
+
+async def test_a_row_with_nothing_to_deliver_is_held_and_never_signed(
+    mock_db, eth, armed, beam_wallet
+):
+    """The zero-amount guard used to ride along inside the share gate's `amount <= 0 or fee /
+    amount > …` — the only thing standing between a nonsense row and a division by zero. The
+    share gate is now a legacy-row gate, so a MODERN row with no amount would have skipped it
+    entirely and walked on toward a send of nothing. It is its own guard, at its own level."""
+    await make_payout(mock_db, rid="reqZero", amount=0, bridge_fee_groth=3_600)
+    await payouts.process_once()
+    row = await payout(mock_db, "reqZero")
+    assert row["status"] == "scheduled" and "nothing to deliver" in row["hold_detail"]
+    assert "process_invoke_data" not in beam_wallet.methods()
+
+
+async def test_a_legacy_row_is_still_measured_against_the_share_of_the_amount(
+    mock_db, eth, armed
+):
+    """A row written before 2026-09-10 funded its crossing out of our 2% and nothing else, so the
+    old pair of ceilings is the only thing standing between it and a loss-making crossing. The
+    share gate stays exactly where it was FOR THOSE ROWS."""
+    await make_payout(mock_db, rid="reqLegacy", amount=20_000)  # 2% = 400 groth, no bridge fee
+    assert payouts.funds_its_own_crossing(await payout(mock_db, "reqLegacy")) is False
+    await payouts.process_once()
+    row = await payout(mock_db, "reqLegacy")
+    assert row["status"] == "scheduled" and "max 10%" in row["hold_detail"]
+
+
+async def test_a_subsidy_of_zero_is_read_as_one_by_the_gate_and_by_the_charge(
+    mock_db, eth, armed, monkeypatch
+):
+    """T30c/F2: ONE reader of the subsidy multiple. `headroom_for` read `float(x or 0) or 1.0`
+    (0 → 1.0) and the release gate read the raw `0` (→ `fee > charged × 0` holds EVERYTHING), so
+    an operator who wrote `PGAS_MAX_RELAYER_SUBSIDY=0` meaning "no subsidy" was charged for a 1×
+    crossing and then had every single order held for ever. Two readers of one setting."""
+    from pgasme import config
+    from pgasme.routers import withdrawals as wr
+
+    monkeypatch.setattr(settings, "max_relayer_subsidy", 0)
+    assert config.relayer_subsidy() == 1.0
+    zero_charge = wr.headroom_for(0.0)
+    monkeypatch.setattr(settings, "max_relayer_subsidy", 1.0)
+    assert config.relayer_subsidy() == 1.0
+    assert wr.headroom_for(0.0) == zero_charge  # the charge side already read 0 as 1×…
+
+    monkeypatch.setattr(settings, "max_relayer_subsidy", 0)  # …and now the gate does too
+    await make_payout(mock_db, rid="reqFunded", bridge_fee_groth=3_600)
+    await make_payout(mock_db, rid="reqShort", bridge_fee_groth=3_599)
+    await payouts.process_once()
+    assert (await payout(mock_db, "reqFunded"))["status"] == "releasing"
+    short = await payout(mock_db, "reqShort")
+    assert short["status"] == "scheduled" and "refusing to cross at a loss" in short["hold_detail"]
+    assert "limit 1×" in short["hold_detail"]
+
+
+async def test_the_dry_run_reports_the_gates_the_release_actually_runs(
+    mock_db, eth, beam_wallet, capsys
+):
+    """Law 8, sighting N: the prober must call the way the caller calls. The dry run is the
+    operator's only window onto these gates before a release, and it measured the live relayer
+    fee against our 2% (`row.fee_groth`) while the gate measures it against the bridge fee the
+    order funded — so a perfectly fundable modern order printed `⛔ LOSS-MAKING` and `⛔ TOO
+    HIGH` and then released anyway. A dry run that disagrees with the money path is worse than
+    no dry run: it is the one an operator makes a decision on."""
+    await make_payout(mock_db, amount=20_000, bridge_fee_groth=3_600)
+    assert await beam.cli_main(["dry-run", "--payout", "req1"]) == 0
+    text = capsys.readouterr().out
+    assert "bridge fee funded" in text and "0.000036" in text
+    assert "LOSS-MAKING" not in text  # 3,600 paid against 3,600 funded, at a 1× limit
+    assert "TOO HIGH" not in text  # …and the share of the amount is not this row's gate at all
+
+
+async def test_the_release_clears_every_half_the_schedule_debited(mock_db):
+    """The bridge fee went into `Scheduled` with the rest of the order. A release that cleared
+    only amount + fee would leave it there forever — the exact defect `release`/`fee` were split
+    into two guarded halves for, one field later."""
+    await ledger.credit("acctB", "ETH", 1_000_000, "seed-B")
+    await ledger.schedule("acctB", "ETH", 510_000, "reqB2", "test", bridge_fee_groth=3_600)
+    assert await ledger.debited_groth("reqB2") == 513_600
+    assert (await ledger.balance("acctB", "ETH"))["scheduled"] == 513_600
+
+    row = {
+        "_id": "reqB2",
+        "account_id": "acctB",
+        "asset": "ETH",
+        "amount_groth": 500_000,
+        "fee_groth": 10_000,
+        "bridge_fee_groth": 3_600,
+    }
+    await payouts._book_release(row)
+    entry = await ledger.find_entry("bridge_fee", "reqB2")
+    assert entry and entry["groth"] == 3_600 and entry["d_sched"] == -3_600
+    assert await ledger.balance("acctB", "ETH") == {
+        "available": 486_400,
+        "scheduled": 0,
+        "sent": 500_000,
+    }
+    # …and it is idempotent per half: a second booking adds nothing
+    assert await ledger.release("acctB", "ETH", 500_000, 10_000, "reqB2", "again",
+                                bridge_fee_groth=3_600) == []
+
+
+async def test_a_half_written_bridge_fee_is_repaired_not_declared_booked(mock_db, monkeypatch):
+    """The same doctrine as the `fee` half: a guard that reads only the halves it knew about
+    declares "already booked" forever when a later append failed, and that groth sits in
+    Scheduled where nothing can clear or charge it."""
+    real = ledger._append
+    state = {"fail": True}
+
+    async def flaky(account_id: str, asset: str, kind: str, *a: Any, **kw: Any) -> Any:
+        if kind == "bridge_fee" and state["fail"]:
+            raise RuntimeError("not primary")
+        return await real(account_id, asset, kind, *a, **kw)
+
+    monkeypatch.setattr(ledger, "_append", flaky)
+    await ledger.credit("acctC", "ETH", 1_000_000, "seed-C")
+    await ledger.schedule("acctC", "ETH", 510_000, "reqC", "test", bridge_fee_groth=3_600)
+    row = {
+        "_id": "reqC",
+        "account_id": "acctC",
+        "asset": "ETH",
+        "amount_groth": 500_000,
+        "fee_groth": 10_000,
+        "bridge_fee_groth": 3_600,
+    }
+    with pytest.raises(RuntimeError):
+        await payouts._book_release(row)
+    assert (await ledger.balance("acctC", "ETH"))["scheduled"] == 3_600
+
+    state["fail"] = False
+    await payouts._book_release(row)  # the next pass finishes it instead of short-circuiting
+    assert await ledger.find_entry("bridge_fee", "reqC") is not None
+    assert (await ledger.balance("acctC", "ETH"))["scheduled"] == 0
+
+
+async def test_a_payout_that_could_not_be_sent_is_delayed_and_keeps_its_debit(mock_db, eth, armed):
+    """⛔ **THE PROCESSOR NO LONGER REFUNDS ANYTHING** (T40, admin 2026-09-10: *"withdrawals on
+    user's side cannot be failed"*). `_fail` used to move the order to `failed` and give the
+    debit back; the user then saw the word Failed for a cause that was always ours and had to
+    schedule the whole thing again. An internal cause is `_delay` now: the money stays exactly
+    where it was — Scheduled, all three halves of it — and the order is tried again.
+
+    The refund still exists and is still read from the ledger rather than recomputed
+    (`ledger.debited_groth`), but it belongs to ONE path: the user pressing cancel."""
+    row = await make_payout(mock_db, rid="reqF", bridge_fee_groth=3_600)
+    debited = 500_000 + 10_000 + 3_600
+    assert await ledger.debited_groth("reqF") == debited
+    await payouts._delay(row, "scheduled", "the destination sprouted contract code")
+    got = await payout(mock_db, "reqF")
+    assert got["status"] == payouts.DELAYED
+    assert "contract code" in got["hold_detail"] and got["next_attempt_at"] > time.time()
+    assert await ledger.find_entry("cancel", "reqF") is None  # NOTHING was given back
+    assert (await ledger.balance("acct1", "ETH"))["scheduled"] == debited
+    # …and the user can still end it themselves, which is the only path that refunds
+    assert payouts.cancellable(got)[0] is True
+
+
+async def test_the_bridge_fee_entry_is_unique_per_ref_in_the_database(mock_db):
+    await ledger.ensure_indexes()
+    await ledger.credit("acctD", "ETH", 1_000_000, "seed-D")
+    await ledger.release("acctD", "ETH", 500_000, 10_000, "reqD", "first", bridge_fee_groth=3_600)
+    with pytest.raises(DuplicateKeyError):
+        await ledger._append("acctD", "ETH", "bridge_fee", 3_600, 0, -3_600, 0, "reqD", "x")
 
 
 async def test_the_b2e_relayer_fee_never_goes_below_the_floor(
@@ -771,7 +1015,7 @@ async def test_dark_is_cleared_when_the_next_hold_is_a_real_one(
     beam_pay.addresses[MP]["available"]["36"] = 100
     await payouts.process_once()  # armed, and now genuinely stuck on the float
     row = await payout(mock_db)
-    assert "shielded float" in row["hold_reason"] and "dark" not in row
+    assert "the float holds" in row["hold_detail"] and "dark" not in row
 
     paged.clear()
     tg._last_sent.clear()

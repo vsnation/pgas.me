@@ -5,11 +5,12 @@ client which contract to call on which chain."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 
 from .. import uniswap, xchain
 from ..assets import ASSETS
 from ..config import LEGACY_CHAIN_ID_FIELD
+from ..tokens import normalise
 
 router = APIRouter(tags=["dex"])
 
@@ -82,27 +83,26 @@ async def chains():
 
 
 @router.get("/v1/dex/tokens")
-async def tokens(chain_id: int = Query(..., description="EVM (original) chain id")):
+async def tokens(
+    response: Response, chain_id: int = Query(..., description="EVM (original) chain id")
+):
+    """The FALLBACK for one chain's token list.
+
+    The list a visitor normally gets is the static `/tokens/<chain_id>.json` written by
+    `pgasme.tokens` and served by nginx from the edge's cache; this route stays exactly as it
+    was for the case that file is missing (a box that has never run the refresher, a chain the
+    refresher could not fetch) — and it builds its rows with the SAME `normalise()` the static
+    file is built with, so falling back changes the speed and never the answer.
+
+    An hour of cache: the underlying list changes daily at most, and a client that fell back
+    once should not pay for the proxy on every chain switch afterwards."""
     try:
         internal = await xchain.route_chain_id(chain_id)
         rows = await xchain.token_list(internal)
     except xchain.XchainError as e:
         raise _xchain_error(e) from e
-    out = []
-    for t in rows:
-        addr = t.get("address")
-        if not addr:
-            continue
-        out.append(
-            {
-                "address": addr,
-                "symbol": t.get("symbol") or "",
-                "name": t.get("name") or "",
-                "decimals": int(t.get("decimals") or 0),
-                "logo": t.get("logoURI") or "",
-            }
-        )
-    return {"tokens": out}
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return {"tokens": normalise(rows)}
 
 
 # `/v1/assets` is the path of record (API_CONTRACT.md); `/v1/dex/assets` is the same handler

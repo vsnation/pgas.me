@@ -25,6 +25,7 @@ from .config import settings
 from .db import ensure_indexes, note_index_failure
 from .routers import (
     account,
+    admin,
     deposits,
     destinations,
     dev,
@@ -52,13 +53,36 @@ log = logging.getLogger("pgasme")
 BOT_TOKEN_RE = re.compile(r"bot[0-9]+:[A-Za-z0-9_-]+")
 BOT_TOKEN_MASK = "bot<REDACTED>"
 QUIET_LOGGERS = ("httpx", "httpcore")
+# …and the operator panel's key (2026-09-10, T38). It rides in a header — `X-Admin-Key`, or
+# `Authorization: Bearer` — which uvicorn's access log never writes, so this is not the leak the
+# bot token was; it is the belt for the same braces. A traceback that renders the request, a
+# future debug handler that dumps headers, or a hand-written `log.info("headers=%s", …)` would
+# each put it in a file that gets tailed and pasted. Masked by VALUE, so it does not matter
+# which of those wrote it. `routers/admin` never logs the header itself.
+ADMIN_KEY_MASK = "<REDACTED-ADMIN-KEY>"
+
+
+def admin_key() -> str:
+    """The configured panel key, or '' — read at record time so a rotated key masks at once."""
+    return (getattr(settings, "admin_key", "") or "").strip()
+
+
+def carries_secret(text: str) -> bool:
+    """True when this text holds something that must not reach a log file. ONE predicate: the
+    filter, the record factory and the traceback branch all ask exactly this question."""
+    if BOT_TOKEN_RE.search(text):
+        return True
+    key = admin_key()
+    return bool(key and key in text)
 
 
 def redact_secrets(text: str) -> str:
-    """`text` with every Telegram bot token masked. ONE implementation of what a secret looks
-    like and what it is replaced by — the filter, the record factory and the runbook's
-    `sed -E 's#bot[0-9]+:[A-Za-z0-9_-]+#bot<REDACTED>#g'` all describe the same shape."""
-    return BOT_TOKEN_RE.sub(BOT_TOKEN_MASK, text)
+    """`text` with every Telegram bot token and the admin key masked. ONE implementation of what
+    a secret looks like and what it is replaced by — the filter, the record factory and the
+    runbook's `sed -E 's#bot[0-9]+:[A-Za-z0-9_-]+#bot<REDACTED>#g'` all describe the same shape."""
+    text = BOT_TOKEN_RE.sub(BOT_TOKEN_MASK, text)
+    key = admin_key()
+    return text.replace(key, ADMIN_KEY_MASK) if key else text
 
 
 class RedactSecrets(logging.Filter):
@@ -75,7 +99,7 @@ class RedactSecrets(logging.Filter):
             text = record.getMessage()
         except Exception:  # noqa: BLE001 — a broken format string is the emitter's bug, not ours
             text = ""
-        if text and BOT_TOKEN_RE.search(text):
+        if text and carries_secret(text):
             record.msg = redact_secrets(text)
             record.args = ()
         if record.exc_info:
@@ -86,7 +110,7 @@ class RedactSecrets(logging.Filter):
                 exc_text = record.exc_text or logging.Formatter().formatException(record.exc_info)
             except Exception:  # noqa: BLE001 — an unformattable traceback stays as it was
                 exc_text = ""
-            if exc_text and BOT_TOKEN_RE.search(exc_text):
+            if exc_text and carries_secret(exc_text):
                 record.exc_text = redact_secrets(exc_text)
         return True
 
@@ -148,6 +172,14 @@ def is_internal_path(path: str) -> bool:
     `//INTERNAL/x`, and `/internalx` too. A PREFIX, not a directory: a guard that only matched
     `/internal/` leaves `/internal` and `/internalx` to whatever is mounted next."""
     return normalised_path(path).startswith(INTERNAL_PREFIX)
+
+
+def is_admin_path(path: str) -> bool:
+    """True for every spelling of the operator panel's family. The prefix itself comes from the
+    router that owns it (`routers.admin.PREFIX`) — a second hand-written `/admin` here would be
+    two implementations of one fact, and the one that drifted would be the one still writing the
+    panel's filters into the access log."""
+    return normalised_path(path).startswith(admin.PREFIX)
 
 
 class InternalIsLoopbackOnly:
@@ -317,6 +349,13 @@ class RedactAccessLog(logging.Filter):
       The prefix is matched through `is_internal_path`, the SAME reading the middleware guard
       uses — `//internal/x?token=…` and `/INTERNAL/x?token=…` are that route family too, and a
       filter that tested `startswith("/internal/")` on the raw target logged both in full.
+    * **the `/admin` query string** (2026-09-10, T38), for the first reason rather than the
+      second: the operator panel filters by account — `/admin/deposits?account=0x…` — and that
+      address would sit in the access log next to the address that asked for it, which is
+      exactly what the first bullet exists to prevent. The panel's own log line (routers/admin)
+      records the method, the path and the caller and nothing else, for the same reason. The key
+      itself never reaches here (it is a header), and `redact_secrets` masks its value anywhere
+      a record does carry it.
     """
 
     PREFIX = "/v1/destinations/"
@@ -329,7 +368,7 @@ class RedactAccessLog(logging.Filter):
             path, query, _ = target.partition("?")
             if target.startswith(self.PREFIX) and path not in self.KEEP:
                 record.args = (*args[:2], self.PREFIX + "<redacted>", *args[3:])
-            elif query and is_internal_path(path):
+            elif query and (is_internal_path(path) or is_admin_path(path)):
                 record.args = (*args[:2], path + "?<redacted>", *args[3:])
         return True
 
@@ -406,8 +445,18 @@ def create_app() -> FastAPI:
     # → 401, anything not an un-proxied loopback caller → 404). Mounting it on a flag would mean
     # BeamPay's webhook worker gets a 404 and pages the operator's group on every attempt, which
     # is the flood this route exists to end. nginx refuses /api/internal at the edge as well.
-    for r in (stats, siwe, account, destinations, dex, quote, deposits, withdrawals, internal):
+    # `admin` is mounted ALWAYS and refuses by itself, exactly like `internal`: with no key
+    # configured every one of its routes answers the 404 an unrouted path answers, so mounting
+    # it on a flag would buy nothing and would give the panel two switches that can disagree.
+    for r in (
+        stats, siwe, account, destinations, dex, quote, deposits, withdrawals, internal, admin
+    ):
         app.include_router(r.router)
+    # …and the ONE admin route that cannot live on a prefixed router: `/admin` itself. A
+    # prefixed APIRouter refuses an empty path, so the bare prefix matched nothing and
+    # Starlette's `redirect_slashes` answered every method with 307 → /admin/ — a redirect is a
+    # YES, and it was the one answer that told an unauthenticated prober the family is mounted.
+    app.include_router(admin.bare)
     if settings.dev_endpoints_active:  # never in prod — config refuses to boot on that combination
         log.warning("/v1/dev/* is MOUNTED (PGAS_DEV_ENDPOINTS=1, env=%s)", settings.env)
         app.include_router(dev.router)
