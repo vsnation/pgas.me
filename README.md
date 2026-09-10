@@ -21,7 +21,7 @@ arm flag until it has been proven with tiny real amounts.
 - Private funding of fresh EVM wallets
 - Pay with ETH, DAI or WBTC
 - Ethereum → Beam → Ethereum settlement
-- ⏱Scheduled payouts
+- Scheduled payouts
 - Multiple destination wallets per deposit
 - Real-time balance and payout status
 - Sign-In with Ethereum
