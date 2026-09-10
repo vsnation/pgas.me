@@ -108,6 +108,7 @@ class FakeBeamPay(beampay.BeamPay):
         self.withdraw_lands = True  # the daemon emits the transaction immediately
         self.withdraw_fee = 1_100_000  # BeamPay's own offline/max-privacy fee
         self.next_created = "MaxPrivacyTokenCreatedByBeamPay" + "z" * 40
+        self.created: list[dict[str, Any]] = []  # every /create_wallet body, in order
         self.next_tx = 1
         self.now = time.time
 
@@ -238,7 +239,12 @@ class FakeBeamPay(beampay.BeamPay):
         if path == "/validate_address":
             return 200, {"status": True, "result": params.get("address") not in self.invalid}
         if path == "/create_wallet":
-            addr = self.next_created
+            # ⛔ A REAL /create_wallet ANSWERS A NEW ADDRESS EVERY TIME. A fake that answered
+            # one address forever would let "a fresh max-privacy address per shield chunk" pass
+            # while every chunk went to the same one — which is precisely the collision the
+            # per-chunk address exists to prevent, so the fake must be able to show it.
+            addr = f"{self.next_created}{len(self.created)}"
+            self.created.append(dict(body or {}, address=addr))
             self.register(addr, str((body or {}).get("wallet_type") or "regular"))
             return 200, {"address": addr, "note": (body or {}).get("note")}
         if path == "/transactions":
@@ -951,7 +957,24 @@ async def test_a_deposit_is_claimed_then_shielded_with_one_event_per_transition(
     sends = beam_pay.withdrawals
     assert [s["amount"] for s in sends] == [10_000_000, 1_000_000, 1_000_000]
     assert all(s["asset_id"] == 36 and s["from_address"] == TREASURY for s in sends)
-    assert all(s["to_address"] == MP for s in sends)
+    # ⛔ A FRESH MAX-PRIVACY ADDRESS PER CHUNK, AND NEVER THE PRIMARY. Three sends to ONE
+    # max-privacy address is what deposit 60b0e57…'s chunks 1 and 2 died of on 2026-09-09
+    # ("Shielded outp duplicate ← Kernel Type 3", status 4): the wallet re-uses the address's
+    # one-time voucher and rebuilds the identical shielded output, which the chain refuses.
+    targets = [s["to_address"] for s in sends]
+    assert len(set(targets)) == 3 and MP not in targets
+    assert [c["note"] for c in beam_pay.created] == [f"pgasme shielded|dep1|{k}" for k in range(3)]
+    assert all(
+        c["wallet_type"] == "max_privacy" and c["expiration"] == "never"
+        for c in beam_pay.created
+    )
+    # …and each one is in the registry the float read sums over, before it was sent to
+    regs = await mock_db["pgasme_test"].mp_addresses.find({}).sort("k", 1).to_list(10)
+    assert [r["address"] for r in regs] == targets
+    assert [(r["deposit_id"], r["k"], r["purpose"]) for r in regs] == [
+        ("dep1", k, "shield") for k in range(3)
+    ]
+    assert [r["_id"] for r in regs] == [f"shield|dep1|{k}" for k in range(3)]
     # ⛔ no `fee` field: BeamPay sets the withdrawal fee and ignores ours (INTEGRATION.md §4)
     assert all("fee" not in s for s in sends)
     assert [s["comment"] for s in sends] == [f"shield|dep1|{k}" for k in range(3)]
@@ -996,7 +1019,9 @@ async def test_a_shield_retry_finds_its_comment_and_does_not_send_twice(
     await payouts.process_once()
     row = await deposit(mock_db)
     assert len(beam_pay.withdrawals) == 1  # it was queued
-    assert row["shield_calls"][0] > 0  # …and the row says so, which is what stops a resend
+    # …and the row says so, which is what stops a resend — with the address it was called with
+    assert row["shield_calls"][0]["at"] > 0
+    assert row["shield_calls"][0]["to_address"] == beam_pay.created[-1]["address"]
     assert row.get("shield_txids") in (None, [])
 
     beam_pay._withdraw = original
@@ -1036,6 +1061,313 @@ async def test_a_claim_waits_while_the_relayer_has_not_delivered(mock_db, eth, a
     row = await deposit(mock_db)
     assert row["treasury"] == "claiming" and "has not delivered" in row["hold_reason"]
     assert "process_invoke_data" not in beam_wallet.methods()
+
+
+# ====================== the shield collision (deposit 60b0e57…, 2026-09-09 23:21–23:23Z)
+#
+# Three max-privacy self-sends of 1,000,000 groth bETH to the SAME PGAS_BEAM_MP_ADDRESS,
+# seconds apart. Chunk 0 settled (tx f15dd77d…, shielded output 28390 at height 4030052).
+# Chunks 1 and 2 came back status 4, "failed maximum anonymity", with the wallet-api's own
+# reason: **"Shielded outp duplicate ← Kernel Type 3"**. A max-privacy address publishes
+# ONE-TIME vouchers; the wallet re-used the same one for every send in quick succession and
+# rebuilt the identical shielded output, which the chain refuses. Two thirds of the deposit
+# stayed unshielded.
+
+
+def chunk_tx(bp: FakeBeamPay, dep_id: str, k: int) -> dict[str, Any]:
+    """The transaction carrying one chunk's comment — the only identity a `/withdraw` has."""
+    return next(r for r in bp.tx_rows if r.get("comment") == f"shield|{dep_id}|{k}")
+
+
+def fail_chunk(bp: FakeBeamPay, dep_id: str, k: int) -> str:
+    """One chunk's transaction, as the wallet came back with chunks 1 and 2 that night."""
+    row = chunk_tx(bp, dep_id, k)
+    row.update(
+        status=beam.TX_FAILED,
+        status_string="failed maximum anonymity",
+        success=False,
+        failure_reason="Shielded outp duplicate ← Kernel Type 3",
+    )
+    return str(row["_id"])
+
+
+def fail_last_withdrawal(bp: FakeBeamPay) -> dict[str, Any]:
+    """The newest emitted withdrawal, same shape."""
+    row = bp.tx_rows[-1]
+    row.update(
+        status=beam.TX_FAILED,
+        status_string="failed maximum anonymity",
+        success=False,
+        failure_reason="Shielded outp duplicate ← Kernel Type 3",
+    )
+    return row
+
+
+async def cli_lines(fn: Any, *args: Any, **kw: Any) -> tuple[int, list[str]]:
+    lines: list[str] = []
+    code = await fn(*args, out=lines.append, **kw)
+    return code, lines
+
+
+async def shielding_deposit(mock_db, beam_wallet, beam_pay, value: int = 3_000_000) -> None:
+    """A claimed deposit sitting in `shielding` with `value / 1,000,000` chunks planned."""
+    await make_deposit(mock_db, value=value)
+    beam_wallet.incoming = [{"msg_id": 222, "amount": value}]
+    beam_pay.fund(TREASURY, 36, value)
+    for _ in range(4):
+        await payouts.process_once()
+    assert (await deposit(mock_db))["treasury"] == "shielding"
+
+
+async def test_each_shield_chunk_gets_its_own_fresh_max_privacy_address(
+    mock_db, eth, armed, beam_wallet, beam_pay
+):
+    """⛔ ONE ADDRESS PER CHUNK, CREATED THROUGH BEAMPAY, REGISTERED BEFORE IT IS SENT TO.
+
+    The registry is not bookkeeping: it is the only thing that makes the float knowable, so the
+    address must be in `mp_addresses` BEFORE any value is on its way to it."""
+    await shielding_deposit(mock_db, beam_wallet, beam_pay, value=2_000_000)
+    for _ in range(2):
+        await payouts.process_once()
+    a, b = (w["to_address"] for w in beam_pay.withdrawals)
+    assert a != b and MP not in (a, b)
+    assert beam_pay.address_types[a] == beam_pay.address_types[b] == "max_privacy"
+    # created through BeamPay — never the wallet-api — with the chunk in the note
+    assert [c["note"] for c in beam_pay.created] == ["pgasme shielded|dep1|0", "pgasme shielded|dep1|1"]
+    assert all(c["expiration"] == "never" for c in beam_pay.created)
+    assert "create_wallet" not in beam_wallet.methods()
+    # …in the registry the float read sums over, keyed by the chunk's own identity
+    rows = await mock_db["pgasme_test"].mp_addresses.find({}).sort("k", 1).to_list(10)
+    assert [(r["_id"], r["address"], r["purpose"]) for r in rows] == [
+        ("shield|dep1|0", a, "shield"),
+        ("shield|dep1|1", b, "shield"),
+    ]
+    # …and on the chunk record, chosen before the call, beside the marker that stops a resend
+    assert [c["to_address"] for c in payouts.shield_calls_of(await deposit(mock_db))] == [a, b]
+    # the comment — the only identity /withdraw has — is unchanged by any of this
+    assert [w["comment"] for w in beam_pay.withdrawals] == ["shield|dep1|0", "shield|dep1|1"]
+
+
+async def test_the_float_is_the_sum_over_every_registered_max_privacy_address(
+    mock_db, eth, armed, beam_wallet, beam_pay
+):
+    """⛔ THE FLOAT IS NOT ONE ADDRESS'S BALANCE ANY MORE. Reading only PGAS_BEAM_MP_ADDRESS
+    sees one chunk of a three-chunk shielding, and the payout then starves on value that is
+    sitting there, shielded, in the addresses nobody asked about."""
+    beam_pay.addresses[MP]["available"]["36"] = 100_000  # the primary holds almost nothing
+    spread = []
+    for k, groth in enumerate((400_000, 300_000)):
+        addr = beam_pay.register(f"MaxPrivacyChunk{k}" + "y" * 50, "max_privacy")
+        beam_pay.fund(addr, 36, groth)
+        spread.append(addr)
+        await mock_db["pgasme_test"].mp_addresses.insert_one(
+            {
+                "_id": f"shield|depX|{k}",
+                "address": addr,
+                "created_at": time.time() + k,
+                "deposit_id": "depX",
+                "k": k,
+                "purpose": "shield",
+            }
+        )
+    payouts.reset_process_state()
+    assert await payouts.mp_registry() == [MP, *spread]  # the primary FIRST
+    assert await payouts.float_groth(beam_pay, ETH) == 800_000
+
+    # and the money-level half: 0.005 needs 510,000 with the relayer fee, which the primary
+    # alone (100,000) cannot pay for and the registry can
+    await make_payout(mock_db, amount=500_000)
+    await payouts.process_once()
+    assert (await payout(mock_db))["status"] == "releasing"
+
+
+async def test_an_unreadable_address_in_the_registry_is_never_a_smaller_float(
+    mock_db, eth, armed, beam_wallet, beam_pay
+):
+    """A partial sum is a number nobody measured. `available_groth` RAISES on an address
+    BeamPay cannot report, and the release holds rather than crossing against a float that is
+    missing an address."""
+    await mock_db["pgasme_test"].mp_addresses.insert_one(
+        {
+            "_id": "shield|depX|0",
+            "address": "MaxPrivacyNotInBeamPaysBook" + "u" * 40,
+            "created_at": time.time(),
+            "deposit_id": "depX",
+            "k": 0,
+            "purpose": "shield",
+        }
+    )
+    payouts.reset_process_state()
+    with pytest.raises(beampay.BeamPayError):
+        await payouts.float_groth(beam_pay, ETH)
+    await make_payout(mock_db)
+    await payouts.process_once()  # the loop catches it per row and pages; nothing signs
+    assert (await payout(mock_db))["status"] == "scheduled"
+    assert "process_invoke_data" not in beam_wallet.methods()
+
+
+async def test_a_failed_chunk_holds_for_a_human_once_and_names_the_cli(
+    mock_db, eth, armed, beam_wallet, beam_pay, monkeypatch
+):
+    """⛔ A DEAD TRANSACTION IS NOT A LANDING, AND IT IS NOT AUTO-RETRIED.
+
+    `/withdraw` has no idempotency key, so a resend nobody looked at first is the double send
+    the whole design refuses to make possible. The hold is TERMINAL (the row leaves
+    `shielding`), so this is decided ONCE rather than re-decided every six hours — and the row
+    says the exact command that resolves it."""
+    monkeypatch.setattr(settings, "hold_backoff_s", 0.0)
+    await shielding_deposit(mock_db, beam_wallet, beam_pay)  # three 0.01 chunks
+    for _ in range(3):
+        await payouts.process_once()  # all three dispatched, as the live row was
+    assert len(beam_pay.withdrawals) == 3
+    # chunk 0 settles; 1 and 2 come back "failed maximum anonymity"
+    dead = [fail_chunk(beam_pay, "dep1", 1), fail_chunk(beam_pay, "dep1", 2)]
+
+    await payouts.process_once()
+    row = await deposit(mock_db)
+    assert row["treasury"] == payouts.HELD and row["held_from"] == "shielding"
+    assert "a shield chunk failed on Beam" in row["hold_reason"]
+    assert "python -m pgasme.beam replan-shield --deposit dep1" in row["hold_reason"]
+    assert "--apply" in row["hold_reason"]
+    assert row["shield_txids"] == [chunk_tx(beam_pay, "dep1", 0)["_id"]]  # only the LIVE one
+    assert "deposit_shield_failed" in await kinds(mock_db)
+    # ⛔ and it does not re-decide: a held row is out of the handler's reach entirely
+    holds = row.get("holds")
+    for _ in range(3):
+        await payouts.process_once()
+    again = await deposit(mock_db)
+    assert again["treasury"] == payouts.HELD and again.get("holds") == holds
+    assert len(beam_pay.withdrawals) == 3  # no fourth send into a broken plan
+    assert dead  # the two that died are what the re-plan below writes off
+
+
+async def test_replan_shield_dry_run_reads_beampay_and_writes_nothing(
+    mock_db, eth, armed, beam_wallet, beam_pay, monkeypatch
+):
+    monkeypatch.setattr(settings, "hold_backoff_s", 0.0)
+    await shielding_deposit(mock_db, beam_wallet, beam_pay)
+    for _ in range(3):
+        await payouts.process_once()
+    fail_chunk(beam_pay, "dep1", 1)
+    fail_chunk(beam_pay, "dep1", 2)
+    await payouts.process_once()
+    before = await deposit(mock_db)
+
+    code, lines = await cli_lines(beam.cmd_replan_shield, "dep1")
+    text = "\n".join(lines)
+    assert code == 0
+    assert "DRY RUN" in text and "held from shielding" in text
+    assert "settled" in text and "failed" in text
+    assert "failed maximum anonymity" in text
+    assert "settled, KEPT : chunk(s) 0" in text
+    assert "would re-plan : chunk(s) 1, 2" in text
+    assert "DRY RUN — nothing was written" in text
+    assert await deposit(mock_db) == before  # a look is a look
+    assert beam_pay.withdrawals and len(beam_pay.withdrawals) == 3
+
+
+async def test_replan_shield_apply_resends_the_failed_chunks_to_fresh_addresses(
+    mock_db, eth, armed, beam_wallet, beam_pay, monkeypatch
+):
+    """The repair, end to end: the settled chunk and its txid are kept, the two dead ones are
+    written off ON the row, the hold clears, and the processor re-sends them — each to its own
+    fresh max-privacy address, under the SAME comment, with no double-send page."""
+    monkeypatch.setattr(settings, "hold_backoff_s", 0.0)
+    await shielding_deposit(mock_db, beam_wallet, beam_pay)
+    for _ in range(3):
+        await payouts.process_once()
+    dead = [fail_chunk(beam_pay, "dep1", 1), fail_chunk(beam_pay, "dep1", 2)]
+    await payouts.process_once()
+    settled_txid = chunk_tx(beam_pay, "dep1", 0)["_id"]
+    first_targets = [w["to_address"] for w in beam_pay.withdrawals]
+
+    code, lines = await cli_lines(beam.cmd_replan_shield, "dep1", apply=True)
+    assert code == 0 and "APPLIED" in "\n".join(lines)
+    row = await deposit(mock_db)
+    assert row["treasury"] == "shielding" and "hold_reason" not in row and "held_from" not in row
+    calls = payouts.shield_calls_of(row)
+    assert calls[0]["at"] > 0 and calls[1]["at"] == 0 and calls[2]["at"] == 0  # 0 is untouched
+    assert sorted(row["shield_writeoffs"]) == sorted(dead)
+    assert [r["chunks"] for r in row["shield_replans"]] == [[1, 2]]
+    assert row["shield_txids"] == [settled_txid]  # the settled chunk's evidence is kept
+    assert "deposit_shield_replanned" in await kinds(mock_db)
+    # ⛔ the floor a history walk searches back to must not have moved forward, or chunk 0's
+    # transaction becomes invisible and the machine sends it again
+    assert row["shield_since"] <= row["treasury_at"]
+
+    for _ in range(2):
+        await payouts.process_once()
+    assert len(beam_pay.withdrawals) == 5
+    resent = beam_pay.withdrawals[3:]
+    assert [w["comment"] for w in resent] == ["shield|dep1|1", "shield|dep1|2"]
+    # ⛔ NEW ADDRESSES, NOT THE ONES THAT FAILED. The failed send already published that
+    # address's one-time voucher; re-sending to it reproduces the exact duplicate the chain
+    # refused. The attempt count comes from BeamPay's history — how many dead transactions
+    # carry this chunk's comment — never from a counter of ours.
+    assert not {w["to_address"] for w in resent} & set(first_targets)
+    regs = await mock_db["pgasme_test"].mp_addresses.find({}).sort("_id", 1).to_list(20)
+    assert [r["_id"] for r in regs] == [
+        "shield|dep1|0", "shield|dep1|1", "shield|dep1|1#1", "shield|dep1|2", "shield|dep1|2#1"
+    ]
+    assert {r["address"] for r in regs} == set(first_targets) | {w["to_address"] for w in resent}
+    # a dead transaction sharing a comment with a live one is NOT a double send
+    assert "deposit_shield_duplicate" not in await kinds(mock_db)
+
+    await payouts.process_once()
+    row = await deposit(mock_db)
+    assert row["treasury"] == "shielded" and len(row["shield_txids"]) == 3
+
+
+async def test_replan_shield_refuses_while_a_chunk_could_still_land(
+    mock_db, eth, armed, beam_wallet, beam_pay, monkeypatch
+):
+    """⛔ NEVER RACE THE WALLET. A pending transaction may still settle and a `/withdraw`
+    BeamPay has accepted may still be emitted: re-planning either queues a SECOND send of one
+    chunk, which is exactly what this route cannot dedupe."""
+    monkeypatch.setattr(settings, "hold_backoff_s", 0.0)
+    await shielding_deposit(mock_db, beam_wallet, beam_pay)
+    for _ in range(3):
+        await payouts.process_once()
+    fail_chunk(beam_pay, "dep1", 1)
+    # chunk 2 is still in flight: the kernel has not registered yet
+    chunk_tx(beam_pay, "dep1", 2).update(status=beam.TX_IN_PROGRESS, status_string="in progress")
+    code, lines = await cli_lines(beam.cmd_replan_shield, "dep1", apply=True)
+    text = "\n".join(lines)
+    assert code == 1 and "REFUSING" in text and "chunk 3 is pending" in text
+    assert (await deposit(mock_db))["treasury"] == "shielding"
+    assert len(beam_pay.withdrawals) == 3  # nothing was re-sent
+
+    # the other racy shape: /withdraw was called and no transaction has appeared at all
+    chunk_tx(beam_pay, "dep1", 2).update(comment="")  # chunk 2's transaction is not visible
+    code, lines = await cli_lines(beam.cmd_replan_shield, "dep1", apply=True)
+    assert code == 1 and "chunk 3 is unknown" in "\n".join(lines)
+
+
+async def test_replan_shield_refuses_when_nothing_failed_and_when_the_switch_is_set(
+    mock_db, eth, armed, beam_wallet, beam_pay, monkeypatch, tmp_path
+):
+    await shielding_deposit(mock_db, beam_wallet, beam_pay, value=1_000_000)
+    await payouts.process_once()  # chunk 0 sent and settled
+    code, lines = await cli_lines(beam.cmd_replan_shield, "dep1", apply=True)
+    assert code == 1 and "nothing here to re-plan" in "\n".join(lines)
+
+    fail_last_withdrawal(beam_pay)
+    stop = tmp_path / "pgasme.stop"
+    stop.write_text("stop")
+    monkeypatch.setattr(settings, "stop_file", str(stop))
+    code, lines = await cli_lines(beam.cmd_replan_shield, "dep1", apply=True)
+    assert code == 1 and "kill switch is set" in "\n".join(lines)
+    assert (await deposit(mock_db)).get("shield_writeoffs") is None
+
+    code, _lines = await cli_lines(beam.cmd_replan_shield, "no-such-deposit")
+    assert code == 1
+
+
+async def test_the_replan_command_parses_its_arguments(mock_db, beam_pay, capsys):
+    assert await beam.cli_main(["replan-shield"]) == 2
+    assert await beam.cli_main(["replan-shield", "--deposit"]) == 2
+    assert await beam.cli_main(["replan-shield", "--deposit", "nope"]) == 1
+    assert "replan-shield --deposit <id>" in beam.USAGE
 
 
 def test_the_shield_plan_is_denominations_largest_first_then_the_remainder():

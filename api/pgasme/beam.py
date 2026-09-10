@@ -1,7 +1,7 @@
 """The Beam side: the TWO wallet-api calls BeamPay has no endpoint for, the b2e relayer fee,
 and a read-only CLI.
 
-⛔ **BeamPay is the ONLY interface to the Beam wallet** (CLAUDE.md law 10, admin 2026-09-09:
+⛔ **BeamPay is the ONLY interface to the Beam wallet** (operating law 10, admin 2026-09-09:
 *"Avoid using wallet-api. Only Beampay as it counts all balances."*). Balances, transactions,
 statuses, addresses, withdrawals and shielding all live in `pgasme/beampay.py`. This file keeps
 exactly two wallet-api methods, because BeamPay has no endpoint for either:
@@ -55,17 +55,24 @@ theirs), and it is read BACK from BeamPay after settlement rather than assumed
 (`payouts.fee_charged`). The withdrawal fee is BeamPay's and is never ours to send. See the
 FEES section of `pgasme/payouts.py` for the whole picture.
 
-CLI (read-only, nothing is ever sent — with ONE named exception):
+CLI (read-only, nothing is ever sent — with TWO named exceptions):
     python -m pgasme.beam status
     python -m pgasme.beam dry-run --payout <request_id>
     python -m pgasme.beam dry-run --claim <deposit_id>
-    python -m pgasme.beam repair-fee --txid <contract txid> [--apply]
+    python -m pgasme.beam repair-fee --txid <contract txid> [--apply] [--adjust-id <id>]
         the one-off operator repair for a contract tx made by the OLD claim path, which
         submitted before it registered the txid: BeamPay booked the whole flow to `__house__`,
         including the BEAM fee. `--apply` posts one ZERO-SUM `POST /internal/ledger/adjust`
         (asset 0, treasury → `__house__`, `after_tx` = the settled claim) and nothing else; the
         default is a dry run that prints the body and every gate the route will apply. It never
         reaches the wallet's signing path, and the kill switch is checked before it posts.
+    python -m pgasme.beam replan-shield --deposit <deposit id> [--apply]
+        the chunk table of one deposit's shielding, read from BeamPay's own history, and which
+        FAILED chunks a re-plan would hand back to the processor. `--apply` clears the hold and
+        marks those chunks unsent so the processor re-sends them, each to its own FRESH
+        max-privacy address (see `payouts.shield_target`: consecutive sends to ONE max-privacy
+        address collide). It refuses while any chunk is pending or unresolved — that would race
+        the wallet — writes no value itself, and checks the kill switch before it writes at all.
 """
 
 from __future__ import annotations
@@ -492,7 +499,11 @@ async def cmd_status(out: Any = print) -> int:
         return 1
     mp = await payouts.float_address()
     out(f"  treasury   : {treasury}")
-    out(f"  max-privacy: {mp or '— not configured (the float cannot be read)'}")
+    out(f"  max-privacy: {mp or '— not configured (the float cannot be read)'}  (primary: "
+        f"the float's first entry and the address a release books to)")
+    registry = await payouts.mp_registry()
+    out(f"  mp registry: {len(registry)} max-privacy address(es) — the FLOAT column below is the "
+        f"SUM over all of them (one fresh address per shield chunk)")
     try:
         st = await bp.wallet_status()  # BeamPay's GET /wallet_status, not the wallet-api's
     except BeamPayError as e:
@@ -515,7 +526,7 @@ async def cmd_status(out: Any = print) -> int:
     for key, asset in ASSETS.items():
         try:
             regular = await bp.available_groth(treasury, asset.aid)
-            floated = await bp.available_groth(mp, asset.aid) if mp else None
+            floated = await payouts.float_groth(bp, asset) if mp else None
             locked = await bp.locked_groth(treasury, asset.aid)
         except BeamPayError as e:
             out(f"  {key:6} {asset.aid:>4}  unreadable: {e}")
@@ -601,10 +612,14 @@ async def cmd_dry_run_payout(request_id: str, out: Any = print) -> int:
         f"{'OK' if fee_groth <= charged * settings.max_relayer_subsidy else '⛔ LOSS-MAKING'}")
     bp = beampay.beampay()
     mp = await payouts.float_address()
-    out(f"  float address : {mp or '— none configured; the release would hold'}  (BeamPay)")
+    out(f"  float address : {mp or '— none configured; the release would hold'}  (BeamPay; "
+        f"the address this crossing BOOKS to)")
     try:
         treasury = beampay.treasury_address()
-        fl = await bp.available_groth(mp, asset.aid) if mp else 0
+        registry = await payouts.mp_registry()
+        fl = await payouts.float_groth(bp, asset) if mp else 0
+        out(f"  float spread  : {len(registry)} max-privacy address(es) — the float below is the "
+            f"SUM over them (one per shield chunk)")
         reserved = await payouts.inflight_groth(asset, request_id)
         need = amount + fee_groth + settings.float_min_groth
         out(f"  shielded float: {_fmt(fl)} · {_fmt(reserved)} committed to crossings in flight "
@@ -767,7 +782,9 @@ async def _row_for_txid(txid: str) -> tuple[str, str] | None:
     return None
 
 
-async def cmd_repair_fee(txid: str, apply: bool = False, out: Any = print) -> int:
+async def cmd_repair_fee(
+    txid: str, apply: bool = False, out: Any = print, adjust_id: str | None = None
+) -> int:
     """Book the BEAM FEE LEG of one already-settled contract tx off `__house__`.
 
     ⚠️ WHY THIS EXISTS, ONCE. The deployed claim path submitted `process_invoke_data` before it
@@ -785,6 +802,14 @@ async def cmd_repair_fee(txid: str, apply: bool = False, out: Any = print) -> in
     house back (treasury → `__house__`); an INFLOW credited it, so the repair pays the address.
     This computes the same flow with the same arithmetic and refuses locally rather than
     discovering the mismatch as a 409.
+
+    THE ID IS DETERMINISTIC ON PURPOSE, AND OVERRIDABLE FOR ONE REASON. `pgasme:fee:<txid>` is
+    what makes a *replay* free: post it twice and BeamPay answers `replayed: true` instead of
+    moving value twice. But an adjustment that was REFUSED (a 409 on a body we then corrected,
+    a reversed pair of addresses) has burned that id, and the corrected adjustment can never be
+    posted under it. `--adjust-id` is the escape hatch for exactly that: a fresh id for a repair
+    that has never been applied. It is never a way to post the same repair a second time — the
+    operator carries the burden of knowing which of the two it is.
 
     DRY RUN BY DEFAULT: it prints the exact body and every gate the route will apply, and sends
     nothing. `--apply` posts it, and checks the kill switch immediately before doing so."""
@@ -841,7 +866,7 @@ async def cmd_repair_fee(txid: str, apply: bool = False, out: Any = print) -> in
         frm, to = HOUSE_ACCOUNT_ID, treasury
         which = "the flow was an INFLOW, so __house__ was CREDITED and the repair pays the treasury"
     body = {
-        "adjust_id": f"pgasme:fee:{txid}",
+        "adjust_id": adjust_id or f"pgasme:fee:{txid}",
         "asset_id": 0,
         "from_address": frm,
         "to_address": to,
@@ -878,17 +903,133 @@ async def cmd_repair_fee(txid: str, apply: bool = False, out: Any = print) -> in
     return 0
 
 
+async def cmd_replan_shield(deposit_id: str, apply: bool = False, out: Any = print) -> int:
+    """The chunk table of one deposit's shielding, and the re-plan of the chunks that FAILED.
+
+    ⚠️ WHY THIS EXISTS. 2026-09-09 23:21–23:23Z, deposit 60b0e5703cbad6955af059f1: three
+    max-privacy self-sends of 1,000,000 groth bETH to the SAME `PGAS_BEAM_MP_ADDRESS`. Chunk 0
+    settled; chunks 1 and 2 were refused by the wallet with "Shielded outp duplicate ← Kernel
+    Type 3" (status 4, "failed maximum anonymity") — a max-privacy address publishes ONE-TIME
+    vouchers and the wallet re-used the same one for every send in quick succession. The code
+    path is fixed (`payouts.shield_target` makes a fresh address per chunk), but the two chunks
+    that already failed are not something the machine may retry on its own: `/withdraw` has no
+    idempotency key, so a resend a human did not look at first is exactly the double send the
+    whole design refuses to make possible.
+
+    THE STATE IS READ FROM BEAMPAY'S OWN HISTORY, by the comment WE chose (`shield_comment`) —
+    never from what the row believes. A chunk qualifies for a re-plan only when its transactions
+    are ALL dead: no live transaction carries its comment. A `pending` or unresolved chunk
+    REFUSES the whole run, because the wallet may still emit its transaction and a re-plan that
+    races it queues a second send of one chunk.
+
+    DRY RUN BY DEFAULT. `--apply` writes exactly one transition (`payouts.replan_shield`): the
+    failed chunks become unsent, their dead txids are written off on the row, the hold is
+    cleared, and the settled chunks and their txids are left untouched — they ARE the shielded
+    value. Nothing here reaches the wallet or BeamPay's movers, and the kill switch is checked
+    before the write."""
+    from . import payouts  # local: payouts imports this module
+
+    dep = await db().deposits.find_one({"_id": deposit_id})
+    if not dep:
+        out(f"⛔ no deposit {deposit_id!r}")
+        return 1
+    bp = beampay.beampay()
+    try:
+        treasury = beampay.treasury_address()
+    except BeamPayError as e:
+        out(f"⛔ {e}")
+        return 1
+    asset = get_asset(dep.get("asset", "ETH"))
+    plan = [int(x) for x in (dep.get("shield_plan") or [])]
+    out(f"{'APPLY' if apply else 'DRY RUN'} · re-plan the shield chunks of deposit {deposit_id}")
+    held = str(dep.get("treasury")) == payouts.HELD
+    out(f"  treasury   : {dep.get('treasury')}"
+        + (f"  (held from {dep.get('held_from')})" if held else ""))
+    if dep.get("hold_reason"):
+        out(f"  hold       : {str(dep['hold_reason'])[:400]}")
+    out(f"  asset      : {asset.key} (aid {asset.aid}) · sent from the treasury {treasury}")
+    out(f"  plan       : {len(plan)} chunk(s), {_fmt(sum(plan))} {asset.key} of a "
+        f"{_fmt(int(dep.get('value_groth') or 0))} deposit")
+    out(f"  history    : searched back to create_time {int(payouts.shield_since_of(dep))} — the "
+        f"window every chunk's comment is looked for in")
+    if not plan:
+        out("  ⛔ this deposit has no shield plan, so there are no chunks to re-plan")
+        return 1
+    try:
+        rows = await payouts.shield_chunk_report(bp, dep)
+    except BeamPayError as e:
+        out(f"  ⛔ BeamPay could not be read: {e} — that is 'we cannot see', and it is NEVER "
+            f"'nothing was sent'")
+        return 1
+    out("")
+    out("   k  amount            state      BeamPay status              txid          comment")
+    for r in rows:
+        status = (
+            f"{r['tx_status']} {r['tx_status_string'] or '—'}" if r["txid"] else "— no transaction"
+        )
+        out(f"  {r['k']:>2}  {_fmt(r['amount']):<16}  {r['state']:<9}  {status[:26]:<26}  "
+            f"{(r['txid'][:12] if r['txid'] else '—'):<12}  {r['comment']}")
+        if r["to_address"]:
+            out(f"      → sent to {r['to_address'][:24]}…"
+                if len(r["to_address"]) > 24 else f"      → sent to {r['to_address']}")
+    ks, txids, racy = payouts.shield_replan_plan(rows)
+    settled = [r for r in rows if r["state"] == payouts.SHIELD_SETTLED]
+    out("")
+    out(f"  settled, KEPT : chunk(s) {', '.join(str(r['k']) for r in settled) or '— none'} "
+        f"({_fmt(sum(r['amount'] for r in settled))} {asset.key} already shielded, txids kept)")
+    out(f"  would re-plan : chunk(s) {', '.join(str(k) for k in ks) or '— none'} "
+        f"({_fmt(sum(r['amount'] for r in rows if r['k'] in ks))} {asset.key} to be re-sent, "
+        f"each to its own FRESH max-privacy address)")
+    out(f"  writes off    : {', '.join(txids) or '— none'}")
+    if racy:
+        out("")
+        for why in racy:
+            out(f"  ⛔ REFUSING: {why}. The wallet may still emit a transaction for it, and a "
+                f"re-plan that races /withdraw queues a SECOND send of one chunk")
+        return 1
+    if not ks:
+        out("")
+        out("  ⛔ no chunk is `failed`, so there is nothing here to re-plan — and a hold this "
+            "tool did not cause is not this tool's to clear")
+        return 1
+    if not apply:
+        out("")
+        out("  DRY RUN — nothing was written. Re-run with --apply to clear the hold and mark "
+            "those chunks unsent; the processor then re-sends them ONE PER PASS.")
+        return 0
+    if _paused():
+        out(f"  ⛔ the kill switch is set ({settings.stop_file}) — nothing was written")
+        return 1
+    res = await payouts.replan_shield(deposit_id, ks, txids)
+    if not res.get("ok"):
+        out(f"  ⛔ REFUSED: {res.get('why')}")
+        return 1
+    out(f"  APPLIED: chunk(s) {', '.join(str(k) for k in res['chunks'])} of "
+        f"{res['chunks_total']} are unsent again (the row was {res['from']}), "
+        f"{len(res['writeoffs'])} failed transaction(s) written off. The processor sends one "
+        f"chunk per pass, each to its own fresh max-privacy address.")
+    return 0
+
+
 USAGE = """python -m pgasme.beam <command>
 
   status                        wallet height vs node, balances per asset, float, pending intents
   dry-run --payout <id>         the exact calls a bETH → ETH release would make, and the fee
   dry-run --claim <deposit id>  the exact calls a claim would make
+  replan-shield --deposit <id>  one deposit's shield chunks as BeamPay's history has them, and
+                                which FAILED chunks a re-plan would hand back to the processor
+                                [--apply]  clear the hold and mark them unsent, so they are
+                                           re-sent to FRESH max-privacy addresses
   repair-fee --txid <txid>      the ledger/adjust that books an unregistered contract tx's BEAM
                                 fee leg off __house__ (a one-off for the OLD claim path)
-                                [--apply]  post it; without it nothing is sent
+                                [--apply]           post it; without it nothing is sent
+                                [--adjust-id <id>]  retry a REFUSED adjustment under a fresh id
+                                                    (default: pgasme:fee:<txid>, which makes a
+                                                    replay idempotent)
 
 Every command reads only, EXCEPT `repair-fee --apply`, which posts one zero-sum BeamPay
-ledger adjustment. Nothing here ever reaches the wallet's signing path.
+ledger adjustment, and `replan-shield --apply`, which writes one transition on one deposit row.
+Nothing here ever reaches the wallet's signing path.
 """
 
 
@@ -914,12 +1055,29 @@ async def cli_main(argv: list[str], out: Any = print) -> int:
             return await cmd_dry_run_claim(argv[i + 1], out)
         out("dry-run needs --payout <id> or --claim <deposit id>")
         return 2
+    if cmd == "replan-shield":
+        if "--deposit" not in argv or argv.index("--deposit") + 1 >= len(argv):
+            out("replan-shield needs --deposit <deposit id>")
+            return 2
+        return await cmd_replan_shield(
+            argv[argv.index("--deposit") + 1], apply="--apply" in argv, out=out
+        )
     if cmd == "repair-fee":
         if "--txid" not in argv or argv.index("--txid") + 1 >= len(argv):
             out("repair-fee needs --txid <the settled contract txid>")
             return 2
+        adjust_id = None
+        if "--adjust-id" in argv:
+            i = argv.index("--adjust-id")
+            if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                out("--adjust-id needs an id")
+                return 2
+            adjust_id = argv[i + 1]
         return await cmd_repair_fee(
-            argv[argv.index("--txid") + 1], apply="--apply" in argv, out=out
+            argv[argv.index("--txid") + 1],
+            apply="--apply" in argv,
+            out=out,
+            adjust_id=adjust_id,
         )
     out(USAGE)
     return 2

@@ -12,6 +12,11 @@ The mode is decided from the source chain and token BEFORE anything is called, a
 always names it (API_CONTRACT.md, "Quote modes"). `xchain` is the name of record; the router's
 own older name for it is still accepted on a stored row for one release (`xchain.norm_mode`):
 
+  "uniswap" the source chain IS Ethereum and the pair is a registered gateway route: ONE
+            transaction — the user swaps on our zero-liquidity gateway pool and the hook routes
+            the input through the canonical deep pool and pipes the whole output to Beam inside
+            that same transaction. Built AT ONCE (one Quoter `eth_call`, then arithmetic): there
+            is no /arm step, because nothing upstream is ordered and nothing is paid for twice.
   "xchain"  the source chain is not Ethereum: the cross-chain order described below.
   "direct"  the source chain IS Ethereum and the source token IS the target asset's own token:
             no router call at all — the deposit is the user's own sendFunds(value, relayerFee,
@@ -59,6 +64,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import secrets
 import time
 from typing import Any
@@ -67,10 +73,12 @@ from eth_utils import is_address, to_checksum_address
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from .. import auth, ethpipe, workers, xchain
+from .. import auth, ethpipe, uniswap, workers, xchain
 from ..assets import Asset, PriceError, get_asset, to_groth, usd_prices
 from ..config import LEGACY_CHAIN_ID_FIELD, ROUTER_HOOK_PARAM, settings
 from ..db import db
+
+log = logging.getLogger("pgasme.quote")
 
 router = APIRouter(prefix="/v1/quote", tags=["quote"])
 
@@ -102,6 +110,22 @@ ARM_ORDER_ATTEMPTS = 3
 ARM_LOCK_S = 30.0
 ARM_WAIT_S = 3.0  # how long the second caller waits for the first one's order before 409
 ARM_POLL_S = 0.05
+BPS = 10_000
+# The routes a client may ask for by name. "auto" is the default and picks the best one that is
+# actually available for the pair (uniswap → direct → swap → xchain).
+ROUTE_CHOICES = ("auto", uniswap.MODE, "direct", "swap", xchain.MODE)
+# What a paused route says. Neutral on purpose: a user does not need to know which upstream is
+# switched off, only that this way in is closed right now and the others are not.
+XCHAIN_PAUSED = "cross-chain deposits are paused — deposit from Ethereum instead"
+UNISWAP_UNAVAILABLE = "the Uniswap route is not available"
+
+
+def refuse(status: int, detail: str, **ctx: Any) -> HTTPException:
+    """Every decision path writes a row. A refusal is not a trade and not a failure — but a
+    refusal nobody can see is how a wrong cap ran for 23.5 hours before anyone noticed, so each
+    one leaves a line naming the route, the reason and the account it was refused for."""
+    log.warning("quote refused %d: %s (%s)", status, detail, ctx)
+    return HTTPException(status, detail)
 
 
 async def check_quote_cap(account_id: str) -> None:
@@ -130,6 +154,9 @@ class QuoteIn(BaseModel):
     amount: str = Field(min_length=1, max_length=40, description="raw units, decimal string")
     target_asset: str = "ETH"
     sender: str | None = None
+    route: str | None = Field(
+        None, max_length=16, description='"uniswap" | "direct" | "swap" | "xchain" | "auto"'
+    )
 
 
 def _xchain_error(e: xchain.XchainError) -> HTTPException:
@@ -155,6 +182,16 @@ def _split(amount: int, asset: Asset) -> tuple[int, int]:
         return ethpipe.split_for_asset(amount, asset)
     except ethpipe.SplitError as e:
         raise HTTPException(400, f"amount too small: {e}") from e
+
+
+def _split_at(amount: int, relayer_fee: int, asset: Asset, what: str) -> tuple[int, int]:
+    """The same split with an EXPLICIT relayer-fee quote — the Uniswap hook is handed the fee in
+    `hookData` and splits the REAL output by it on-chain, so what the user is shown has to be
+    the same arithmetic on the same number (law 9), not `split_for_asset`'s own floor."""
+    try:
+        return ethpipe.split_amount(amount, relayer_fee, asset.grid)
+    except ethpipe.SplitError as e:
+        raise refuse(400, f"amount too small ({what}): {e}", amount=amount, fee=relayer_fee) from e
 
 
 async def _usd(asset: Asset, units: int) -> float | None:
@@ -490,6 +527,9 @@ def stored_arm(q: dict[str, Any], asset: Asset) -> dict[str, Any]:
         resp["order_id"] = q["order_id"]
     if q.get("approval"):
         resp["approval"] = q["approval"]
+    for k in ("deposit_ref", "route"):  # mode "uniswap" carries these instead of an order id
+        if q.get(k):
+            resp[k] = q[k]
     return resp
 
 
@@ -818,6 +858,169 @@ async def swap_quote(
     )
 
 
+# --------------------------------------------------------- mode "uniswap" (Ethereum → the hook)
+
+
+async def uniswap_quote(
+    acct: dict[str, Any],
+    asset: Asset,
+    route: uniswap.Route,
+    amount: int,
+    user: str,
+) -> dict[str, Any]:
+    """One transaction: the user swaps on our gateway pool and the hook pipes the output to Beam.
+
+    Built AT ONCE — there is no /arm step, because nothing upstream is ordered: the whole quote
+    is one `eth_call` on the Quoter plus arithmetic we can redo any time. What the user signs is
+    `PgasRouter.deposit(...)`, and the only slippage bound that works on this path is `minOut`
+    inside `hookData` (through any router the hook takes 100 % of the output, so a router-level
+    `amountOutMinimum` would always trip).
+
+    `deposit_ref` is a HINT for attribution, never an authorisation: what binds the deposit to
+    this account is POST /v1/deposits resolving the transaction — `from` == this wallet, `to` ==
+    our router, this ref in the calldata, and, once mined, our hook's log AND the pipe's.
+    """
+    if amount > route.max_deposit_units:
+        raise refuse(
+            400,
+            f"above this route's cap of {route.max_deposit_units} units of "
+            f"{route.symbol or route.token_in} — the cap comes from the pool's live depth",
+            token=route.token_in,
+            amount=amount,
+        )
+    if amount < route.min_deposit_units:
+        raise refuse(
+            400,
+            f"below this route's minimum of {route.min_deposit_units} units of "
+            f"{route.symbol or route.token_in}",
+            token=route.token_in,
+            amount=amount,
+        )
+    try:
+        out_units = await uniswap.quote_out(workers.get_rpc(), route, amount)
+    except uniswap.QuoteUnreadable as e:
+        # An unreadable query is not evidence of anything — least of all of a price.
+        raise refuse(503, f"could not read a price from the pool ({e}) — try again", token=route.token_in) from e
+    except uniswap.RouteError as e:
+        raise refuse(400, str(e), token=route.token_in, amount=amount) from e
+
+    slippage = max(0, min(BPS - 1, int(settings.uniswap_slippage_bps)))
+    min_out = out_units * (BPS - slippage) // BPS
+    # The relayer's quoted e2b tariff, raised to the route's own on-chain floor when it has one:
+    # the hook refuses a quote below `route.minRelayerFee`, and handing the user calldata that
+    # must revert is not a quote.
+    relayer_fee = max(ethpipe.min_relayer_fee_units(asset), route.min_relayer_fee_units)
+    # measured against the WORST output the hook will accept, because that is the one the bound
+    # has to hold at — the same two checks the hook itself makes, one implementation
+    if problem := uniswap.relayer_fee_problem(
+        min_out, relayer_fee, route.min_relayer_fee_units, route.max_relayer_fee_bps
+    ):
+        raise refuse(
+            400,
+            f"{problem} — this deposit is too small for the route's relayer-fee bounds",
+            token=route.token_in,
+            amount=amount,
+        )
+    # what the user is shown, at the quoted output …
+    value, relayer_fee_out = _split_at(out_units, relayer_fee, asset, "at the quoted output")
+    # … and the same split at the WORST output the hook will accept: if that cannot mint a
+    # groth the deposit is too small to be safe, whatever the mid-price says right now.
+    _split_at(min_out, relayer_fee, asset, "at the minimum output")
+
+    notes: list[str] = []
+    if n := await check_min_deposit(asset, out_units):
+        notes.append(n)
+    deposit_ref = "0x" + secrets.token_hex(32)
+    src = {
+        "chain_id": settings.eth_chain_id,
+        "token": route.token_in,
+        "symbol": route.symbol,
+        "decimals": route.decimals,
+        "amount": str(amount),
+    }
+    estimate = {
+        "src": src,
+        "out_units": str(out_units),
+        "min_out_units": str(min_out),
+        "out_groth": to_groth(value, asset),
+        "value_units": str(value),
+        "relayer_fee_units": str(relayer_fee_out),
+        "usd": await _usd(asset, out_units),
+        "eta_s": settings.lock_confirmations * 12 + 120,
+    }
+    route_public = route.as_json()
+    doc_extra: dict[str, Any] = {
+        "deposit_ref": deposit_ref,
+        "route": route_public,
+        "min_out_units": str(min_out),
+        "relayer_fee_quote_units": str(relayer_fee),
+    }
+    resp_extra: dict[str, Any] = {"deposit_ref": deposit_ref, "route": route_public}
+    armed = settings.ingress_ready_for(asset.key)
+    if not armed:
+        notes.append(f"estimate only — {_why_unarmed(asset)}; no transaction is issued")
+    else:
+        calldata = uniswap.deposit_calldata(route, amount, deposit_ref, min_out, relayer_fee)
+        tx = {
+            "chain_id": settings.eth_chain_id,
+            "to": to_checksum_address(settings.uniswap_router),
+            "data": calldata,
+            # native input: the router forwards it and refunds anything unused
+            "value": str(amount) if route.native_in else "0",
+        }
+        approval = (
+            None
+            if route.native_in
+            else {
+                "chain_id": settings.eth_chain_id,
+                "token": route.token_in,
+                "spender": to_checksum_address(settings.uniswap_router),
+                "amount": str(amount),
+            }
+        )
+        doc_extra |= {
+            "hook_calldata": calldata,
+            "pubkey": settings.pubkey_for(asset.key),
+            "tx": tx,
+            "approval": approval,
+            "armed_at": time.time(),
+        }
+        resp_extra["tx"] = tx
+        if approval:
+            resp_extra["approval"] = approval
+    return await _store(
+        acct,
+        user,
+        asset,
+        uniswap.MODE,
+        src,
+        out_units,
+        value,
+        relayer_fee_out,
+        "0x" + secrets.token_hex(5),  # kept for uniformity; nothing tags a uniswap deposit
+        estimate,
+        armed,
+        notes,
+        doc_extra,
+        resp_extra,
+    )
+
+
+def pick_uniswap_route(src_token: str, asset: Asset, explicit: bool) -> uniswap.Route | None:
+    """The registered route for this pair, or None.
+
+    A registry that cannot be PARSED is not "no such pair": asked for by name it is a 503 the
+    operator can act on, and on `auto` it is logged at ERROR and the request falls through to a
+    route that still works — the user's deposit must not wait for a fixed env file."""
+    try:
+        return uniswap.route_for(src_token, asset.key)
+    except uniswap.RouteError as e:
+        if explicit:
+            raise refuse(503, f"the Uniswap route is misconfigured: {e}", token=src_token) from e
+        log.error("PGAS_UNISWAP_POOLS is unusable, falling back to another route: %s", e)
+        return None
+
+
 # ----------------------------------------------------------------------------------- the route
 
 
@@ -846,17 +1049,64 @@ async def quote(body: QuoteIn, acct=auth.Account):
         )
 
     cross_chain = int(body.src_chain_id) != int(settings.eth_chain_id)
+    wanted = (body.route or "auto").strip().lower()
+    if wanted not in ROUTE_CHOICES:
+        raise refuse(
+            400, f"unknown route {wanted!r} — choose one of {', '.join(ROUTE_CHOICES)}",
+            account_id=acct["account_id"],
+        )
+    is_direct_token = src_token.lower() == asset.token.lower()
+
+    # ── which ways in are open. Both flags sit UNDER `ingress_armed` and the kill switch below:
+    # they decide which routes the API will SERVE, never whether money may move.
+    if (cross_chain or wanted == xchain.MODE) and not settings.ingress_xchain:
+        raise refuse(409, XCHAIN_PAUSED, account_id=acct["account_id"], src_chain_id=body.src_chain_id)
+    if wanted == xchain.MODE and not cross_chain:
+        raise refuse(
+            400,
+            "the cross-chain route needs a source chain other than Ethereum — deposit from "
+            "Ethereum with route \"uniswap\" or \"direct\"",
+            account_id=acct["account_id"],
+        )
+    if wanted == uniswap.MODE:
+        if not settings.ingress_uniswap:
+            raise refuse(409, UNISWAP_UNAVAILABLE, account_id=acct["account_id"])
+        if cross_chain:
+            raise refuse(
+                400, "the Uniswap route is Ethereum-only — quote from Ethereum",
+                account_id=acct["account_id"], src_chain_id=body.src_chain_id,
+            )
+    if wanted == "direct" and not is_direct_token:
+        raise refuse(
+            400,
+            f"route \"direct\" needs the {asset.key} token itself as the source",
+            account_id=acct["account_id"],
+        )
+
+    uni: uniswap.Route | None = None
+    if not cross_chain and settings.ingress_uniswap and wanted in ("auto", uniswap.MODE):
+        uni = pick_uniswap_route(src_token, asset, explicit=wanted == uniswap.MODE)
+    if wanted == uniswap.MODE and uni is None:
+        raise refuse(
+            400,
+            f"{src_token} is not a registered source for {asset.key} on the Uniswap route",
+            account_id=acct["account_id"], token=src_token,
+        )
+
     # the kill switch reaches the request path: while it is set no ROUTE may hand back a
-    # transaction that locks money in OUR pipe. A `direct` quote carries one, so it is refused
-    # here; an `xchain` quote no longer does (POST /v1/quote/{id}/arm is where that is refused), and
-    # an estimate costs nothing and still answers.
-    issues_a_pipe_tx = not cross_chain and src_token.lower() == asset.token.lower()
+    # transaction that locks money in OUR pipe. A `direct` quote carries one, and so does a
+    # `uniswap` one (the hook calls the pipe inside the same transaction), so both are refused
+    # here; an `xchain` quote no longer does (POST /v1/quote/{id}/arm is where that is refused),
+    # and an estimate costs nothing and still answers.
+    issues_a_pipe_tx = not cross_chain and (is_direct_token or uni is not None)
     if issues_a_pipe_tx and settings.ingress_ready_for(asset.key) and workers.paused():
         raise HTTPException(409, workers.PAUSED_REASON)
     if cross_chain:
         return await xchain_quote(body, acct, asset, src_token, amount, user)
-    if src_token.lower() == asset.token.lower():
+    if is_direct_token:
         return await direct_quote(acct, asset, amount, user)
+    if uni is not None and wanted in ("auto", uniswap.MODE):
+        return await uniswap_quote(acct, asset, uni, amount, user)
     return await swap_quote(acct, asset, src_token, amount, user)
 
 
@@ -892,6 +1142,19 @@ async def arm(quote_id: str, acct=auth.Account):
         raise HTTPException(409, workers.PAUSED_REASON)
     if mode == "direct":
         return await arm_direct(q, asset)  # pure arithmetic: idempotent by construction
+    if mode == uniswap.MODE:
+        # A uniswap quote is built at once — /arm exists for it only so a client that calls it
+        # anyway gets the SAME transaction back. Nothing upstream is ordered, so there is
+        # nothing to rebuild and nothing to pay for twice.
+        if not q.get("tx"):
+            raise refuse(
+                409,
+                "that quote was an estimate only — quote again once ingress is armed",
+                quote_id=quote_id,
+            )
+        return stored_arm(q, asset)
+    if not settings.ingress_xchain:
+        raise refuse(409, XCHAIN_PAUSED, quote_id=quote_id, account_id=acct["account_id"])
     if q.get("tx") and q.get("order_id") and now - float(q.get("armed_at") or 0) < ARM_FRESH_S:
         return stored_arm(q, asset)  # the SAME order, not a second one
     # ⛔ A QUOTE WHOSE TRANSACTION IS ALREADY REGISTERED IS NOT RE-ARMABLE. Building a new order

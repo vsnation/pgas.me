@@ -232,6 +232,12 @@ export function getWalletOptions(): WalletOption[] {
   return list;
 }
 
+/**
+ * READING a chain id off a wallet: tolerant on purpose, and the exact opposite of the write side.
+ * Wallets answer `eth_chainId`/`chainChanged` with whatever they like — `'0x1'` (the EIP-695 form),
+ * `'0x01'` (padded), a plain number, a decimal string, a bigint — and every one of those means the
+ * same chain. What goes back OUT to a wallet is only ever `chainIdHex()` from `lib/chains.ts`.
+ */
 export function parseChainId(v: unknown): number | null {
   if (typeof v === 'number') return Number.isFinite(v) ? v : null;
   if (typeof v === 'bigint') return Number(v);

@@ -43,6 +43,10 @@ ROUTER_HOOK_PARAM = f"{_ROUTER}Hook"  # the create-tx parameter that carries our
 # first; `routers/dex` still emits the second alongside `route_chain_id`.
 LEGACY_MODE = _ROUTER
 LEGACY_CHAIN_ID_FIELD = f"{_ROUTER}_chain_id"
+# The deposit row's router-status field before the rename. Rows are NEVER rewritten (law: never
+# edit history to fix a ledger), so the READ maps it onto `route_status` — `routers/account`
+# and `routers/deposits` are the only two places that do it.
+LEGACY_STATUS_FIELD = f"{_ROUTER}_status"
 
 
 def _router_env(name: str) -> AliasChoices:
@@ -96,6 +100,17 @@ class Settings(BaseSettings):
     xchain_slippage: float = Field(1.0, validation_alias=_router_env("slippage"))
     xchain_timeout_s: float = Field(25.0, validation_alias=_router_env("timeout_s"))
     quote_ttl_s: int = 900
+    # ── which ingress routes the API will SERVE. Both sit UNDER `ingress_armed` and the kill
+    # switch: with a flag on and ingress unarmed a quote is still an estimate only, exactly as
+    # before. Turning a flag off refuses NEW quotes/arms for that route — it never stops the
+    # workers, because a deposit already in flight must never be stranded.
+    ingress_uniswap: bool = False  # PGAS_INGRESS_UNISWAP — the v4 gateway-pool hook route
+    ingress_xchain: bool = Field(  # PGAS_INGRESS_XCHAIN (the deprecated spelling still resolves)
+        True,
+        validation_alias=AliasChoices(
+            "PGAS_INGRESS_XCHAIN", f"PGAS_INGRESS_{_ROUTER.upper()}"
+        ),
+    )
     # quotes are NOT expired by a TTL index: the scanner resolves a late fill through
     # quotes.order_id / quotes.metadata long after the quote stopped being signable.
     quote_prune_after_s: int = 7 * 86400
@@ -114,6 +129,26 @@ class Settings(BaseSettings):
     hook_gas: int = 250_000
     lock_scan_blocks: int = 2000  # how far back the watcher looks for NewLocalMessage
     lock_scan_chunk: int = 50  # eth_getLogs range per request (most public providers refuse 500)
+
+    # ── Uniswap V4 ingress (pgasme/uniswap.py). EVERY address here is EMPTY by default and an
+    # empty one is never guessed: the route refuses instead. A wrong hook or router address is
+    # calldata the user's wallet would sign and the chain would reject, so these are read from
+    # the environment the operator provisioned and validated at parse time.
+    uniswap_hook: str = ""  # PgasIngressHook (its low 14 address bits are 0x2888)
+    uniswap_router: str = ""  # PgasRouter — the `to` of every deposit transaction we issue
+    uniswap_quoter: str = ""  # the chain's deployed V4Quoter, read with eth_call, never written
+    # [{token_in, symbol, decimals, gateway_pool_key:{currency0,currency1,fee,tickSpacing,hooks},
+    #   inner_pool_key:{…}, zero_for_one, target:"ETH", max_deposit_units,
+    #   min_deposit_units?, min_relayer_fee_units?, max_relayer_fee_bps?}]
+    # `max_deposit_units` is re-derived from the inner pool's live depth before each arming and
+    # is NEVER a flat dollar cap: depth is read, not assumed.
+    uniswap_pools: str = "[]"
+    uniswap_slippage_bps: int = 50  # min_out = out × (1 − bps/10000); the hook enforces min_out
+    # How far ABOVE the quoted output a pipe lock may land and still be this deposit's. The
+    # quote is measured at quote time and the price moves inside the quote's TTL; a lock outside
+    # the band is not credited to anyone — it goes to unattributed_locks and pages (law: a lock
+    # nobody can attribute is never credited).
+    uniswap_max_upside_bps: int = 500
 
     # Beam side — the pipe receiver pubkey is derived from (our wallet master key, pipe cid), so
     # each pipe has its OWN 33-byte pubkey (wallet-api role=user,action=get_pk,cid=<that pipe's cid>).
@@ -137,6 +172,12 @@ class Settings(BaseSettings):
     beampay_key: str = ""  # PGAS_BEAMPAY_KEY — the ordinary key (/balances, /transactions, …)
     beampay_internal_key: str = ""  # PGAS_BEAMPAY_INTERNAL_KEY — scope `ledger:adjust`
     beampay_timeout_s: float = 20.0
+    # ── The shared secret on BeamPay's webhook URL (POST /internal/beampay/webhook?token=…).
+    # BeamPay sends NO auth header — its worker posts a bare JSON body — so the only credential
+    # it can carry is in the URL it was configured with. EMPTY IS A REFUSAL, NEVER AN OPEN
+    # DOOR: with this unset the route answers 503 and records nothing, because an unauthenticated
+    # writer of a collection the operator reads as evidence is worse than a missing notification.
+    beampay_webhook_token: str = ""  # PGAS_BEAMPAY_WEBHOOK_TOKEN
     # The regular address every claim books to and every shield spends from. A balance read
     # with no address is not a zero, so every read of it RAISES while this is empty.
     beam_treasury_address: str = ""

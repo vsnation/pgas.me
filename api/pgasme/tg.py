@@ -17,6 +17,7 @@ from __future__ import annotations
 import html
 import logging
 import os
+import re
 import time
 from typing import Any
 
@@ -39,6 +40,78 @@ def _cfg() -> tuple[str, str, bool]:
 
 def esc(s: object) -> str:
     return html.escape(str(s), quote=False)
+
+
+# Telegram refuses a message over 4096 characters, so SOMETHING has to cut a long one. It used
+# to be a bare `text[:4000]` inside send(), which cut mid-sentence and mid-command and said
+# nothing about it — the operator read a truncated instruction as the whole instruction. One
+# implementation, one number, and a marker: a cut the reader can SEE.
+MAX_CHARS = 3500  # under Telegram's 4096 with room for the marker and any HTML tail
+CUT_MARKER = " …(truncated)"
+# The tags Telegram's HTML subset accepts and this codebase actually writes. A message that ends
+# with one of them still OPEN is refused whole ("can't parse entities"), so cutting is not enough:
+# an unbalanced pair deletes the alert the cut was supposed to shorten. The check is on the PAIR,
+# not on the last `<`: `…<code>` is a complete tag and the old guard passed it happily.
+TAGS = frozenset({"b", "i", "code", "pre", "a"})
+TAG_RE = re.compile(r"<\s*(/?)\s*([A-Za-z][A-Za-z0-9]*)[^>]*>")
+
+
+def unclosed(head: str) -> str:
+    """The closing tags `head` still owes, innermost first — `""` when it is balanced."""
+    stack: list[str] = []
+    for m in TAG_RE.finditer(head):
+        name = m.group(2).lower()
+        if name not in TAGS:
+            continue
+        if m.group(1):  # a closer: it ends its opener and anything still open inside it
+            if name in stack:
+                del stack[len(stack) - 1 - stack[::-1].index(name) :]
+        else:
+            stack.append(name)
+    return "".join(f"</{n}>" for n in reversed(stack))
+
+
+def _cut(text: str, room: int) -> str:
+    """`text` shortened to at most `room` characters, never landing mid-token.
+
+    Three things the cut must not do, in the order they are repaired:
+      * split a word — and therefore a command's flag or a txid — so it cuts at whitespace;
+      * end inside a `code span`, which is how a runbook command reaches the operator: an odd
+        number of backticks means the cut landed inside one, so it moves back to that backtick
+        rather than handing over half a command;
+      * end inside an HTML tag or entity, which makes Telegram refuse the WHOLE message.
+    """
+    head = text[: max(0, room)]
+    at = head.rfind(" ")
+    if at > 0:
+        head = head[:at]
+    if head.count("`") % 2:
+        head = head[: head.rfind("`")]
+    for opener, closer in (("<", ">"), ("&", ";")):
+        i = head.rfind(opener)
+        if i != -1 and closer not in head[i:]:
+            head = head[:i]
+    return head
+
+
+def cap(text: str, limit: int = MAX_CHARS) -> str:
+    """`text`, shortened to `limit` characters with a visible marker if it had to be cut — and
+    HANDED OVER BALANCED: every tag the cut left open is closed (or, when its opener falls off
+    the end of the budget, dropped with it), so the message Telegram gets always parses.
+    """
+    if len(text) <= limit:
+        return text
+    room = limit - len(CUT_MARKER)
+    head = _cut(text, room)
+    closers = unclosed(head)
+    # Make room for the closers, and keep making it while a SHORTER head owes MORE of them (a
+    # cut can drop a `</code>` and leave its opener behind). Whenever this body runs,
+    # `room - len(closers) < len(head)`, so `head` strictly shrinks — it cannot spin — and on
+    # exit the closers and the marker are both inside `limit`.
+    while closers and len(head) + len(closers) > room:
+        head = _cut(text, room - len(closers))
+        closers = unclosed(head)
+    return head.rstrip() + closers + CUT_MARKER
 
 
 def enabled() -> bool:
@@ -67,7 +140,7 @@ async def send(text: str, *, key: str | None = None, cooldown_s: float = 0.0) ->
                 f"https://api.telegram.org/bot{token}/sendMessage",
                 json={
                     "chat_id": chat,
-                    "text": text[:4000],
+                    "text": cap(text),
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True,
                 },

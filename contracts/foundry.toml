@@ -1,0 +1,50 @@
+# Pgas.me Uniswap V4 ingress — toolchain pins.
+#
+# The Uniswap sources come from npm, pinned exactly:
+#   @uniswap/v4-core@1.0.2  +  @uniswap/v4-periphery@1.0.3
+# v4-periphery's `main` branch DELETED src/utils/BaseHook.sol and src/utils/HookMiner.sol
+# in Feb 2026 — both are still shipped by the 1.0.3 npm tarball, which is why this project
+# resolves periphery through node_modules and never through `forge install <repo> main`.
+#
+# `via_ir = true` is required (upstream v4 sets it too) and is applied to EVERY source,
+# tests included: the mined CREATE2 salt depends on the hook's creation code, so test-time
+# and script-time compilation settings must be identical or the addresses diverge.
+
+[profile.default]
+src = "src"
+out = "out"
+test = "test"
+script = "script"
+libs = ["node_modules"]
+solc_version = "0.8.26"
+via_ir = true
+optimizer = true
+# 44,444,444 is upstream v4-core's own setting, and it is not a preference: compiling
+# v4-core's Pool library for the offline unit suite fails with a Yul "stack too deep" at
+# lower run counts. Matching upstream is the fix.
+optimizer_runs = 44444444
+evm_version = "cancun"
+bytecode_hash = "none"
+fs_permissions = [
+    { access = "read", path = "./test/vectors" },
+    { access = "read-write", path = "./snapshots" },
+]
+# A bare `forge test` is offline by construction: the fork suite is excluded here and
+# only runs under FOUNDRY_PROFILE=fork, which needs FORK_RPC_URL in the environment.
+no_match_path = "test/fork/*"
+
+[profile.fork]
+# `no_match_path` is inherited from [profile.default]; point it somewhere harmless so the
+# fork suite is discoverable, and select the fork suite explicitly.
+no_match_path = "test/__never__/*"
+match_path = "test/fork/*"
+
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
+sort_imports = false
+
+[rpc_endpoints]
+mainnet = "${FORK_RPC_URL}"

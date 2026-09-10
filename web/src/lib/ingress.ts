@@ -1,15 +1,20 @@
 // Which ingress paths the API has open, and which tokens the Uniswap one is registered for.
 //
-// API_CONTRACT.md puts the flags on the public reference reads — `GET /v1/assets` and
-// `GET /v1/health` carry `ingress:{uniswap,xchain}` — and a build that is behind may still carry
-// them on the account instead (`ingress`, or `modes.ingress`). Every one of those is the SAME fact,
-// so it is read in exactly one place — here — and every caller reads the answer rather than its own
-// copy. A build that states nothing gets the defaults: both paths on, which is what the API itself
-// does when no route is named (`route:"auto"` picks uniswap → direct → cross-chain).
+// The API is the ONE writer of this fact. It publishes it on the public reference reads —
+// `GET /v1/dex/assets` carries `ingress:{uniswap, xchain, direct, uniswap_tokens:[…]}` and
+// `GET /v1/health` carries `ingress:{uniswap, xchain, direct}` — and `/v1/account` carries
+// `uniswap`/`xchain` inside its own `ingress`. Every one of those is the SAME fact, so it is read in
+// exactly one place — here — and every caller reads the answer rather than its own copy.
 //
-// Tolerance is the point. An older API answers `/health` with `ingress_armed` and no `ingress`
-// object at all; a newer one may add keys this client has never heard of. Neither is a reason to
-// refuse a deposit, and neither is evidence that a path is closed — only an explicit `false` is.
+// **A flag the API does not state is a flag that is off** (operator, 2026-09-10). The hook, the
+// gateway pools and the routes are deployed by a human; a client that assumes the Uniswap path is
+// open would offer "Pay with Uniswap V4" against a hook that does not exist yet. `xchain` keeps the
+// other default because that path has been live and stated for weeks, and a build that has not
+// learned to publish flags is still running it.
+//
+// Tolerance is the rest of the point. An older API answers `/health` with `ingress_armed` and no
+// `ingress` object at all, or 404s the route entirely; a newer one may add keys this client has
+// never heard of. Neither is an error, and neither is evidence about a path it did not name.
 
 export interface IngressFlags {
   /** the Uniswap V4 gateway pool + Pgas hook: one transaction on Ethereum */
@@ -18,26 +23,37 @@ export interface IngressFlags {
   xchain: boolean;
 }
 
-/** What one payload actually STATES. A key nobody states is absent, never `false`. */
+/** What one payload actually STATES. A key nobody states is absent — never `true`, never `false`. */
 export type IngressPartial = Partial<IngressFlags>;
 
-export const INGRESS_DEFAULT: IngressFlags = { uniswap: true, xchain: true };
+/**
+ * What a path is when nobody states it. `uniswap` off: the API is the only thing that knows whether
+ * the hook is deployed, and silence is not a yes. `xchain` on: it predates the flags entirely.
+ */
+export const INGRESS_DEFAULT: IngressFlags = { uniswap: false, xchain: true };
 
 const FLAG_KEYS = ['uniswap', 'xchain'] as const;
 
-/** The token symbols the hackathon build registers a gateway pool for, when the API names none. */
+/**
+ * The tokens the gateway pools are registered for, used ONLY when the API states the flag without
+ * naming a list. When it sends `uniswap_tokens`, that list is the truth and this one is not read.
+ */
 export const UNISWAP_DEFAULT_TOKENS = ['ETH', 'WETH', 'USDC', 'USDT', 'DAI', 'WBTC'];
 
 function asObject(v: unknown): Record<string, unknown> | null {
   return v && typeof v === 'object' ? (v as Record<string, unknown>) : null;
 }
 
-/** Every place an API build is known to put the ingress facts, in the order they are trusted. */
-function ingressObjects(src: unknown): Record<string, unknown>[] {
+/**
+ * The `ingress` objects on a payload, in the order they are trusted: its own `ingress`, the
+ * `modes.ingress` an older build used, and — for the flags only — the payload itself, so a caller
+ * that already holds a flags object can pass it straight in.
+ */
+function ingressObjects(src: unknown, includeSelf = true): Record<string, unknown>[] {
   const o = asObject(src);
   if (!o) return [];
   const out: Record<string, unknown>[] = [];
-  for (const v of [o.ingress, asObject(o.modes)?.ingress, o]) {
+  for (const v of [o.ingress, asObject(o.modes)?.ingress, ...(includeSelf ? [o] : [])]) {
     const obj = asObject(v);
     if (obj) out.push(obj);
   }
@@ -55,7 +71,7 @@ export function ingressPartial(src: unknown): IngressPartial {
   return out;
 }
 
-/** First source that states a flag wins; a flag nobody states takes its default (on). */
+/** First source that states a flag wins; a flag nobody states takes its default above. */
 export function resolveIngress(...parts: (IngressPartial | null | undefined)[]): IngressFlags {
   const out: IngressFlags = { ...INGRESS_DEFAULT };
   for (const k of FLAG_KEYS) {
@@ -70,11 +86,13 @@ export function resolveIngress(...parts: (IngressPartial | null | undefined)[]):
 }
 
 /**
- * The tokens the Uniswap route is registered for, as the API names them (symbols or addresses),
- * or null when it names none — null means "we were told nothing", never "there are none".
+ * The tokens the Uniswap route is registered for. The live shape is `ingress.uniswap_tokens` as
+ * `[{address, symbol, decimals}]`; a list of plain strings is read the same way. Read only from an
+ * `ingress` object — never from the payload's own keys, where `tokens` means something else.
+ * Null means "we were told nothing", never "there are none".
  */
 export function uniswapTokenList(src: unknown): string[] | null {
-  for (const o of ingressObjects(src)) {
+  for (const o of ingressObjects(src, false)) {
     for (const key of ['uniswap_tokens', 'uniswap_pairs', 'pairs', 'tokens']) {
       const v = o[key];
       if (!Array.isArray(v) || v.length === 0) continue;
@@ -82,7 +100,8 @@ export function uniswapTokenList(src: unknown): string[] | null {
         .map((e) => {
           if (typeof e === 'string') return e;
           const obj = asObject(e);
-          const first = [obj?.token, obj?.address, obj?.symbol].find((x) => typeof x === 'string');
+          // address first: it is the identity, and two chains' "USDC" are not one token
+          const first = [obj?.address, obj?.token, obj?.symbol].find((x) => typeof x === 'string');
           return typeof first === 'string' ? first : null;
         })
         .filter((s): s is string => !!s);

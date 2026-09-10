@@ -45,6 +45,12 @@ FEE_REF_INDEX = "uniq_fee_ref"
 # (67), so that index exists nowhere on prod — but it may exist on a 6.0+ development box,
 # where it would be a second writer of the same fact. Dropped by name.
 LEGACY_RELEASE_FEE_INDEX = "uniq_release_fee_ref"
+# One row per BeamPay delivery: its webhooks are at-least-once and INTEGRATION.md §5 names
+# (txId, event) as the key to dedupe on. `routers/internal.py` is the only writer of this
+# collection, and it derives the row's `_id` from the SAME pair — so the dedupe holds even
+# before this index exists (a fresh box, or a boot where ensure_indexes failed), and the two
+# can never disagree about what a duplicate is.
+BEAMPAY_EVENT_INDEX = "uniq_beampay_event"
 
 
 def set_client(client: Any, name: str = "pgasme") -> None:
@@ -218,6 +224,19 @@ async def ensure_indexes() -> list[str]:
         "payout_requests status/release",
         _ensure(d.payout_requests, [("status", 1), ("release_at", 1)]),
     )
+    # BeamPay's webhook log: evidence only, never money state (routers/internal.py). Unique on
+    # the delivery key BeamPay itself documents, so a redelivery cannot become a second row.
+    await step(
+        "beampay_events txId/event unique",
+        _ensure(
+            d.beampay_events,
+            [("txId", 1), ("event", 1)],
+            unique=True,
+            name=BEAMPAY_EVENT_INDEX,
+        ),
+    )
+    await step("beampay_events.received_at", _ensure(d.beampay_events, [("received_at", -1)]))
+
     await step("events notified/at", _ensure(d.events, [("notified", 1), ("at", 1)]))
     await step("events.at TTL", _ensure(d.events, "at", expireAfterSeconds=30 * 86400))
 

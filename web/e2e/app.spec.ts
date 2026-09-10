@@ -500,6 +500,57 @@ test.describe('Pgas.me web', () => {
     expect(pageErrors).toEqual([]);
   });
 
+  test('schedule: an untouched form says nothing in red, and a blank row is not an order', async ({ page }) => {
+    await boot(page, '/schedule');
+    await connectAndSignIn(page);
+    await expect(page.getByTestId('schedule-form')).toBeVisible();
+    // the defect (screen review 2026-09-10): "row 1: enter an address · row 1: enter an amount",
+    // in red, before the user had typed anything at all
+    await expect(page.getByTestId('schedule-problems')).toHaveCount(0);
+    await expect(page.locator('.error-text')).toHaveCount(0);
+    await expect(page.locator('body')).not.toContainText('enter an address');
+    await expect(page.locator('body')).not.toContainText('enter an amount');
+    // one muted line instead, and the button stays down
+    await expect(page.getByTestId('schedule-hint')).toHaveText('Add a wallet and an amount.');
+    await expect(page.getByTestId('schedule-submit')).toBeDisabled();
+    await expect(page.getByTestId('schedule-submit')).toHaveText('Schedule orders');
+    await expect(page.getByTestId('total-orders')).toHaveText('0');
+
+    // a row the user HAS been in says what it is still missing
+    await page.getByLabel('Address 1').fill(walletB.address);
+    await expect(page.getByTestId('schedule-problems')).toContainText('enter an amount');
+    await expect(page.getByTestId('schedule-hint')).toHaveCount(0);
+    await page.getByLabel('Amount 1').fill('0.1');
+    await expect(page.getByTestId('schedule-problems')).toHaveCount(0);
+    await expect(page.getByTestId('total-orders')).toHaveText('1');
+    await expect(page.getByTestId('schedule-submit')).toBeEnabled();
+
+    // and the blank row "+ Add another address" makes neither complains nor holds the button down
+    await page.getByTestId('schedule-add').click();
+    await expect(page.getByTestId('schedule-row')).toHaveCount(2);
+    await expect(page.getByTestId('schedule-problems')).toHaveCount(0);
+    await expect(page.getByTestId('total-orders')).toHaveText('1');
+    await expect(page.getByTestId('schedule-submit')).toBeEnabled();
+    // leaving its fields empty is not a complaint either — but the moment it has content, it is
+    await page.getByLabel('Address 2').click();
+    await page.getByLabel('Amount 2').click();
+    await page.getByLabel('Address 1').click();
+    await expect(page.getByTestId('schedule-problems')).toHaveCount(0);
+    await page.getByLabel('Amount 2').fill('0.05');
+    await expect(page.getByTestId('schedule-problems')).toContainText('row 2: enter an address');
+    await expect(page.getByTestId('schedule-submit')).toBeDisabled();
+
+    // the blank row does not travel: the body carries the one order that was filled in
+    await page.getByLabel('Amount 2').fill('');
+    await expect(page.getByTestId('schedule-submit')).toBeEnabled();
+    await page.getByTestId('schedule-submit').click();
+    await expect(page.getByTestId('schedule-result')).toContainText('Scheduled 1 order');
+    const body = api.calls.find((c) => c.path === '/withdrawals' && c.method === 'POST')!.body as { items: { W: string }[] };
+    expect(body.items).toHaveLength(1);
+    expect(body.items[0].W).toBe(walletB.address);
+    expect(pageErrors).toEqual([]);
+  });
+
   test("schedule: the 409 shortfall is the API's own sentence, shown verbatim", async ({ page }) => {
     await boot(page, '/schedule');
     await connectAndSignIn(page);
@@ -770,6 +821,280 @@ test.describe('Pgas.me web', () => {
     expect(pageErrors).toEqual([]);
   });
 
+  // ---------- the Uniswap V4 ingress (2026-09-10, T12) ----------
+  //
+  // The flags come from the API (`/assets`, `/health`), so every one of these states the world it
+  // is testing before the page loads. The default — `uniswapEnabled = false` — is the "flag off"
+  // case, and it is what every other test in this file runs against.
+
+  test('deposit: with the Uniswap ingress open it is the primary card, and native ETH needs no approval', async ({ page }) => {
+    await boot(page, '/', {
+      mock: (a) => {
+        a.uniswapEnabled = true;
+        a.armed = true;
+      },
+    });
+    await connectAndSignIn(page);
+    const form = page.getByTestId('deposit-form');
+    await expect(form).toHaveAttribute('data-route', 'uniswap');
+    await expect(form).toContainText('Pay with Uniswap V4');
+    await expect(page.getByTestId('uniswap-primary')).toContainText('one transaction on Ethereum');
+
+    await page.getByLabel('Amount (ETH)').fill('0.1');
+    await expect(page.getByTestId('quote-out')).toContainText('0.1');
+    // the request names the route; everything else about the body is unchanged
+    expect(api.calls.filter((c) => c.path === '/quote').pop()?.body).toEqual({
+      src_chain_id: 1,
+      src_token: NATIVE,
+      amount: '100000000000000000',
+      target_asset: 'ETH',
+      sender: walletA.address,
+      route: 'uniswap',
+    });
+
+    await expect(page.getByTestId('amount-usd')).toContainText('$400');
+    // nothing is swapped when ETH is what you pay and what you get: the bound is the amount itself
+    await expect(page.getByTestId('min-out')).toHaveText('min you receive 0.1 ETH');
+    await expect(page.getByTestId('price-impact')).toHaveText('price impact 0.00%');
+    await expect(page.getByTestId('lands-in')).toContainText('Lands in your balance in ≈');
+    await expect(page.getByTestId('lands-in')).toContainText('bridge fee $0.40');
+    await expect(page.getByTestId('uniswap-note')).toHaveText(UNISWAP_NOTE);
+    await expect(page.getByTestId('direct-note')).toHaveCount(0);
+    await expect(page.getByTestId('swap-panel')).toHaveCount(0);
+    await expect(page.getByTestId('approve-btn')).toHaveCount(0); // native ETH: no approval, ever
+    await expect(page.getByTestId('deposit-btn')).toHaveText('Deposit 0.1 ETH on Ethereum');
+
+    await page.getByTestId('deposit-btn').click();
+    await expect(page.getByTestId('deposit-timeline')).toBeVisible();
+    expect(api.armCalls).toEqual([]); // the tx came with the quote — there is nothing to arm
+    const sent = await page.evaluate(() => (window as any).__mock.state.sent);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ from: walletA.address, to: PGAS_ROUTER, data: '0xc0ffee00', value: '0x16345785d8a0000' });
+    const reg = api.calls.filter((c) => c.path === '/deposits' && c.method === 'POST');
+    expect(reg).toHaveLength(1);
+    expect(reg[0].body).toEqual({ quote_id: expect.stringMatching(/^q-/), src_tx_hash: MOCK_TX });
+    expect(reg[0].auth).toBe(`Bearer ${api.token}`);
+
+    // four steps, not five: on this route the swap and the lock are the same transaction, so there
+    // is no order for anyone to fill and no step that can never light up
+    const timeline = page.getByTestId('deposit-timeline');
+    await expect(timeline.locator('.timeline')).toHaveAttribute('data-route', 'uniswap');
+    await expect(timeline.locator('.tl-step')).toHaveCount(4);
+    await expect(timeline.locator('.tl-title')).toHaveText(['Submitted', 'Bridging', 'Confirming', 'Credited']);
+    await expect(timeline).not.toContainText('Order filled');
+
+    // and the mechanism panel says which path this is, in step 2
+    await page.getByTestId('how-it-works').click();
+    const modal = page.getByTestId('how-it-works-modal');
+    await expect(modal.locator('li')).toHaveCount(6);
+    await expect(modal.locator('li').nth(1)).toHaveText(
+      'A Uniswap V4 swap on Ethereum whose Pgas hook locks the output in the Beam bridge in the same transaction.',
+    );
+    await expect(modal).not.toContainText('A cross-chain order fills it');
+    await expect(modal).toContainText('Beam bridge');
+    expect(pageErrors).toEqual([]);
+  });
+
+  test('deposit: USDC through the Uniswap ingress approves the router and deposits on one click', async ({ page }) => {
+    await boot(page, '/', {
+      mock: (a) => {
+        a.uniswapEnabled = true;
+        a.armed = true;
+      },
+    });
+    await connectAndSignIn(page);
+    await payWith(page, { token: 'usdc' });
+    await page.getByLabel('Amount (USDC)').fill('250');
+    await expect(page.getByTestId('deposit-form')).toContainText('Pay with Uniswap V4');
+
+    // a real swap this time: the estimate, the bound the hook reverts below, and what it costs
+    await expect(page.getByTestId('quote-out')).toContainText(/0\.0623/);
+    expect(api.calls.filter((c) => c.path === '/quote').pop()?.body).toMatchObject({
+      src_chain_id: 1,
+      src_token: USDC,
+      amount: '250000000',
+      route: 'uniswap',
+    });
+    await expect(page.getByTestId('min-out')).toHaveText('min you receive 0.062001 ETH');
+    await expect(page.getByTestId('price-impact')).toHaveText('price impact 0.30%');
+    await expect(page.getByTestId('uniswap-note')).toHaveText(UNISWAP_NOTE);
+    await expect(page.getByTestId('swap-panel')).toHaveCount(0); // not the wallet-side swap mode
+    // ONE button: the router's approval is known before the click, so it does not need its own
+    await expect(page.getByTestId('approve-btn')).toHaveCount(0);
+    await expect(page.getByTestId('deposit-btn')).toHaveText('Deposit 250 USDC on Ethereum');
+
+    await page.getByTestId('deposit-btn').click();
+    await expect(page.getByTestId('deposit-timeline')).toBeVisible();
+    const sent = await page.evaluate(() => (window as any).__mock.state.sent);
+    expect(sent).toHaveLength(2);
+    expect(sent[0]).toMatchObject({ to: USDC });
+    expect(sent[0].data.toLowerCase()).toContain(PGAS_ROUTER.slice(2).toLowerCase()); // approve(router, amount)
+    expect(sent[0].data).toMatch(/^0x095ea7b3/);
+    expect(sent[0].value).toBeUndefined();
+    expect(sent[1]).toMatchObject({ to: PGAS_ROUTER, data: '0xc0ffee00' });
+    expect(sent[1].value).toBeUndefined();
+    expect(api.armCalls).toEqual([]);
+    const reg = api.calls.filter((c) => c.path === '/deposits' && c.method === 'POST');
+    expect(reg).toHaveLength(1);
+    expect(reg[0].body).toEqual({ quote_id: expect.stringMatching(/^q-/), src_tx_hash: MOCK_TX });
+    expect(pageErrors).toEqual([]);
+  });
+
+  test('deposit: the pay-with list is narrowed to the pairs the Uniswap route takes', async ({ page }) => {
+    await boot(page, '/', {
+      mock: (a) => {
+        a.uniswapEnabled = true;
+        a.armed = true;
+        a.uniswapTokens = ['ETH', 'USDC']; // the API names the registered pairs; this list is read
+      },
+    });
+    await connectAndSignIn(page);
+    await page.getByTestId('pay-with').click();
+    const options = page.getByRole('option');
+    // narrowed by `ingress.uniswap_tokens`, which only `/dex/assets` carries — so this is that read
+    expect(api.calls.some((c) => c.path === '/dex/assets')).toBe(true);
+    await expect(options).toHaveCount(2);
+    await expect(options.nth(0)).toContainText('ETH');
+    await expect(options.nth(1)).toContainText('USDC');
+    await page.getByTestId('pay-with').click();
+
+    // DAI and WBTC are not gone from Pgas.me — they are reached by their own pipe, so choosing one
+    // as the target puts the whole token list back and stops asking for the Uniswap route
+    await page.getByRole('radio', { name: 'DAI' }).click();
+    await page.getByTestId('pay-with').click();
+    await expect(page.getByRole('option')).toHaveCount(4);
+    await page.getByTestId('pay-with').click();
+    await payWith(page, { token: 'dai' });
+    await page.getByLabel('Amount (DAI)').fill('100');
+    await expect(page.getByTestId('direct-note')).toContainText('your DAI goes straight into the Beam bridge');
+    expect((api.calls.filter((c) => c.path === '/quote').pop()?.body as { route?: string }).route).toBeUndefined();
+    await expect(page.getByTestId('uniswap-note')).toHaveCount(0);
+    await expect(page.getByTestId('deposit-form')).toContainText('What to deposit');
+    expect(pageErrors).toEqual([]);
+  });
+
+  test('deposit: a source off Ethereum falls back to the cross-chain path, or says how to pay when it is closed', async ({ page }) => {
+    // both paths open: a chip on another chain is still a deposit — the cross-chain order takes it
+    await boot(page, '/', {
+      mock: (a) => {
+        a.uniswapEnabled = true;
+        a.armed = true;
+      },
+    });
+    await connectAndSignIn(page);
+    await payWith(page, { chainId: 42161 });
+    await page.getByLabel('Amount (ETH)').fill('0.2');
+    await expect(page.getByTestId('deposit-btn')).toHaveText('Deposit 0.2 ETH on Arbitrum');
+    await expect(page.getByTestId('uniswap-note')).toHaveCount(0);
+    await expect(page.getByTestId('deposit-form')).toContainText('What to deposit');
+    // the button above only exists because the quote came back, so the last call is that quote
+    expect((api.calls.filter((c) => c.path === '/quote').pop()?.body as { route?: string }).route).toBeUndefined();
+    expect(pageErrors).toEqual([]);
+  });
+
+  test('deposit: with the cross-chain path closed a chip elsewhere says to switch to Ethereum', async ({ page }) => {
+    await boot(page, '/', {
+      rpc: true,
+      mock: (a) => {
+        a.uniswapEnabled = true;
+        a.xchainEnabled = false;
+        a.armed = true;
+      },
+    });
+    await connectAndSignIn(page);
+    // the chips stay: what the wallet holds elsewhere is still worth seeing
+    const chips = page.getByTestId('portfolio-chips').locator('.portfolio-chip');
+    await expect(chips).toHaveCount(14, { timeout: 30_000 });
+    await chips.filter({ hasText: 'CRO' }).first().click();
+    await expect(page.getByTestId('xchain-closed')).toHaveText('Switch to Ethereum to pay with Uniswap');
+    await expect(page.getByTestId('quote-out')).toHaveCount(0);
+    // and nothing was asked of the API for a chain it cannot take
+    expect(api.calls.filter((c) => c.path === '/quote' && (c.body as { src_chain_id?: number }).src_chain_id === 25)).toEqual([]);
+
+    await page.getByTestId('use-ethereum').click();
+    await expect(page.getByTestId('xchain-closed')).toHaveCount(0);
+    await expect(page.getByTestId('deposit-form')).toContainText('Pay with Uniswap V4');
+    await page.getByLabel(/^Amount/).fill('0.1');
+    await expect(page.getByTestId('uniswap-note')).toHaveText(UNISWAP_NOTE);
+    expect((api.calls.filter((c) => c.path === '/quote').pop()?.body as { route?: string }).route).toBe('uniswap');
+    expect(pageErrors).toEqual([]);
+  });
+
+  test('deposit: when the API says the Uniswap path is closed, nothing asks for that route', async ({ page }) => {
+    await boot(page); // the default mock: `ingress.uniswap` is false, and it SAYS so on every read
+    api.armed = true;
+    await connectAndSignIn(page);
+    await expect(page.getByTestId('deposit-form')).toContainText('What to deposit');
+    await expect(page.getByTestId('deposit-form')).toHaveAttribute('data-route', 'classic');
+    await expect(page.getByTestId('uniswap-primary')).toHaveCount(0);
+    await page.getByLabel('Amount (ETH)').fill('0.3');
+    await expect(page.getByTestId('direct-note')).toContainText('straight into the Beam bridge');
+    // no `route` key at all: an API build that has never heard of the field sees the old body
+    expect(api.calls.filter((c) => c.path === '/quote').pop()?.body).toEqual({
+      src_chain_id: 1,
+      src_token: NATIVE,
+      amount: '300000000000000000',
+      target_asset: 'ETH',
+      sender: walletA.address,
+    });
+    await expect(page.getByTestId('min-out')).toHaveCount(0);
+    await expect(page.getByTestId('price-impact')).toHaveCount(0);
+    await expect(page.getByTestId('uniswap-note')).toHaveCount(0);
+    await page.getByTestId('deposit-btn').click();
+    await expect(page.getByTestId('deposit-timeline')).toBeVisible();
+    const sent = await page.evaluate(() => (window as any).__mock.state.sent);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ to: ETH_PIPE }); // the pipe itself, exactly as before
+    await expect(page.getByTestId('deposit-timeline').locator('.tl-step')).toHaveCount(5);
+    await page.getByTestId('how-it-works').click();
+    await expect(page.getByTestId('how-it-works-modal')).toContainText('A cross-chain order fills it on Ethereum');
+    expect(pageErrors).toEqual([]);
+  });
+
+  test('deposit: an API that states no ingress flags at all leaves the Uniswap path off', async ({ page }) => {
+    await boot(page, '/', {
+      mock: (a) => {
+        // today's live API: no `/dex/assets`, no `/health`, and the account's old `{armed, near}`
+        a.silentIngress = true;
+        // …and the server-side switch is ON, to prove the client goes by what is STATED. Silence is
+        // not a yes: the hook is deployed by a human, and a page that offers "Pay with Uniswap V4"
+        // against a hook that is not there is the failure this default exists to prevent.
+        a.uniswapEnabled = true;
+        a.armed = true;
+      },
+    });
+    await connectAndSignIn(page);
+    // two 404s on the way in, and neither is an error the user is shown
+    await expect(page.locator('body')).not.toContainText('Reference data failed to load');
+    await expect(page.getByTestId('deposit-form')).toHaveAttribute('data-route', 'classic');
+    await expect(page.getByTestId('deposit-form')).toContainText('What to deposit');
+    await expect(page.getByTestId('uniswap-primary')).toHaveCount(0);
+
+    await page.getByLabel('Amount (ETH)').fill('0.3');
+    await expect(page.getByTestId('direct-note')).toContainText('straight into the Beam bridge');
+    expect(api.calls.filter((c) => c.path === '/quote').pop()?.body).toEqual({
+      src_chain_id: 1,
+      src_token: NATIVE,
+      amount: '300000000000000000',
+      target_asset: 'ETH',
+      sender: walletA.address,
+    });
+    await expect(page.getByTestId('min-out')).toHaveCount(0);
+    await expect(page.getByTestId('price-impact')).toHaveCount(0);
+    await expect(page.getByTestId('uniswap-note')).toHaveCount(0);
+
+    // the whole pre-Uniswap path, unchanged: the pipe itself, and five steps
+    await page.getByTestId('deposit-btn').click();
+    await expect(page.getByTestId('deposit-timeline')).toBeVisible();
+    const sent = await page.evaluate(() => (window as any).__mock.state.sent);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ to: ETH_PIPE });
+    await expect(page.getByTestId('deposit-timeline').locator('.tl-step')).toHaveCount(5);
+    await page.getByTestId('how-it-works').click();
+    await expect(page.getByTestId('how-it-works-modal')).toContainText('A cross-chain order fills it on Ethereum');
+    expect(pageErrors).toEqual([]);
+  });
+
   // ---------- the 2026-09-09 screen review (T14) ----------
 
   test('navigation: three tabs, no Activity page, and its old link lands on the timeline', async ({ page }) => {
@@ -913,11 +1238,38 @@ test.describe('Pgas.me web', () => {
       await goTab(page, 'schedule');
       await expect(page.getByTestId('schedule-form')).toBeVisible();
       const sticky = page.getByTestId('sticky-totals');
+      const totals = page.getByTestId('schedule-totals');
+      /**
+       * The bar repeats the Totals card's two numbers for while that card is off screen — so while
+       * the card IS on screen it is not drawn at all. Screen review 2026-09-10: it used to be, and
+       * a sticky element hovers over whatever follows it until the scroll reaches its own place in
+       * the flow, which put it on top of "Total debited" at exactly this viewport.
+       */
+      await expect(totals).toBeInViewport();
+      await expect(sticky).toBeHidden();
+
+      // push the card off the bottom and the bar comes back — above the tab bar, over nothing
+      for (let i = 0; i < 4; i++) await page.getByTestId('schedule-add').click();
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await expect(totals).not.toBeInViewport();
       await expect(sticky).toBeVisible();
       await expect(sticky).toContainText('Remaining');
-      // it is pinned above the tab bar, not scrolled away with the form
-      const box = await sticky.boundingBox();
-      expect(box!.y + box!.height).toBeLessThanOrEqual(844);
+      const box = (await sticky.boundingBox())!;
+      const barBox = (await bar.boundingBox())!;
+      expect(box.y + box.height).toBeLessThanOrEqual(844);
+      expect(box.y + box.height).toBeLessThanOrEqual(barBox.y + 1); // clear of the tab bar
+      const cardBox = (await totals.boundingBox())!;
+      expect(cardBox.y).toBeGreaterThan(box.y + box.height); // and clear of the card it repeats
+
+      // scrolled back to the card, the bar gets out of its way again
+      await totals.scrollIntoViewIfNeeded();
+      await expect(sticky).toBeHidden();
+
+      // at the very bottom nothing is left under either fixed thing
+      await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+      const lastCard = (await page.locator('.page > section.card').last().boundingBox())!;
+      const barNow = (await bar.boundingBox())!;
+      expect(lastCard.y + lastCard.height).toBeLessThanOrEqual(barNow.y);
       expect(pageErrors).toEqual([]);
     });
   });

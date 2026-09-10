@@ -67,10 +67,16 @@ class LedgerBeamPay(FakeBeamPay):
     def __init__(self) -> None:
         super().__init__()
         self.adjustments: list[dict[str, Any]] = []
+        # ids the route has already REFUSED. The adjustment is two-phase and can be refused
+        # AFTER the money moved, so a burned id stays burned: the corrected body must be posted
+        # under a fresh one or not at all.
+        self.burned_adjust_ids: set[str] = set()
 
     def _route(self, method, path, params, body):
         if path == "/internal/ledger/adjust" and method == "POST":
             b = dict(body or {})
+            if str(b.get("adjust_id")) in self.burned_adjust_ids:
+                return 409, {"detail": "adjust_id_already_refused"}
             gate = self.tx_index.get(str(b.get("after_tx") or ""))
             if not gate or gate.get("status") != beam.TX_COMPLETED:
                 return 409, {"detail": "tx_not_booked"}
@@ -476,6 +482,42 @@ async def test_apply_posts_the_documented_body_and_beampay_accepts_it(mock_db, b
     assert ("POST", "/internal/ledger/adjust", sent) in beam_pay.calls
 
 
+async def test_repair_fee_keeps_the_deterministic_adjust_id_by_default(mock_db, beam_pay):
+    """`pgasme:fee:<txid>` is what makes a REPLAY free: post it twice and BeamPay answers
+    `replayed: true` instead of moving value twice."""
+    live_claim(beam_pay)
+    _code, lines = await out_lines(beam.cmd_repair_fee, LIVE_CLAIM_TXID)
+    assert f'"adjust_id": "pgasme:fee:{LIVE_CLAIM_TXID}"' in " ".join(lines)
+
+
+async def test_a_refused_adjustment_can_be_retried_under_a_fresh_id(mock_db, beam_pay):
+    """A burned id can never carry the corrected body, and the default stays the replay-safe
+    one — so the escape hatch is explicit and an operator has to name it."""
+    live_claim(beam_pay)
+    _code, lines = await out_lines(
+        beam.cmd_repair_fee, LIVE_CLAIM_TXID, adjust_id="pgasme:fee:retry-1"
+    )
+    body = " ".join(lines)
+    assert '"adjust_id": "pgasme:fee:retry-1"' in body
+    assert f'"adjust_id": "pgasme:fee:{LIVE_CLAIM_TXID}"' not in body
+
+    # the whole point, end to end: the deterministic id has been refused, and the repair the
+    # operator corrected can only reach BeamPay under a new one
+    beam_pay.burned_adjust_ids.add(f"pgasme:fee:{LIVE_CLAIM_TXID}")
+    code, lines = await out_lines(beam.cmd_repair_fee, LIVE_CLAIM_TXID, apply=True)
+    assert code == 1 and beam_pay.adjustments == []
+    assert any("adjust_id_already_refused" in ln for ln in lines)
+    code, lines = await out_lines(
+        beam.cmd_repair_fee, LIVE_CLAIM_TXID, apply=True, adjust_id="pgasme:fee:retry-1"
+    )
+    assert code == 0 and [a["adjust_id"] for a in beam_pay.adjustments] == ["pgasme:fee:retry-1"]
+
+    # and the CLI passes it through — a flag with no value is refused, never silently defaulted
+    assert await beam.cli_main(
+        ["repair-fee", "--txid", LIVE_CLAIM_TXID, "--adjust-id"], out=lambda *_: None
+    ) == 2
+
+
 async def test_the_kill_switch_stops_the_repair_inside_the_mover(mock_db, beam_pay, monkeypatch, tmp_path):
     stop = tmp_path / "pgasme.stop"
     stop.write_text("stop")
@@ -710,7 +752,11 @@ async def test_the_repair_command_parses_its_arguments(mock_db, beam_pay, capsys
     assert await beam.cli_main(["repair-fee"]) == 2
     assert await beam.cli_main(["repair-fee", "--txid"]) == 2
     assert await beam.cli_main(["repair-fee", "--txid", LIVE_CLAIM_TXID]) == 0
+    assert await beam.cli_main(
+        ["repair-fee", "--txid", LIVE_CLAIM_TXID, "--adjust-id", "pgasme:fee:retry-2"]
+    ) == 0
     text = capsys.readouterr().out
+    assert '"adjust_id": "pgasme:fee:retry-2"' in text
     assert "DRY RUN · repair the BEAM fee leg" in text and "nothing was sent" in text
     assert beam_pay.adjustments == []
     assert "repair-fee --txid <txid>" in beam.USAGE

@@ -12,6 +12,8 @@
 // The second half is the quirks. Each is a thing a shipped wallet does that breaks a dapp that
 // assumes the happy path; the mock reproduces the behaviour and the test proves the handling.
 import { expect, test, type Browser, type Page } from '@playwright/test';
+import { toBeHex } from 'ethers';
+import { CHAIN_META, chainIdHex } from '../src/lib/chains';
 import {
   ALL_PROFILES,
   ANNOUNCED_PROFILES,
@@ -21,6 +23,7 @@ import {
   MockRpc,
   blockExternal,
   installMockPrices,
+  STRICT_CHAIN_PROFILE,
   installWallets,
   signedIn,
   walletA,
@@ -89,6 +92,25 @@ async function boot(page: Page, profiles: MockWalletProfile[], opts: BootOpts = 
 const handleState = (page: Page, key: string) => page.evaluate((k) => (window as never as Record<string, any>).__wallets[k].state, key);
 const call = (page: Page, key: string, method: string, arg?: unknown) =>
   page.evaluate(({ k, m, a }) => (window as never as Record<string, any>).__wallets[k][m](a), { k: key, m: method, a: arg });
+
+/**
+ * One raw EIP-1193 call straight at a mock wallet's provider — no UI — returning the shape a dapp
+ * sees: `ok`, plus the `code` and `message` of the rejection. The chain-id tests use it to hand a
+ * wallet something the app itself must never send.
+ */
+const walletCall = (page: Page, handle: string, method: string, param: Record<string, unknown>) =>
+  page.evaluate(
+    async ({ h, m, p }) => {
+      const prov = (window as never as Record<string, any>).__wallets[h].provider;
+      try {
+        await prov.request({ method: m, params: [p] });
+        return { ok: true, code: 0, message: '' };
+      } catch (e: any) {
+        return { ok: false, code: e?.code, message: String(e?.message ?? '') };
+      }
+    },
+    { h: handle, m: method, p: param },
+  );
 
 async function openPicker(page: Page) {
   await page.getByRole('button', { name: 'Connect wallet' }).first().click();
@@ -543,6 +565,248 @@ test('WalletConnect stays hidden until a project id is built in', async ({ page 
   await openPicker(page);
   await expect(dialog).not.toContainText('WalletConnect');
   await expect(dialog).not.toContainText('not configured');
+  expect(pageErrors).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// quirk (i) the chain id on the wire — EIP-3326's unpadded form
+// ---------------------------------------------------------------------------
+//
+// The 2026-09-10 bug report, in the admin's words: "When I click Deposit, you ask me to Add ETH
+// Network, but I have it." The Deposit button switches the wallet to the source chain, and the id
+// was built with ethers' `toBeHex`, which pads a quantity to whole bytes — chain 1 went out as
+// "0x01". EIP-695/3085/3326 all want the unpadded "0x1". Wallets that compare the string answered
+// 4902, and our own 4902 branch then offered to ADD Ethereum mainnet to a wallet that had it since
+// the day it was installed; MetaMask's family refuses "0x01" outright with -32602 "unpadded", so on
+// those the Deposit button could not switch chains at all.
+//
+// The mock did not catch it because it read the parameter with parseInt(), which takes "0x01"
+// happily. It no longer does — see the chain-id block in mocks.ts — so the tests in this block are
+// the ones that would have failed the day the padding was introduced.
+
+/**
+ * Every chain id in CHAIN_META that `toBeHex` would pad, DERIVED at runtime rather than typed out.
+ * ethers pads a quantity to whole BYTES, so an id whose hex has an ODD number of nibbles comes back
+ * with a leading zero — "0x01", "0x0138de" — and that is the form no wallet accepts as a chainId.
+ *
+ * It is derived because a hand-written list is a list someone forgets: the first version of this
+ * table named five ids and called itself "exactly the ones toBeHex pads", while CHAIN_META already
+ * held eight (zkSync Era 324, Soneium 1868 and Berachain 80094 were outside the guard, unlisted and
+ * untested). Deriving it means a chain added to CHAIN_META tomorrow is inside the guard the moment
+ * it is added. Measured 2026-09-10: 23 chains in CHAIN_META, 8 of them padded by `toBeHex`.
+ */
+const CHAIN_META_IDS = Object.keys(CHAIN_META).map(Number);
+const PADDED_BY_TO_BE_HEX = CHAIN_META_IDS.filter((id) => id.toString(16).length % 2 === 1).sort((a, b) => a - b);
+
+/**
+ * The named rows, kept as examples so a red run says WHICH chain instead of "some id", and so the
+ * derived set is checked against something a human wrote down. Every row must still be in
+ * CHAIN_META — if one is removed from the app, this table has to say so.
+ */
+const CANONICAL_EXAMPLES: [number, string, string][] = [
+  [1, '0x1', '0x01'], // Ethereum — the admin's case
+  [10, '0xa', '0x0a'], // OP Mainnet
+  [324, '0x144', '0x0144'], // zkSync Era
+  [999, '0x3e7', '0x03e7'], // HyperEVM
+  [1514, '0x5ea', '0x05ea'], // Story
+  [1776, '0x6f0', '0x06f0'], // Injective EVM
+  [1868, '0x74c', '0x074c'], // Soneium
+  [80094, '0x138de', '0x0138de'], // Berachain
+];
+
+test('quirk (i) already on Ethereum: nothing is switched, and no chain is offered to be added', async ({ page }) => {
+  const { pageErrors } = await boot(page, [profile('metamask', { inProviders: false, global: 'ethereum', chainId: 1 })], { armed: true });
+  const rows = await openPicker(page);
+  await rows.first().click();
+  await expect(signedIn(page)).toBeVisible();
+
+  await page.getByLabel('Amount (ETH)').fill('0.1');
+  await expect(page.getByTestId('deposit-btn')).toHaveText('Deposit 0.1 ETH on Ethereum');
+  await page.getByTestId('deposit-btn').click();
+  await expect(page.getByTestId('deposit-timeline')).toBeVisible();
+
+  const state = await handleState(page, 'metamask');
+  expect(state.switchCalls).toEqual([]); // the wallet is already there: it is not asked
+  expect(state.addCalls).toEqual([]); // ⛔ and it is NEVER offered "Add Ethereum" — the bug report
+  await expect(page.locator('body')).not.toContainText('does not know chain');
+  expect(state.chainId).toBe(1);
+  expect(state.sent).toHaveLength(1);
+  expect(state.sent[0]).toMatchObject({ from: walletA.address, to: ETH_PIPE, data: '0xdeadbeef' });
+  expect(pageErrors).toEqual([]);
+});
+
+test('quirk (i) on another chain: exactly one switch, and the chainId on it is "0x1"', async ({ page }) => {
+  // BNB Smart Chain is not a chain the API lists, so "Pay with" stays on Ethereum and the click has
+  // a real switch to make. `toBeHex(1)` would have put "0x01" on this wire.
+  const { pageErrors } = await boot(page, [profile('metamask', { inProviders: false, global: 'ethereum', chainId: 56 })], { armed: true });
+  const rows = await openPicker(page);
+  await rows.first().click();
+  await expect(signedIn(page)).toBeVisible();
+
+  await page.getByLabel('Amount (ETH)').fill('0.1');
+  await expect(page.getByTestId('deposit-btn')).toHaveText('Deposit 0.1 ETH on Ethereum');
+  await page.getByTestId('deposit-btn').click();
+  await expect(page.getByTestId('deposit-timeline')).toBeVisible();
+
+  const state = await handleState(page, 'metamask');
+  expect(state.switchCalls).toEqual([{ chainId: '0x1' }]); // one call, unpadded, and nothing else
+  expect(state.addCalls).toEqual([]);
+  expect(state.chainId).toBe(1);
+  expect(state.sent).toHaveLength(1);
+  expect(state.sent[0]).toMatchObject({ from: walletA.address, to: ETH_PIPE });
+  expect(pageErrors).toEqual([]);
+});
+
+test('quirk (i) the wallet from the bug report: the canonical id is found, so nothing is added', async ({ page }) => {
+  // Same journey on the family that compares the chainId as TEXT. This is the test that fails with
+  // "0x01": the string is not in the wallet's list, it answers 4902, and the Add prompt appears.
+  const { pageErrors } = await boot(page, [STRICT_CHAIN_PROFILE], { armed: true });
+  const rows = await openPicker(page);
+  await rows.first().click();
+  await expect(signedIn(page)).toBeVisible();
+
+  await page.getByLabel('Amount (ETH)').fill('0.1');
+  await expect(page.getByTestId('deposit-btn')).toHaveText('Deposit 0.1 ETH on Ethereum');
+  await page.getByTestId('deposit-btn').click();
+  await expect(page.getByTestId('deposit-timeline')).toBeVisible();
+
+  const state = await handleState(page, 'strictchain');
+  expect(state.switchCalls).toEqual([{ chainId: '0x1' }]);
+  expect(state.addCalls).toEqual([]); // ⛔ "you ask me to Add ETH Network, but I have it"
+  expect(state.addedChains).toEqual([]);
+  await expect(page.locator('body')).not.toContainText('does not know chain');
+  expect(state.chainId).toBe(1);
+  expect(state.sent).toHaveLength(1);
+  expect(pageErrors).toEqual([]);
+});
+
+test('quirk (i) a chain the wallet really does not have: 4902, then one add with the unpadded id', async ({ page }) => {
+  // The 4902 branch is not deleted, it is aimed: a wallet holding only Ethereum and BNB, asked for
+  // Story (1514 — another id `toBeHex` pads, to "0x05ea"), is told what the chain is and switched.
+  const { pageErrors } = await boot(
+    page,
+    [profile('metamask', { inProviders: false, global: 'ethereum', chainId: 56, knownChains: [1, 56] })],
+    { armed: true },
+  );
+  const rows = await openPicker(page);
+  await rows.first().click();
+  await expect(signedIn(page)).toBeVisible();
+
+  await page.getByTestId('pay-with').click();
+  await page.locator('[data-chain="1514"]').click();
+  await page.getByLabel('Amount (IP)').fill('0.2');
+  await expect(page.getByTestId('deposit-btn')).toHaveText('Deposit 0.2 IP on Story');
+  await page.getByTestId('deposit-btn').click();
+  await expect(page.getByTestId('deposit-timeline')).toBeVisible();
+
+  const state = await handleState(page, 'metamask');
+  // CHAIN_META[1514], verbatim, with the canonical id — "0x05ea" would have been refused as unpadded
+  expect(state.addCalls).toHaveLength(1);
+  expect(state.addCalls[0]).toMatchObject({
+    chainId: '0x5ea',
+    chainName: 'Story',
+    nativeCurrency: { name: 'IP', symbol: 'IP', decimals: 18 },
+    rpcUrls: ['https://mainnet.storyrpc.io'],
+    blockExplorerUrls: ['https://www.storyscan.io'],
+  });
+  expect(state.switchCalls).toEqual([{ chainId: '0x5ea' }, { chainId: '0x5ea' }]); // refused, added, accepted
+  expect(state.addedChains).toEqual([1514]);
+  expect(state.chainId).toBe(1514);
+  expect(state.sent).toHaveLength(1);
+  expect(state.sent[0]).toMatchObject({ to: ROUTER_ORDER, data: '0xdeadbeef' });
+  expect(pageErrors).toEqual([]);
+});
+
+test('quirk (i) the mock answers a padded id the way the two real families do', async ({ page }) => {
+  // The guard on the guard: proof that these tests can fail. Both families are asked for chain 1
+  // twice — once in ethers' `toBeHex` form, once in the canonical one — at the provider, no UI.
+  await boot(page, [STRICT_CHAIN_PROFILE, profile('metamask', { inProviders: false, global: undefined, chainId: 56 })], { armed: true });
+  const ask = (handle: string, chainId: string) => walletCall(page, handle, 'wallet_switchEthereumChain', { chainId });
+
+  // the validating family (MetaMask's RPC middleware): a padded id is bad params, not a chain
+  const mmPadded = await ask('metamask', '0x01');
+  expect(mmPadded.ok).toBe(false);
+  expect(mmPadded.code).toBe(-32602);
+  expect(mmPadded.message).toContain('unpadded');
+  // the string-comparing family: the id is simply not found — the 4902 that produced the Add prompt
+  const strictPadded = await ask('strictchain', '0x01');
+  expect(strictPadded.ok).toBe(false);
+  expect(strictPadded.code).toBe(4902);
+  // and the canonical form is accepted by both, with no add and no complaint
+  expect(await ask('metamask', '0x1')).toMatchObject({ ok: true });
+  expect(await ask('strictchain', '0x1')).toMatchObject({ ok: true });
+  expect((await handleState(page, 'metamask')).addCalls).toEqual([]);
+  expect((await handleState(page, 'strictchain')).addCalls).toEqual([]);
+
+  // …and this is the table the fix is against, DERIVED from CHAIN_META so a chain added later
+  // cannot silently fall outside it: every id ethers would pad is an id this app must not pad.
+  expect(PADDED_BY_TO_BE_HEX.length).toBeGreaterThan(0);
+  for (const id of PADDED_BY_TO_BE_HEX) {
+    expect(chainIdHex(id)).toBe(`0x${id.toString(16)}`);
+    expect(toBeHex(id)).toBe(`0x0${id.toString(16)}`);
+    expect(chainIdHex(id)).not.toBe(toBeHex(id)); // the whole bug, in one line, per chain
+  }
+  // the named rows, so a failure names the chain — and so the derived set cannot quietly shrink
+  for (const [id, canonical, padded] of CANONICAL_EXAMPLES) {
+    expect(PADDED_BY_TO_BE_HEX).toContain(id);
+    expect(chainIdHex(id)).toBe(canonical);
+    expect(toBeHex(id)).toBe(padded);
+  }
+  // every other chain in CHAIN_META: the two forms agree, which is exactly why the bug hid so long
+  for (const id of CHAIN_META_IDS.filter((id) => !PADDED_BY_TO_BE_HEX.includes(id))) {
+    expect(chainIdHex(id)).toBe(toBeHex(id));
+  }
+});
+
+test('quirk (i) wallet_addEthereumChain refuses a padded id too — and the string family adds a second Ethereum', async ({ page }) => {
+  // The other half of the same guard, and until now the untested half. EIP-3085's `chainId` is the
+  // same string EIP-3326's is, and the validating family checks it on the ADD as well — but every
+  // test above reaches the add through the app, which sends the canonical form, so the -32602 branch
+  // in `wallet_addEthereumChain` could have been deleted with the whole suite still green.
+  const { pageErrors } = await boot(
+    page,
+    [STRICT_CHAIN_PROFILE, profile('metamask', { inProviders: false, global: undefined, chainId: 56 })],
+    { armed: true },
+  );
+  // CHAIN_META[1] verbatim, exactly as the app's own 4902 branch would send it, with only the id
+  // padded — so the refusal below can be about nothing except the padding.
+  const addChain = (handle: string, chainId: string) => walletCall(page, handle, 'wallet_addEthereumChain', { chainId, ...CHAIN_META[1] });
+
+  // the validating family: "0x01" is bad params on the add exactly as it is on the switch…
+  const mmPadded = await addChain('metamask', '0x01');
+  expect(mmPadded.ok).toBe(false);
+  expect(mmPadded.code).toBe(-32602);
+  expect(mmPadded.message).toContain('unpadded');
+  // …and NO chain was added: the attempt is recorded, the wallet's own list is untouched
+  let mm = await handleState(page, 'metamask');
+  expect(mm.addCalls).toHaveLength(1);
+  expect(mm.addedChains).toEqual([]);
+  expect(mm.addedChainStrings).toEqual([]);
+  // the canonical form on the same wallet with the same params is accepted — padding was the fault
+  expect(await addChain('metamask', '0x1')).toMatchObject({ ok: true });
+  mm = await handleState(page, 'metamask');
+  expect(mm.addedChains).toEqual([1]);
+  expect(mm.addedChainStrings).toEqual(['0x1']);
+
+  // the string-comparing family — the admin's — never validates, so it refuses the padded id one
+  // step later, at the switch, with 4902 and nothing added. That 4902 is what made our own branch
+  // offer to ADD a chain the wallet had had since it was installed.
+  const strictPadded = await walletCall(page, 'strictchain', 'wallet_switchEthereumChain', { chainId: '0x01' });
+  expect(strictPadded.ok).toBe(false);
+  expect(strictPadded.code).toBe(4902);
+  let strict = await handleState(page, 'strictchain');
+  expect(strict.addCalls).toEqual([]);
+  expect(strict.addedChains).toEqual([]);
+
+  // …and this is what accepting that prompt costs, which is why the padded form must never leave
+  // this app: the add is not refused, it is remembered as TEXT, and the wallet now holds Ethereum
+  // twice — once as "0x1" (knownChains) and again as "0x01".
+  expect(await addChain('strictchain', '0x01')).toMatchObject({ ok: true });
+  strict = await handleState(page, 'strictchain');
+  expect(strict.addedChains).toEqual([1]);
+  expect(strict.addedChainStrings).toEqual(['0x01']);
+  expect(chainIdHex(1)).not.toBe('0x01'); // the one line that keeps this journey unreachable
+
   expect(pageErrors).toEqual([]);
 });
 

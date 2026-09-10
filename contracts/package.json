@@ -1,0 +1,11 @@
+{
+  "name": "pgasme-contracts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Uniswap V4 ingress contracts for Pgas.me",
+  "license": "MIT",
+  "dependencies": {
+    "@uniswap/v4-core": "1.0.2",
+    "@uniswap/v4-periphery": "1.0.3"
+  }
+}

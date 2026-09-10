@@ -26,6 +26,7 @@ retryable refusal or an unverified row, never an accepted claim and never a reje
 
 from __future__ import annotations
 
+import logging
 import re
 import secrets
 import time
@@ -34,10 +35,13 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from .. import auth, ethpipe, tg, workers, xchain
+from .. import auth, ethpipe, tg, uniswap, workers, xchain
 from ..assets import get_asset
+from ..config import settings
 from ..db import db
 from .account import public_deposit
+
+log = logging.getLogger("pgasme.deposits")
 
 router = APIRouter(prefix="/v1/deposits", tags=["deposits"])
 
@@ -46,6 +50,18 @@ ORDER_IDS_TIMEOUT_S = 8.0  # this sits in the request path: a slow router must n
 NOT_VISIBLE_YET = (
     "that transaction is not visible on Ethereum yet — wait for it to be broadcast and try again"
 )
+
+
+async def reject(q: dict[str, Any], why: str, detail: str) -> HTTPException:
+    """A registration refused BEFORE a row exists still writes one — the event log is where a
+    hash-attribution attempt (or our own broken understanding of a receipt) becomes visible."""
+    log.warning("deposit registration refused: %s (quote %s)", why, q.get("_id"))
+    await tg.queue(
+        "deposit_mismatch",
+        f"REJECTED at registration: {why}",
+        quote_id=q.get("_id"),
+    )
+    return HTTPException(400, detail)
 
 
 class DepositIn(BaseModel):
@@ -159,6 +175,104 @@ async def resolve_direct(q: dict[str, Any], tx_hash: str) -> tuple[bool, str | N
     return True, None
 
 
+async def resolve_uniswap(q: dict[str, Any], tx_hash: str) -> tuple[bool, str | None]:
+    """The gateway swap must be THIS user's, on OUR router, carrying THIS quote's reference —
+    and, once it is mined, it must have reached OUR pipe.
+
+    Four things, and all of them (§3 of the design, §IDENTITY-BEATS-BALANCE):
+
+      1. `from` is the wallet the quote was issued to. A hash is public the moment it is
+         broadcast; the sender is what makes it the user's.
+      2. `to` is our PgasRouter — not the pipe: on this path the pipe's caller is the hook.
+      3. the calldata is a `deposit(...)` call whose hookData carries EXACTLY this quote's
+         reference (decoded, never matched as a substring).
+      4. once mined: our hook's own `PgasDeposit(ref, payer, …)` log AND the target pipe's
+         `NewLocalMessage` for OUR pubkey, in the SAME receipt.
+
+    A transaction we cannot READ is never a verdict: an unreachable endpoint is 503 and an
+    unbroadcast hash is 409, so the user retries instead of being told "no".
+    """
+    asset = get_asset(q["asset"])
+    ref = str(q.get("deposit_ref") or "")
+    if not ref:
+        raise HTTPException(409, "this quote carries no deposit reference — request a new one")
+    rpc = workers.get_rpc()
+    try:
+        tx = await rpc.transaction(tx_hash)
+    except ethpipe.RpcError as e:
+        raise HTTPException(
+            503, f"could not read that transaction from any Ethereum endpoint ({e}) — try again"
+        ) from e
+    if not tx:
+        raise HTTPException(409, NOT_VISIBLE_YET)
+
+    sender = (tx.get("from") or "").lower()
+    to = (tx.get("to") or "").lower()
+    router_address = (settings.uniswap_router or "").lower()
+    if sender != (q.get("address") or "").lower():
+        raise await reject(
+            q,
+            "a Uniswap deposit was offered from a wallet the quote was not issued to "
+            "(hash attribution attempt)",
+            "that transaction was not sent from the wallet this quote was issued to",
+        )
+    if not router_address or to != router_address:
+        raise await reject(
+            q,
+            "a Uniswap deposit was offered whose `to` is not our router",
+            "that transaction is not a call to the Pgas router this quote was built for",
+        )
+    data = tx.get("input") or tx.get("data") or ""
+    if not uniswap.carries_ref(data, ref):
+        raise await reject(
+            q,
+            "a Uniswap deposit was offered whose calldata does not carry this quote's reference",
+            "that transaction does not carry this quote's deposit reference — register the "
+            "transaction you signed for this quote",
+        )
+
+    try:
+        receipt = await rpc.receipt(tx_hash)
+    except ethpipe.RpcError as e:
+        raise HTTPException(
+            503, f"could not read that receipt from any Ethereum endpoint ({e}) — try again"
+        ) from e
+    if not receipt:
+        # Not mined yet. The transaction-level proof above already binds it to this account, and
+        # the scanner completes the story from the chain — broadcast is not done, but it IS
+        # enough to open the row and follow it.
+        return True, None
+    if int(str(receipt.get("status") or "0x1"), 16) == 0:
+        raise await reject(
+            q,
+            "a Uniswap deposit was offered whose transaction REVERTED",
+            "that transaction reverted — nothing reached the bridge; quote again and retry",
+        )
+    hook_log = uniswap.find_deposit_ref(receipt, ref)
+    if not hook_log:
+        raise await reject(
+            q,
+            "a mined Uniswap deposit carries no PgasDeposit log from our hook for this reference",
+            "that transaction did not reach the Pgas hook with this quote's reference",
+        )
+    if hook_log["payer"].lower() != (q.get("address") or "").lower():
+        raise await reject(
+            q,
+            "a mined Uniswap deposit names a different payer than the quote's wallet",
+            "that deposit was paid by a different wallet than this quote was issued to",
+        )
+    pubkey = str(q.get("pubkey") or settings.pubkey_for(asset.key) or "")
+    if not pubkey:
+        raise HTTPException(409, f"no Beam pipe pubkey is configured for {asset.key}")
+    if not ethpipe.find_lock_in_receipt(receipt, pubkey, asset.pipe):
+        raise await reject(
+            q,
+            f"a mined Uniswap deposit has no {asset.key} pipe lock to our pubkey in its receipt",
+            f"that transaction did not lock anything in the {asset.key} pipe for us",
+        )
+    return True, None
+
+
 @router.post("")
 async def create(body: DepositIn, acct=auth.Account):
     if workers.paused():
@@ -186,20 +300,35 @@ async def create(body: DepositIn, acct=auth.Account):
         # 2026-09-09: an `xchain` quote is an ESTIMATE until POST /v1/quote/{id}/arm builds the
         # hook-carrying order. A hash offered against an unarmed quote belongs to some other
         # order (or to nothing), and there is no order id to resolve it against — refuse.
+        # A `uniswap` quote is built at once, so having no transaction means it was priced while
+        # ingress was unarmed; there is nothing to arm and nothing to register.
         raise HTTPException(
             409,
-            "that quote has no transaction yet — call POST /v1/quote/{quote_id}/arm first and "
-            "register the transaction it hands back",
+            "that quote was priced without a transaction — quote again once ingress is armed"
+            if mode == uniswap.MODE
+            else "that quote has no transaction yet — call POST /v1/quote/{quote_id}/arm first "
+            "and register the transaction it hands back",
         )
     existing = await db().deposits.find_one({"src_tx_hash": tx_hash})
     if existing:
         if existing.get("account_id") != acct["account_id"]:
             raise HTTPException(409, "that transaction is already registered")
         return {"deposit_id": existing["_id"], "status": existing["status"]}
+    if mode == uniswap.MODE and (ref := str(q.get("deposit_ref") or "")):
+        # A deposit reference is single-use: it is what the scanner matches a pipe lock by, and
+        # two rows sharing one would make that match ambiguous exactly when money has landed.
+        clash = await db().deposits.find_one({"deposit_ref": ref}, {"_id": 1, "account_id": 1})
+        if clash:
+            if clash.get("account_id") == acct["account_id"]:
+                row = await db().deposits.find_one({"_id": clash["_id"]})
+                return {"deposit_id": row["_id"], "status": row["status"]}
+            raise HTTPException(409, "that deposit reference is already registered")
     # resolve the hash BEFORE a row exists: the quote must own this transaction
-    verified, matched_order = await (resolve_direct if mode == "direct" else resolve_xchain)(
-        q, tx_hash
-    )
+    resolver = {
+        "direct": resolve_direct,
+        uniswap.MODE: resolve_uniswap,
+    }.get(mode, resolve_xchain)
+    verified, matched_order = await resolver(q, tx_hash)
     deposit_id = secrets.token_hex(12)
     # the amounts of the order that MATCHED — falling back to the quote's tip only when the router
     # could not say yet which order this transaction carries (workers._step_submitted adopts the
@@ -242,6 +371,17 @@ async def create(body: DepositIn, acct=auth.Account):
         "created_at": now,
         "updated_at": now,
     }
+    if mode == uniswap.MODE:
+        # What the scanner needs to recognise this deposit's lock and to sanity-check what it is
+        # worth: the reference the hook echoes, the route, and the two numbers the hook was
+        # given (`min_out_units` is the floor it enforces; `out_units` is what we quoted).
+        doc |= {
+            "deposit_ref": q.get("deposit_ref"),
+            "route": q.get("route"),
+            "out_units": q.get("out_units"),
+            "min_out_units": q.get("min_out_units"),
+            "relayer_fee_quote_units": q.get("relayer_fee_quote_units"),
+        }
     try:
         await db().deposits.insert_one(doc)
     except Exception as e:  # noqa: BLE001 — the unique index is the one that decides

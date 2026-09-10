@@ -440,7 +440,8 @@ async def test_a_switch_thrown_mid_shield_halts_the_chain_and_keeps_the_chunk_re
     await payouts.process_once()
     row = await deposit(mock_db)
     assert beam_pay.withdrawals == []  # the mover refused
-    assert row["treasury"] == "shielding" and payouts.shield_calls_of(row) == [0.0]
+    assert row["treasury"] == "shielding"
+    assert [c["at"] for c in payouts.shield_calls_of(row)] == [0.0]
 
 
 # ============================================ §G · a number BeamPay stops maintaining

@@ -12,9 +12,9 @@ The value crosses into **Beam** — Mimblewimble: no addresses on chain, blinded
 assets — through the Beam ⇄ Ethereum bridge, is shielded there, and comes back out through the same
 bridge into the wallets you listed.
 
-Built for a hackathon. Status: the site, wallet sign-in, portfolio, balance and the scheduler are
-live; the Uniswap V4 hook ingress is the build in progress. Every money-moving path stays behind an
-explicit arm flag until it has been proven with tiny real amounts.
+Status: the site, wallet sign-in, portfolio, balance and the scheduler are live; the Uniswap V4 hook
+ingress is written and tested and not yet deployed. Every money-moving path stays behind an explicit
+arm flag until it has been proven with tiny real amounts.
 
 ## How it works
 
@@ -100,8 +100,20 @@ all.
   money, the public Beam ⇄ Ethereum bridge pipes (`EthPipe`
   `0xB1d7FF9D3aCaf30e282c5F6eb1F2A6503f516a96` for ETH, ERC-20 pipes for DAI and WBTC), and
   Lelantus max-privacy shielding of the treasury.
-- **Solidity** — the Pgas hook (`afterSwap`) that forwards a Uniswap V4 swap's output into the bridge
-  pipe. Hook contract: in progress.
+- **contracts/** — the Solidity ingress (Foundry). A Pgas **gateway pool** holds no liquidity and
+  carries a hook whose `beforeSwap` takes the whole input, routes it through the canonical Uniswap
+  V4 pool that Uniswap's own LPs fund, and forwards the entire output into the Beam bridge pipe in
+  the same transaction. Because the hook returns `+amountIn` as its delta, the gateway pool itself
+  never trades — the price comes from the canonical pool, and nothing is ever left sitting in an
+  intermediate address. `hookData` carries the deposit reference, the minimum output and the
+  relayer-fee quote; the entry point is `PgasRouter.deposit(PoolKey, bool, uint256, bytes)`. The
+  permissions are encoded in the hook's address, so the hook is not upgradeable. Details, risks and
+  the grid arithmetic that keeps a bridged amount mintable: [contracts/README.md](contracts/README.md).
+
+**Deployed addresses: pending.** Nothing is deployed yet — the hook, the router and the gateway
+pools get their addresses published here once they are live and verified. The addresses the code
+pins today are third-party infrastructure only: the Uniswap V4 `PoolManager`, the canonical CREATE2
+proxy and the public Beam bridge pipes, all in `contracts/script/PgasAddresses.sol`.
 
 ## Running it
 
@@ -115,7 +127,18 @@ cp .env.example .env            # fill in what you need; nothing is armed by def
 # Web
 cd web && npm ci && npm run dev  # proxies /api → http://127.0.0.1:8300
 npx playwright test              # end-to-end against a mock wallet
+
+# Contracts (Foundry, plus Node for the pinned Uniswap sources)
+cd contracts && npm install      # @uniswap/v4-core and v4-periphery, pinned exactly
+forge build
+forge test -vv                   # the offline suite: no network, no RPC, no fork
+
+# The mainnet-fork suite needs an archive RPC and is excluded from a bare `forge test`
+export FORK_RPC_URL=https://eth.drpc.org
+FOUNDRY_PROFILE=fork forge test -vv
 ```
+
+Read the exit code, not the last line: `forge test | tail; EXIT=${PIPESTATUS[0]}`.
 
 ## License
 

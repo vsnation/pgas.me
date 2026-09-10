@@ -23,15 +23,19 @@ processor understands what to do — execute/wait — until it's completed."
   the user-facing contract is untouched):
 
     (none) ──▶ claiming ──msgId in view_incoming → receive → claim_txid──▶ claimed(kernel)
-           ──▶ shielding ──one max-privacy self-send per denomination chunk──▶ shielded
-           └── the claim response was lost and the message is gone ──▶ held
+           ──▶ shielding ──one max-privacy self-send per denomination chunk, each to its
+           │              OWN fresh max-privacy address──▶ shielded
+           ├── the claim response was lost and the message is gone ──▶ held
+           └── a chunk's send FAILED on Beam ──▶ held (a HUMAN owns it; the row names the
+               `python -m pgasme.beam replan-shield --deposit <id>` that resolves it, and
+               --apply hands the failed chunks back as unsent — never the machine's own retry)
 
 Nothing here spends while its flag is 0: the handler logs what it WOULD do, marks the row
 `dark`, and pages once an hour that treasury work is waiting. Every irreversible call re-checks
 the kill switch inside the mover (`beam.Wallet.submit`), every refusal writes its reason on the
 row, and every transition emits exactly ONE operator event.
 
-⛔ **BeamPay is the ONLY interface to the Beam wallet** (CLAUDE.md law 10). Every balance,
+⛔ **BeamPay is the ONLY interface to the Beam wallet** (operating law 10). Every balance,
 every transaction status, every address and the shield itself are BeamPay's; `pgasme/beam.py`
 is called for exactly two things BeamPay has no endpoint for — `invoke_contract` with
 `create_tx:false` and `process_invoke_data`. And **every contract txid those produce is
@@ -61,6 +65,15 @@ a way real money is lost:
      answers no txid, so a shield chunk records that it is ABOUT to call before it calls, and a
      lost answer is resolved by finding `shield|<deposit>|<k>` in `/transactions` — never by
      calling again.
+  7. **One max-privacy address per shield chunk, and the float is the SUM over them.** Two
+     sends to one max-privacy address in quick succession re-use its one-time voucher and build
+     the identical shielded output, which the chain refuses ("Shielded outp duplicate ← Kernel
+     Type 3"): that is how chunks 1 and 2 of deposit 60b0e57… died on 2026-09-09 while chunk 0
+     settled. Each chunk therefore gets a FRESH `/create_wallet` address, registered in
+     `mp_addresses` before anything is sent to it, and `float_groth` sums `available` over that
+     registry plus the primary — an address the registry does not know is value nothing can
+     measure. A chunk being re-planned after a failure gets a NEW address again, because the
+     one that failed has already published its voucher.
 
 FEES — three sources, and we set exactly one of them
 ---------------------------------------------------
@@ -152,7 +165,18 @@ _LEASE: dict[str, Any] = {"refused_since": None}
 # about to be made against ONE BeamPay balance read of the treasury's asset 0. (The shielded
 # float needs no counter: a
 # released order is already `releasing` in the database, so `inflight_groth` sees it.)
-_PASS: dict[str, Any] = {"beam_fee": 0, "expect_route": None, "fee_budget": {}}
+_PASS: dict[str, Any] = {
+    "beam_fee": 0,
+    "expect_route": None,
+    "fee_budget": {},
+    # The shielded float is spread over MANY max-privacy addresses — one per shield chunk, see
+    # `shield_target` — so reading it is N BeamPay calls and no longer one. The registry and
+    # the sum it produces are cached per PASS for the same reason the fee budget is: N payouts
+    # are about to be gated on one answer, and a float that changes between two orders of one
+    # pass is exactly the defect `inflight_groth` exists to prevent.
+    "mp_registry": None,
+    "float": {},
+}
 
 
 def get_rpc() -> Any:
@@ -172,6 +196,8 @@ def reset_process_state() -> None:
     _PASS["beam_fee"] = 0
     _PASS["expect_route"] = None
     _PASS["fee_budget"] = {}
+    _PASS["mp_registry"] = None
+    _PASS["float"] = {}
     _LEASE["refused_since"] = None
 
 
@@ -214,6 +240,11 @@ async def ensure_indexes() -> None:
     # beam_txid and claim_txid are already indexed by the unique guards above; the shield ids
     # are the third place a txid of ours lives, and that lookup needs an index of its own.
     await d.deposits.create_index([("shield_txids", 1)])
+    # THE MAX-PRIVACY REGISTRY: one row per shield chunk, and the shielded float is the SUM
+    # over it (`float_groth`). `_id` IS the chunk's identity (`shield_comment`), so two
+    # addresses for one chunk are impossible by construction rather than by convention.
+    await d.mp_addresses.create_index([("created_at", 1)])
+    await d.mp_addresses.create_index([("deposit_id", 1), ("k", 1)])
 
 
 # ----------------------------------------------------------------------------- rows and events
@@ -248,7 +279,16 @@ async def _advance(
         q,
         {
             "$set": {field: to, f"{field}_at": now, "updated_at": now, **fields},
-            "$unset": {"hold_reason": "", "hold_at": "", "dark": ""},
+            # the hold is over, so every trace of it goes — including the two stamps the HELD
+            # reminder reads. A row that is held AGAIN later must page again, not inherit the
+            # silence of a hold that was resolved.
+            "$unset": {
+                "hold_reason": "",
+                "hold_at": "",
+                "hold_paged_at": "",
+                "held_reminded_at": "",
+                "dark": "",
+            },
         },
     )
     if not claimed:
@@ -274,6 +314,10 @@ async def _hold(
     never delivered — was then invisible to every stuck check, forever. `dark` describes the
     CURRENT reason for waiting or it describes nothing."""
     now = time.time()
+    # ⛔ `hold_at` and NOT `hold_paged_at`: this hold is a WAITING row that a handler still owns
+    # and will retry. Only `_hold_for_a_human` — the terminal hold nothing retries — stamps when
+    # the operator was paged, because that stamp is what silences the HELD reminder. This hold
+    # writing it too made a fee-budget wait mute the pager for a row already parked for a human.
     upd: dict[str, Any] = {"hold_reason": reason, "hold_at": now}
     change: dict[str, Any] = {"$set": upd, "$inc": {"holds": 1}}
     if dark:
@@ -293,20 +337,30 @@ async def _hold_for_a_human(
     handler no longer resolves. The port copied the message and dropped the state change, so
     the row stayed in `releasing` with the same unbounded `since` — and un-held itself two
     hours later by adopting an unrelated transaction. A row a human owns must not be able to
-    un-hold itself."""
+    un-hold itself.
+
+    THE ONE WRITER of `hold_paged_at`: this call sends the page (`tg.alert`, immediate) and
+    stamps the moment it did, in the same update. `workers.held_paged_at` reads that field and
+    nothing else, so "when were we last told about this hold" has exactly one author — and a
+    hold of a different kind (`_hold`, which a handler still retries) can never silence the
+    reminder that follows."""
+    now = time.time()
     claimed = await db()[coll].find_one_and_update(
         {"_id": row_id, field: frm},
         {
             "$set": {
                 field: HELD,
-                f"{field}_at": time.time(),
-                "updated_at": time.time(),
+                f"{field}_at": now,
+                "updated_at": now,
                 "held_from": frm,
                 "hold_reason": reason,
-                "hold_at": time.time(),
-                "unresolved_at": time.time(),
+                "hold_at": now,
+                "hold_paged_at": now,  # ← read by workers.held_paged_at; written NOWHERE else
+                "unresolved_at": now,
             },
-            "$unset": {"dark": ""},
+            # a fresh hold starts a fresh reminder clock: the last reminder was about the
+            # previous hold, and THIS page is now the most recent thing that said anything
+            "$unset": {"dark": "", "held_reminded_at": ""},
         },
     )
     if claimed is None:
@@ -677,6 +731,73 @@ async def float_address() -> str:
         return want
     row = await db().treasury.find_one({"_id": "mp_address"})
     return str((row or {}).get("address") or "")
+
+
+# One max-privacy address per shield chunk means the registry only ever GROWS: a per-chunk
+# address is credited when its withdrawal lands and is never debited, because a release
+# registers its contract txid to the PRIMARY address (`float_address`) and every spend books
+# there. The SUM stays right — the primary simply carries the debits and may go negative — but
+# each float read costs one BeamPay balance call per registered address, so a long registry is
+# a load problem and an operator's cue to consolidate. It is said out loud and never silently
+# truncated: a read that stopped early would UNDERSTATE the float, and an understated float is
+# a payout that holds for a reason nobody can see.
+MP_REGISTRY_WARN = 200
+
+
+async def mp_registry() -> list[str]:
+    """Every max-privacy address the shielded float is spread across, PRIMARY FIRST.
+
+    `PGAS_BEAM_MP_ADDRESS` (through `float_address`) is the first entry and is deliberately not
+    required to be a row: it is the address a release BOOKS its flow to, so it is part of the
+    float whether or not a chunk was ever sent to it. Everything after it is an `mp_addresses`
+    row — one fresh address per shield chunk (`shield_target`) — oldest first, deduplicated.
+
+    Cached per pass. READ ONLY: it never creates an address, because a balance read must never
+    have an address creation as a side effect."""
+    cached = _PASS.get("mp_registry")
+    if cached is not None:
+        return list(cached)
+    out: list[str] = []
+    primary = await float_address()
+    if primary:
+        out.append(primary)
+    for row in await db().mp_addresses.find({}).sort("created_at", 1).to_list(None):
+        addr = str(row.get("address") or "")
+        if addr and addr not in out:
+            out.append(addr)
+    if len(out) > MP_REGISTRY_WARN:
+        await tg.send(
+            f"the shielded float is spread over {len(out)} max-privacy addresses and every "
+            f"float read costs one BeamPay balance call per address — they want consolidating",
+            key="mp-registry-size",
+            cooldown_s=24 * 3600,
+        )
+    _PASS["mp_registry"] = list(out)
+    return list(out)
+
+
+async def float_groth(bp: beampay.BeamPay, asset: Asset) -> int:
+    """THE SHIELDED FLOAT of one asset: the SUM over every registered max-privacy address.
+
+    ⛔ IT IS NOT ONE ADDRESS'S BALANCE. Every shield chunk goes to a FRESH max-privacy address
+    (`shield_target`, and the incident that made it necessary), so a float read that named only
+    `PGAS_BEAM_MP_ADDRESS` would see one chunk of a three-chunk shielding and every payout
+    would starve on value that is sitting there, shielded, in the addresses it did not ask
+    about. `mp_addresses` is the registry that makes the sum knowable at all — which is why the
+    address is written there BEFORE anything is sent to it.
+
+    RAISES through `available_groth` when any one address cannot be read: an unreadable query
+    is not evidence of anything and a partial sum is a number nobody measured. Cached per pass
+    per asset."""
+    cache: dict[int, int] = _PASS["float"]
+    aid = int(asset.aid)
+    if aid in cache:
+        return cache[aid]
+    total = 0
+    for addr in await mp_registry():
+        total += await bp.available_groth(addr, aid)
+    cache[aid] = total
+    return total
 
 
 async def register_attribution(
@@ -1141,9 +1262,12 @@ async def _payout_scheduled(row: dict[str, Any]) -> None:
         )
         return
     need = amount + fee_groth + settings.float_min_groth
-    # THE FLOAT IS A BEAMPAY BALANCE. Shielded value lives at our max-privacy address because
-    # a BeamPay `/withdraw` put it there, so `available` at that address is the matured
-    # shielded float — and an address we cannot name is a float we cannot read.
+    # THE FLOAT IS A SUM OF BEAMPAY BALANCES. Shielded value lives at our max-privacy
+    # addresses because a BeamPay `/withdraw` put it there — one FRESH address per shield chunk
+    # (`shield_target`) — so `float_groth` sums the whole registry and never reads one address.
+    # The primary is still named here because it is the address this release BOOKS its flow to
+    # and the address BeamPay debits the BEAM fee from, and an address we cannot name is a
+    # float we cannot read.
     mp_addr = await float_address()
     if not mp_addr:
         await _hold(
@@ -1154,7 +1278,7 @@ async def _payout_scheduled(row: dict[str, Any]) -> None:
             key=f"payout-nofloat:{rid}",
         )
         return
-    have = await bp.available_groth(mp_addr, asset.aid)
+    have = await float_groth(bp, asset)
     # every crossing already in flight is committed float, whether or not the wallet's
     # `available_mp` has noticed yet (for a BVM invocation it may not fall until the kernel
     # registers at all). `_advance` writes `releasing` before `_release` sends, so an order
@@ -1164,9 +1288,10 @@ async def _payout_scheduled(row: dict[str, Any]) -> None:
         await _hold(
             "payout_requests",
             rid,
-            f"the shielded float holds {tg.fmt_groth(have)} {asset.key}, "
-            f"{tg.fmt_groth(reserved)} of it is already committed to crossings in flight, and "
-            f"this payout needs {tg.fmt_groth(need)} (amount + relayer fee + reserve)",
+            f"the shielded float holds {tg.fmt_groth(have)} {asset.key} across "
+            f"{len(await mp_registry())} max-privacy address(es), {tg.fmt_groth(reserved)} of "
+            f"it is already committed to crossings in flight, and this payout needs "
+            f"{tg.fmt_groth(need)} (amount + relayer fee + reserve)",
             key=f"payout-float:{rid}",
         )
         return
@@ -2332,8 +2457,8 @@ def shield_plan(value_groth: int, denoms: list[int] | None = None) -> list[int]:
     return out
 
 
-async def mp_address(bp: beampay.BeamPay) -> str:
-    """OUR max_privacy address — the one every shield sends to, PROVEN to be ours.
+async def _prove_mp_address(bp: beampay.BeamPay, addr: str) -> None:
+    """RAISES unless `addr` is a max-privacy address of THIS deployment. Never a value.
 
     Every value-moving call in this module proves its destination. A BeamPay `/withdraw` has no
     calldata to inspect, and `PGAS_BEAM_MP_ADDRESS` used to win verbatim with no check at all:
@@ -2353,24 +2478,12 @@ async def mp_address(bp: beampay.BeamPay) -> str:
         `/balances` cannot report, so the float would be permanently invisible even if the
         value did arrive.
       * the SHAPE — a 64/66-hex SBBS token is a REGULAR address. Shielding to one is a send
-        that settles and shields nothing.
+        that settles and shields nothing. ⚠️ This one also catches a BeamPay that ignored
+        `wallet_type` on `/create_wallet`, which is the only way a FRESH address can be wrong.
 
-    The verdict is stored on the row, in the spirit of `verify_arb_key.py`. RAISES when the
-    address cannot be proven; never created while shielding is off."""
-    want = (settings.beam_mp_address or "").strip()
-    row = await db().treasury.find_one({"_id": "mp_address"})
-    stored = str((row or {}).get("address") or "")
-    if stored and (row or {}).get("proven_at") and (not want or stored == want):
-        return stored
-    if not settings.shield_enabled:
-        return ""
-    created = False
-    addr = want or stored
-    if not addr:
-        # created THROUGH BeamPay, never through the wallet-api: an address the ledger does not
-        # know about is a float nothing can read (law 10, and INTEGRATION.md §6 rule 3).
-        addr = await bp.create_wallet("pgasme treasury shield target", "max_privacy")
-        created = True
+    Applied to the configured primary AND to every freshly created per-chunk target: an address
+    this deployment made is not exempt, because "we asked for max_privacy" is not the same fact
+    as "the wallet made one" (§WE-SET-IT-WE-DONT-READ-IT)."""
     if not await bp.validate_address(addr):
         raise beampay.BeamPayError(
             "the shield target is not a valid Beam address — refusing to send treasury value "
@@ -2387,6 +2500,36 @@ async def mp_address(bp: beampay.BeamPay) -> str:
             "the shield target is a 64/66-hex SBBS (regular) address, not a max-privacy token "
             "— shielding to it would settle and shield nothing"
         )
+
+
+async def mp_address(bp: beampay.BeamPay) -> str:
+    """OUR PRIMARY max_privacy address, PROVEN to be ours.
+
+    ⚠️ IT IS NO LONGER THE ADDRESS A SHIELD SENDS TO — `shield_target` makes a fresh one per
+    chunk, because consecutive sends to one max-privacy address collide. This is the address
+    that stays load-bearing for everything else about the float: it is the FIRST entry of
+    `mp_registry`, the address a release registers its contract txid to, and therefore the
+    address BeamPay books the crossing and its BEAM fee against. A shield that cannot prove it
+    is shielding into a float the payout side can neither read nor spend, so the proof still
+    gates the shield.
+
+    The verdict is stored on the row, in the spirit of `verify_arb_key.py`. RAISES when the
+    address cannot be proven; never created while shielding is off."""
+    want = (settings.beam_mp_address or "").strip()
+    row = await db().treasury.find_one({"_id": "mp_address"})
+    stored = str((row or {}).get("address") or "")
+    if stored and (row or {}).get("proven_at") and (not want or stored == want):
+        return stored
+    if not settings.shield_enabled:
+        return ""
+    created = False
+    addr = want or stored
+    if not addr:
+        # created THROUGH BeamPay, never through the wallet-api: an address the ledger does not
+        # know about is a float nothing can read (law 10, and INTEGRATION.md §6 rule 3).
+        addr = await bp.create_wallet("pgasme treasury float primary", "max_privacy")
+        created = True
+    await _prove_mp_address(bp, addr)
     await db().treasury.update_one(
         {"_id": "mp_address"},
         {
@@ -2449,6 +2592,12 @@ async def _treasury_claimed(dep: dict[str, Any]) -> None:
         shield_plan=plan,
         shield_txids=[],
         shield_ids=[],
+        # THE HISTORY FLOOR, PINNED AT THE TRANSITION. `treasury_at` cannot be it: a hold for a
+        # human re-stamps it (and so would a re-plan), and a floor that moves FORWARD makes an
+        # already-settled chunk's transaction invisible — which reads as "never sent".
+        shield_since=time.time(),
+        # the shape the slot claim needs, so no later pass has to migrate the row
+        shield_calls=[],
     )
 
 
@@ -2462,8 +2611,81 @@ def shield_comment(dep_id: str, k: int) -> str:
     return f"shield|{dep_id}|{int(k)}"
 
 
-def shield_calls_of(dep: dict[str, Any]) -> list[float]:
-    """When `/withdraw` was CALLED for each chunk, as a LIST, whatever shape the row carries.
+async def shield_target(bp: beampay.BeamPay, dep_id: str, k: int, attempt: int = 0) -> str:
+    """A max-privacy address for EXACTLY ONE shield chunk, created through BeamPay.
+
+    ⛔ **CONSECUTIVE SENDS TO ONE MAX-PRIVACY ADDRESS COLLIDE.** 2026-09-09 23:21–23:23Z,
+    deposit 60b0e5703cbad6955af059f1: three max-privacy self-sends of 1,000,000 groth bETH to
+    the SAME `PGAS_BEAM_MP_ADDRESS`, seconds apart. Chunk 0 settled (tx f15dd77d…, shielded
+    output 28390 at height 4030052). Chunks 1 and 2 were refused by the wallet with
+    **"Shielded outp duplicate ← Kernel Type 3"** and status 4, "failed maximum anonymity": a
+    max-privacy address publishes ONE-TIME vouchers, the wallet re-used the same voucher for
+    every send to it in quick succession, and the identical shielded output cannot be spent
+    into the pool twice. Two thirds of that deposit stayed unshielded and the row was held.
+
+    So the address belongs to the CHUNK, not to the deployment: one `/create_wallet` per chunk,
+    registered in `mp_addresses` BEFORE anything is sent to it — the registry is what
+    `float_groth` sums over, and an address the registry does not know is value nothing can
+    measure — and never used for a second send.
+
+    Idempotent on the chunk ATTEMPT: `mp_addresses._id` is `shield_comment(dep_id, k)`, plus
+    `#<attempt>` from the second attempt on. A chunk that was prepared and then refused —
+    `{"status": false}`, a kill switch, a lost address write — re-uses the address it already
+    made rather than leaking one per pass, and that is safe precisely because NOTHING was sent
+    to it.
+
+    ⛔ **`attempt` IS NOT DECORATION.** It is how many transactions carrying this chunk's
+    comment are already DEAD, counted from BeamPay's own history — so a chunk an operator
+    re-plans after a failure gets a NEW address and never the one that failed. Re-sending to
+    the address a failed max-privacy send already used reproduces the exact collision this
+    function exists to prevent: the voucher it published has been used once, and the wallet
+    builds the same shielded output again."""
+    doc_id = shield_comment(dep_id, k) + (f"#{int(attempt)}" if int(attempt) > 0 else "")
+    row = await db().mp_addresses.find_one({"_id": doc_id})
+    addr = str((row or {}).get("address") or "")
+    if addr:
+        return addr
+    addr = await bp.create_wallet(f"pgasme shielded|{dep_id}|{int(k)}", "max_privacy", "never")
+    await _prove_mp_address(bp, addr)
+    await db().mp_addresses.update_one(
+        {"_id": doc_id},
+        {
+            "$setOnInsert": {
+                "address": addr,
+                "created_at": time.time(),
+                "deposit_id": str(dep_id),
+                "k": int(k),
+                "attempt": int(attempt),
+                "purpose": "shield",
+            }
+        },
+        upsert=True,
+    )
+    # the REGISTRY wins, never the local variable: an upsert that found a document did not
+    # write ours, and a float summed over one registry must not be sent to a second belief
+    # about which address this chunk uses. The per-pass cache is dropped so the next read of
+    # the float includes what was just registered.
+    _PASS["mp_registry"] = None
+    _PASS["float"] = {}
+    row = await db().mp_addresses.find_one({"_id": doc_id})
+    return str((row or {}).get("address") or addr)
+
+
+def _shield_slot(v: Any) -> dict[str, Any]:
+    """One chunk's slot, normalised: `{"at": when /withdraw was called, "to_address": where}`.
+
+    ⚠️ TWO SHAPES ARE LIVE. The slot was a bare timestamp before the per-chunk address existed
+    and is `{"at": …, "to_address": …}` now, so a number is read as `{"at": it,
+    "to_address": ""}` — a legacy chunk's destination is recoverable from its transaction's
+    `receiver` and is never invented here. `0` (and absent) is a slot never claimed."""
+    if isinstance(v, dict):
+        return {"at": float(v.get("at") or 0), "to_address": str(v.get("to_address") or "")}
+    return {"at": float(v or 0), "to_address": ""}
+
+
+def shield_calls_of(dep: dict[str, Any]) -> list[dict[str, Any]]:
+    """Each chunk's slot — WHEN `/withdraw` was called and the address it was called with — as
+    a LIST, whatever shape the row carries.
 
     ⛔ **A dotted `$set` into a field that does not exist makes a MAP, not a list.** A deposit
     that entered `shielding` before `shield_calls` was initialised has no array for the
@@ -2475,44 +2697,109 @@ def shield_calls_of(dep: dict[str, Any]) -> list[float]:
     directly."""
     raw = dep.get("shield_calls")
     if isinstance(raw, dict):
-        out: list[float] = []
+        out: list[dict[str, Any]] = []
         for k, v in sorted(raw.items(), key=lambda kv: int(kv[0])):
-            out.extend(0.0 for _ in range(int(k) - len(out)))  # a gap is a slot never claimed
-            out.append(float(v or 0))
+            # a gap is a slot never claimed
+            out.extend(_shield_slot(0) for _ in range(int(k) - len(out)))
+            out.append(_shield_slot(v))
         return out
-    return [float(x or 0) for x in (raw or [])]
+    return [_shield_slot(x) for x in (raw or [])]
+
+
+# The words a chunk can be in. Only `failed` may be re-planned by a human; the three racy ones
+# must never be, because the wallet may still be about to emit a transaction for them and a
+# re-plan that races it queues a second send of one chunk.
+SHIELD_SETTLED = "settled"
+SHIELD_PENDING = "pending"
+SHIELD_FAILED = "failed"
+SHIELD_UNSENT = "unsent"
+SHIELD_UNKNOWN = "unknown"
+SHIELD_DUPLICATE = "duplicate"
+SHIELD_RACY = (SHIELD_PENDING, SHIELD_UNKNOWN, SHIELD_DUPLICATE)
+
+
+def shield_classify(
+    matches: list[dict[str, Any]], called_at: float, written_off: set[str]
+) -> dict[str, Any]:
+    """ONE reading of what BeamPay's history says about ONE chunk — the fact both the processor
+    and the re-plan CLI act on, so there is one writer of it and not two that disagree.
+
+    `{"state": …, "live": [live txs, newest first], "dead": [cancelled/failed ones]}`:
+
+      settled    one live transaction, status COMPLETED — this chunk's value IS shielded
+      pending    one live transaction that has not settled: the wallet may still land it
+      failed     no live transaction, and at least one dead one nobody has written off — no
+                 value moved, and this is the only state a human may re-plan
+      unknown    no transaction at all, but `/withdraw` WAS called: BeamPay queues the send and
+                 its daemon emits it seconds later, so this is the one state where calling
+                 again (or re-planning) would double-send
+      unsent     no transaction and `/withdraw` was never called for it
+      duplicate  TWO live transactions for one comment — the chunk went out twice, and only a
+                 human can decide what that means
+
+    A written-off dead transaction is one an operator has already accounted for in a re-plan;
+    it stays visible in `dead` (it is evidence) and stops being a reason to hold."""
+    alive = [m for m in matches if int(m.get("status", -1)) not in beam.TX_DEAD]
+    gone = [m for m in matches if int(m.get("status", -1)) in beam.TX_DEAD]
+    if len(alive) > 1:
+        state = SHIELD_DUPLICATE
+    elif alive:
+        state = (
+            SHIELD_SETTLED
+            if int(alive[0].get("status", -1)) in beam.TX_SETTLED
+            else SHIELD_PENDING
+        )
+    elif [d for d in gone if str(d.get("txId")) not in written_off]:
+        state = SHIELD_FAILED
+    elif float(called_at or 0) > 0:
+        state = SHIELD_UNKNOWN
+    else:
+        state = SHIELD_UNSENT
+    return {"state": state, "live": alive, "dead": gone}
 
 
 async def _shield_scan(
     bp: beampay.BeamPay, treasury: str, dep_id: str, chunks: int, since_ts: float
-) -> dict[int, dict[str, Any]]:
-    """{chunk index: the BeamPay transaction carrying its comment} — ONE scan per pass.
+) -> tuple[dict[int, dict[str, Any]], dict[int, list[dict[str, Any]]]]:
+    """`({chunk: its LIVE transaction}, {chunk: its DEAD transactions})` — ONE scan per pass.
 
     This is both the idempotency check and the settlement read, because for a `/withdraw` they
     are the same question: BeamPay's history is the only place a withdrawal we made can be
     identified, and the comment is the only thing in it that is ours.
 
-    ⛔ TWO transactions carrying ONE comment is a double send of that chunk. `/withdraw` has no
-    idempotency key at all, so it is the accident this route makes possible — and the one thing
-    that must never be silent. It is paged IMMEDIATELY; the newest is used so the row still
-    advances, because the second send's value is already gone and stalling the deposit does not
-    bring it back."""
+    ⛔ **A DEAD TRANSACTION IS NOT A LANDING.** A chunk whose send FAILED or was CANCELLED moved
+    no value at all — the wallet built a shielded output the chain refused (`shield_target`) —
+    and the groth is still sitting unshielded at the treasury. Counting it with the live ones
+    made this scan answer "chunk 1 has a transaction", which walked the machine PAST that chunk
+    to queue the next send into the same broken plan, and made an ordinary failed-then-resent
+    pair read as a DOUBLE SEND. The two are separated here, and only a live transaction is a
+    chunk's transaction.
+
+    ⛔ TWO LIVE transactions carrying ONE comment IS a double send of that chunk. `/withdraw`
+    has no idempotency key at all, so it is the accident this route makes possible — and the
+    one thing that must never be silent. It is paged IMMEDIATELY; the newest is used so the row
+    still advances, because the second send's value is already gone and stalling the deposit
+    does not bring it back."""
     comments = {shield_comment(dep_id, k): k for k in range(chunks)}
     rows = await bp.find_txs_by_comments(treasury, comments, since_ts)
-    out: dict[int, dict[str, Any]] = {}
+    live: dict[int, dict[str, Any]] = {}
+    dead: dict[int, list[dict[str, Any]]] = {}
     for comment, matches in rows.items():
-        if not matches:
-            continue
-        if len(matches) > 1:
+        k = comments[comment]
+        seen = shield_classify(matches, 0.0, set())
+        if seen["dead"]:
+            dead[k] = seen["dead"]
+        if seen["state"] == SHIELD_DUPLICATE:
             await tg.alert(
                 "deposit_shield_duplicate",
-                f"DOUBLE SEND: {len(matches)} transactions carry the shield comment "
+                f"DOUBLE SEND: {len(seen['live'])} live transactions carry the shield comment "
                 f"{comment!r} — /withdraw is not idempotent and this chunk went out more than "
-                f"once. Transactions: {', '.join(str(m.get('txId')) for m in matches)}",
+                f"once. Transactions: {', '.join(str(m.get('txId')) for m in seen['live'])}",
                 deposit_id=dep_id,
             )
-        out[comments[comment]] = matches[0]
-    return out
+        if seen["live"]:
+            live[k] = seen["live"][0]
+    return live, dead
 
 
 async def _treasury_shielding(dep: dict[str, Any]) -> None:
@@ -2530,10 +2817,19 @@ async def _treasury_shielding(dep: dict[str, Any]) -> None:
         )
     bp = beampay.beampay()
     treasury = beampay.treasury_address()
-    # `treasury_at` is stamped by `_advance` when this row ENTERED shielding — the floor the
-    # history walk goes back to. A walk bounded by a row count instead would fail open exactly
-    # when the wallet is busy, which is exactly when a double-send costs the most.
-    since = float(dep.get("treasury_at") or dep.get("claimed_at") or dep.get("created_at") or 0)
+    # ⛔ THE FLOOR THE HISTORY WALK GOES BACK TO, AND IT MUST NEVER MOVE FORWARD. `shield_since`
+    # is stamped once, when the row entered shielding; `treasury_at` is only the fallback for a
+    # row that entered before that field existed, because `_hold_for_a_human` re-stamps
+    # `treasury_at` and a floor later than a settled chunk's transaction hides it — after which
+    # the chunk reads as never sent. A walk bounded by a row count instead would fail open
+    # exactly when the wallet is busy, which is exactly when a double-send costs the most.
+    since = float(
+        dep.get("shield_since")
+        or dep.get("treasury_at")
+        or dep.get("claimed_at")
+        or dep.get("created_at")
+        or 0
+    )
     if since <= 0:
         # without a floor the history walk has nothing to walk back TO, and a scan that cannot
         # complete must refuse rather than answer "no such transaction" — which here would mean
@@ -2547,41 +2843,63 @@ async def _treasury_shielding(dep: dict[str, Any]) -> None:
             cooldown_s=6 * 3600,
         )
         return
-    landed = await _shield_scan(bp, treasury, dep_id, len(plan), since)
-    txids = [str(landed[i]["txId"]) for i in range(len(plan)) if i in landed]
+    if not dep.get("shield_since"):
+        # a row that entered shielding before the field existed: pin its floor NOW, from the
+        # only evidence it has, BEFORE anything can re-stamp `treasury_at` under it
+        await _checkpoint("deposits", dep_id, shield_since=since)
+    live, dead = await _shield_scan(bp, treasury, dep_id, len(plan), since)
+    txids = [str(live[i]["txId"]) for i in range(len(plan)) if i in live]
     if txids != list(dep.get("shield_txids") or []):
         await _set("deposits", dep_id, shield_txids=txids)
-    # the first chunk BeamPay has no transaction for. Not `len(txids)`: a gap must not be
+    # ⛔ A FAILED CHUNK IS A HUMAN'S, ONCE — AND IT IS CHECKED BEFORE THE NEXT CHUNK IS CHOSEN.
+    # A plan with a dead chunk in it must not grow another send: the collision `shield_target`
+    # describes repeats for every chunk that follows, so one refusal becomes N. And this hold
+    # is TERMINAL (`_hold_for_a_human` takes the row out of `shielding`), because a `_hold` here
+    # re-decided the same thing every 6 h forever and paged every time.
+    # `shield_writeoffs` is how the operator's re-plan says "that txid is accounted for" —
+    # append-only, carried on the row, never an edit of history.
+    written_off = {str(t) for t in (dep.get("shield_writeoffs") or [])}
+    unresolved = {
+        i: [t for t in txs if str(t.get("txId")) not in written_off]
+        for i, txs in dead.items()
+    }
+    unresolved = {i: txs for i, txs in unresolved.items() if txs}
+    if unresolved:
+        first = min(unresolved)
+        tx = unresolved[first][0]
+        await _hold_for_a_human(
+            "deposits",
+            dep_id,
+            "treasury",
+            "shielding",
+            f"a shield chunk failed on Beam: chunk {first + 1}/{len(plan)} is "
+            f"{tx.get('status_string') or tx.get('status')} (tx {tx.get('txId')}), so that value "
+            f"is still UNSHIELDED and nothing is auto-retried. Run `python -m pgasme.beam "
+            f"replan-shield --deposit {dep_id}` to see the chunk table, then the same command "
+            f"with --apply to re-send the failed chunk(s) to fresh max-privacy addresses",
+            "deposit_shield_failed",
+            "deposit_id",
+        )
+        return
+    # the first chunk BeamPay has no LIVE transaction for. Not `len(txids)`: a gap must not be
     # silently skipped by counting.
-    k = next((i for i in range(len(plan)) if i not in landed), len(plan))
+    k = next((i for i in range(len(plan)) if i not in live), len(plan))
 
     if k >= len(plan):
-        for i in sorted(landed):  # every chunk must be a settled kernel before the float counts
-            tx = landed[i]
-            status = int(tx.get("status", -1))
-            if status in beam.TX_DEAD:
-                await _hold(
-                    "deposits",
-                    dep_id,
-                    f"a shield chunk failed on Beam ({tx.get('status_string') or status}) — the "
-                    f"value is unshielded and needs a human",
-                    key=f"treasury-shieldfail:{dep_id}",
-                    cooldown_s=6 * 3600,
-                )
-                return
-            if status not in beam.TX_SETTLED:
+        for i in sorted(live):  # every chunk must be a settled kernel before the float counts
+            if int(live[i].get("status", -1)) not in beam.TX_SETTLED:
                 return
         # BeamPay sets the withdrawal fee itself (0.001 BEAM regular, 0.011 offline /
         # max-privacy) and ignores any fee we send. So it is read back from the transactions it
         # made, summed across the chunks, and said out loud when it is absurd.
-        total_fee = sum(int(landed[i].get("fee") or 0) for i in landed)
+        total_fee = sum(int(live[i].get("fee") or 0) for i in live)
         await fee_charged(
             "deposits", dep_id, {"fee": total_fee},
             f"shielding {dep_id} ({len(txids)} chunk(s))", "deposit_id",
         )
         # the BUDGET is per CHUNK, so the history has to be per chunk too: the sum above is
         # what this deposit's shielding cost, the max below is what the next chunk may cost
-        per_chunk = max((int(landed[i].get("fee") or 0) for i in landed), default=0)
+        per_chunk = max((int(live[i].get("fee") or 0) for i in live), default=0)
         if per_chunk > 0:
             await _checkpoint("deposits", dep_id, shield_fee_groth=per_chunk)
         await _advance(
@@ -2598,7 +2916,7 @@ async def _treasury_shielding(dep: dict[str, Any]) -> None:
         )
         return
 
-    called_at = calls[k] if k < len(calls) else 0.0
+    called_at = calls[k]["at"] if k < len(calls) else 0.0
     if called_at:
         # ⛔ `/withdraw` WAS CALLED FOR THIS CHUNK AND ITS TRANSACTION IS NOT VISIBLE YET.
         # BeamPay queues the send and its daemon emits it seconds later, so a gap here is
@@ -2632,8 +2950,12 @@ async def _treasury_shielding(dep: dict[str, Any]) -> None:
         return
     if workers.paused():
         return
+    # THE PRIMARY, PROVEN FIRST. It is not this chunk's destination any more (`shield_target`
+    # makes a fresh one below) — it is the float's first entry and the address every release
+    # books its crossing and its BEAM fee to, so shielding into a float that address cannot
+    # read or spend is work with nowhere to go.
     try:
-        addr = await mp_address(bp)
+        primary = await mp_address(bp)
     except beampay.BeamPayError as e:
         await _hold(
             "deposits",
@@ -2643,7 +2965,7 @@ async def _treasury_shielding(dep: dict[str, Any]) -> None:
             cooldown_s=6 * 3600,
         )
         return
-    if not addr:
+    if not primary:
         await _hold(
             "deposits",
             dep_id,
@@ -2668,7 +2990,12 @@ async def _treasury_shielding(dep: dict[str, Any]) -> None:
             # that only asked `$exists: False` would refuse to claim it forever
             "$or": [{f"shield_calls.{k}": {"$exists": False}}, {f"shield_calls.{k}": 0}],
         },
-        {"$set": {f"shield_calls.{k}": now, "updated_at": now}},
+        # ⛔ THE SLOT IS AN OBJECT, WRITTEN WHOLE. The destination goes in beside `at` a moment
+        # later, and `$set` of `shield_calls.<k>.to_address` into a SCALAR is a hard MongoDB
+        # error ("cannot create field in element"), which on this path would mean the address
+        # of a chunk that is about to be sent never reaching the row. mongomock accepts it
+        # silently, so no test would have caught it — the shape is chosen here on purpose.
+        {"$set": {f"shield_calls.{k}": {"at": now}, "updated_at": now}},
     )
     if won is None:
         return  # another pass owns this chunk
@@ -2677,6 +3004,31 @@ async def _treasury_shielding(dep: dict[str, Any]) -> None:
         # yet, so the marker is released and the chain halts exactly here
         await db().deposits.update_one({"_id": dep_id}, {"$set": {f"shield_calls.{k}": 0}})
         return
+    # ⛔ A FRESH MAX-PRIVACY ADDRESS FOR THIS CHUNK AND NO OTHER — the whole reason this
+    # function exists (`shield_target`: the wallet re-uses a max-privacy voucher and the chain
+    # refuses the duplicate shielded output). Asked AFTER the slot is claimed, so exactly one
+    # pass can ever ask for this chunk's address, and released back to unsent when it cannot be
+    # made and proven, because nothing has been queued yet.
+    try:
+        # a chunk with dead transactions has already had a max-privacy address used on its
+        # behalf; the attempt count comes from BeamPay's history, never from a counter of ours
+        addr = await shield_target(bp, dep_id, k, attempt=len(dead.get(k) or []))
+    except beampay.BeamPayError as e:
+        await db().deposits.update_one({"_id": dep_id}, {"$set": {f"shield_calls.{k}": 0}})
+        await _hold(
+            "deposits",
+            dep_id,
+            f"a fresh max-privacy address for shield chunk {k + 1}/{len(plan)} could not be "
+            f"created and proven: {e} — nothing was sent",
+            key=f"treasury-mpcreate:{dep_id}",
+            cooldown_s=6 * 3600,
+        )
+        return
+    # ON THE CHUNK RECORD BEFORE THE CALL, like the marker itself: which address this chunk was
+    # sent to is the only local record of where the value went, and `/withdraw` answers nothing
+    await db().deposits.update_one(
+        {"_id": dep_id}, {"$set": {f"shield_calls.{k}.to_address": addr}}
+    )
     comment = shield_comment(dep_id, k)
     try:
         res = await bp.withdraw(treasury, addr, asset.aid, int(plan[k]), comment)
@@ -2712,6 +3064,169 @@ async def _treasury_shielding(dep: dict[str, Any]) -> None:
     # the reason an organic user's shield is delayed. The txid is NOT here to record — the
     # route does not answer one — so the next pass finds it by its comment.
     log.info("deposit %s: shield chunk %d/%d queued with BeamPay", dep_id, k + 1, len(plan))
+
+
+# ------------------------------------------------------------- treasury: the shield re-plan
+
+
+def shield_since_of(dep: dict[str, Any]) -> float:
+    """The floor a shield history walk searches back to. ONE reader of this fallback chain, so
+    the CLI cannot search a different window from the processor's."""
+    return float(
+        dep.get("shield_since")
+        or dep.get("treasury_at")
+        or dep.get("claimed_at")
+        or dep.get("created_at")
+        or 0
+    )
+
+
+async def shield_chunk_report(
+    bp: beampay.BeamPay, dep: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """One row per shield chunk: the plan, what BeamPay's history says, and the ONE word that
+    decides whether a human may re-plan it (`shield_classify`).
+
+    READ ONLY, and it alerts about nothing: it is what a `--dry-run` prints, and a tool an
+    operator runs to look must not page anybody or move a row.
+
+    RAISES when BeamPay cannot be read — an incomplete history walk answers "no such
+    transaction", which here would mean re-sending a chunk that is already on its way — and
+    when the row carries no time to search back to."""
+    dep_id = str(dep["_id"])
+    plan = [int(x) for x in (dep.get("shield_plan") or [])]
+    calls = shield_calls_of(dep)
+    written_off = {str(t) for t in (dep.get("shield_writeoffs") or [])}
+    since = shield_since_of(dep)
+    if since <= 0:
+        raise beampay.BeamPayError(
+            f"deposit {dep_id} records no time at which it entered shielding, so BeamPay's "
+            f"history cannot be searched for the chunks it may already have sent"
+        )
+    comments = {shield_comment(dep_id, k): k for k in range(len(plan))}
+    rows = await bp.find_txs_by_comments(beampay.treasury_address(), comments, since)
+    out: list[dict[str, Any]] = []
+    for k, amount in enumerate(plan):
+        comment = shield_comment(dep_id, k)
+        slot = calls[k] if k < len(calls) else _shield_slot(0)
+        seen = shield_classify(rows.get(comment) or [], slot["at"], written_off)
+        tx = (seen["live"] or seen["dead"] or [{}])[0]
+        out.append(
+            {
+                "k": k,
+                "amount": amount,
+                "comment": comment,
+                "state": seen["state"],
+                "txid": str(tx.get("txId") or ""),
+                "tx_status": int(tx.get("status", -1)) if tx else -1,
+                "tx_status_string": str(tx.get("status_string") or ""),
+                # the slot is where WE recorded the destination; a legacy chunk has none, and
+                # then the transaction's own receiver is the evidence — never a guess
+                "to_address": slot["to_address"] or str(tx.get("receiver") or ""),
+                "called_at": slot["at"],
+                # only the dead transactions this re-plan would ACCOUNT FOR; one already
+                # written off is not written off twice
+                "writeoff_txids": [
+                    str(d.get("txId"))
+                    for d in seen["dead"]
+                    if str(d.get("txId")) not in written_off
+                ],
+            }
+        )
+    return out
+
+
+def shield_replan_plan(rows: list[dict[str, Any]]) -> tuple[list[int], list[str], list[str]]:
+    """`(chunks to re-plan, txids to write off, the reasons a re-plan must REFUSE)`.
+
+    ⛔ THE REFUSALS ARE THE POINT. A `pending` chunk may still settle, and an `unknown` one is a
+    `/withdraw` BeamPay has accepted and not yet emitted — re-planning either one races the
+    wallet and queues a second send of one chunk, which is the exact accident `/withdraw` has
+    no idempotency key to prevent. A `duplicate` is already an operator's problem and is not
+    something a tool may tidy away."""
+    ks = [int(r["k"]) for r in rows if r["state"] == SHIELD_FAILED]
+    txids = [t for r in rows if r["state"] == SHIELD_FAILED for t in r["writeoff_txids"]]
+    racy = [
+        f"chunk {int(r['k']) + 1} is {r['state']}"
+        + (f" (tx {r['txid']})" if r["txid"] else "")
+        for r in rows
+        if r["state"] in SHIELD_RACY
+    ]
+    return ks, txids, racy
+
+
+async def replan_shield(
+    dep_id: str, chunks: Iterable[int], writeoffs: Iterable[str]
+) -> dict[str, Any]:
+    """Hand the named shield chunks back to the processor as UNSENT — the ONE write
+    `replan-shield --apply` makes.
+
+    ⛔ NEVER AN EDIT OF HISTORY. The settled chunks and their txids are untouched: they ARE the
+    shielded value and the only record of it. The failed transactions are written off by
+    APPENDING their txids to `shield_writeoffs` — which is what stops `_treasury_shielding`
+    holding the row for a human again over transactions an operator has already accounted for —
+    and one `shield_replans` entry carries the evidence: when, which chunks, which txids.
+
+    The chunk's IDENTITY does not change: `shield_comment(dep_id, k)` stays the one thing that
+    can tell a resend from a first send. What changes is the DESTINATION, and the processor
+    picks a fresh max-privacy address for it (`shield_target`) — which is the whole repair.
+
+    ONE CONDITIONAL TRANSITION, through `_advance`, so a row another pass has moved on is not
+    re-planned from a stale read and `treasury_at` is stamped by the only function that stamps
+    it. `shield_since` is left exactly where it was: the floor a history walk searches back to
+    must never move forward, or an already-settled chunk becomes invisible and reads as never
+    sent — after which the machine would send it again."""
+    ks = sorted({int(k) for k in chunks})
+    ids = sorted({str(t) for t in writeoffs if t})
+    if not ks:
+        return {"ok": False, "why": "no chunk qualifies for a re-plan"}
+    dep = await db().deposits.find_one({"_id": dep_id})
+    if not dep:
+        return {"ok": False, "why": f"no deposit {dep_id!r}"}
+    was = dep.get("treasury")
+    if was == HELD and str(dep.get("held_from") or "") != "shielding":
+        return {
+            "ok": False,
+            "why": f"this row was held from {dep.get('held_from')!r}, not from shielding",
+        }
+    if was not in (HELD, "shielding"):
+        return {
+            "ok": False,
+            "why": f"treasury is {was!r} — only a shielding or held-from-shielding row can be "
+            f"re-planned",
+        }
+    plan = list(dep.get("shield_plan") or [])
+    claimed = await _advance(
+        "deposits",
+        dep_id,
+        "treasury",
+        was,
+        "shielding",
+        "deposit_shield_replanned",
+        f"Treasury: an operator re-planned shield chunk(s) "
+        f"{', '.join(str(k + 1) for k in ks)} of {len(plan)} on deposit {dep_id} — they are "
+        f"unsent again and will go to fresh max-privacy addresses",
+        "deposit_id",
+        **{f"shield_calls.{k}": 0 for k in ks},
+    )
+    if claimed is None:
+        return {"ok": False, "why": "another pass moved this row while it was being read"}
+    change: dict[str, Any] = {
+        "$push": {
+            "shield_replans": {
+                "at": time.time(),
+                "chunks": ks,
+                "txids": ids,
+                "from": was,
+                "by": "replan-shield",
+            }
+        },
+        "$unset": {"held_from": "", "unresolved_at": ""},
+    }
+    if ids:
+        change["$addToSet"] = {"shield_writeoffs": {"$each": ids}}
+    await db().deposits.update_one({"_id": dep_id}, change)
+    return {"ok": True, "chunks": ks, "writeoffs": ids, "from": was, "chunks_total": len(plan)}
 
 
 # ----------------------------------------------------------------------------- the loop
@@ -2860,6 +3375,10 @@ async def process_once() -> dict[str, int]:
         return {"payouts": 0, "treasury": 0, "lease": 0, "lease_refused_s": int(waited)}
     _PASS["beam_fee"] = 0
     _PASS["fee_budget"] = {}
+    # the max-privacy registry and the float summed over it are one pass's answer, never two:
+    # an address created by a shield in THIS pass is in the next pass's registry
+    _PASS["mp_registry"] = None
+    _PASS["float"] = {}
     # the attribution pre-flight is asked ONCE per pass, and must not survive into the next one:
     # a key rotated, a BeamPay restarted or a route deployed between passes is a new answer
     _PASS["expect_route"] = None

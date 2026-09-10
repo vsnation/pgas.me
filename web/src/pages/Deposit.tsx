@@ -135,13 +135,14 @@ export function DepositPage() {
   // ---- which ingress paths are open (the API's statement; see lib/ingress.ts) ----
   const flags = useMemo(() => resolveIngress(data.ingress, ingressPartial(session.account)), [data.ingress, session.account]);
   const onEthereum = chain?.chain_id === 1;
+  /** Where the Uniswap route applies at all: it takes ETH out, and only on Ethereum. */
+  const uniswapChoice = flags.uniswap && !!onEthereum && target === 'ETH';
   /**
-   * The Uniswap route takes ETH out (DAI and WBTC keep their own pipe, which is the direct path)
-   * and only the tokens it has a registered gateway pool for. Asking for a route the API does not
-   * have would be a 400 the user did nothing to deserve, so the request simply does not name it.
+   * …and only for the tokens it has a registered gateway pool for. Asking for a route the API does
+   * not have would be a 400 the user did nothing to deserve, so the request simply does not name it
+   * — the quote comes back as `direct` or `swap`, and the page renders what it always did.
    */
-  const uniswapPair = isUniswapToken(token, data.uniswapTokens);
-  const askUniswap = flags.uniswap && !!onEthereum && target === 'ETH' && uniswapPair;
+  const askUniswap = uniswapChoice && isUniswapToken(token, data.uniswapTokens);
   /** A source off Ethereum with the cross-chain path closed: there is nothing to quote. */
   const xchainClosed = !!chain && !onEthereum && !flags.xchain;
   /**
@@ -149,7 +150,6 @@ export function DepositPage() {
    * the path, and never to nothing: an empty list would be this filter's opinion, not the API's, so
    * a list that matches no pair falls back to the whole list.
    */
-  const uniswapChoice = flags.uniswap && !!onEthereum && target === 'ETH';
   const payTokens = useMemo(() => {
     if (!uniswapChoice) return tokens;
     const kept = tokens.filter((t) => isUniswapToken(t, data.uniswapTokens));
@@ -258,8 +258,7 @@ export function DepositPage() {
 
   // ---- quote: debounced, abortable, re-quoted automatically when it expires ----
   const sessionToken = session.session?.token ?? null;
-  const canQuote =
-    !!sessionToken && !!wallet.address && !!chain && !!token && rawAmount !== null && stage !== 'tracking' && !xchainClosed;
+  const canQuote = !!sessionToken && !!wallet.address && !!chain && !!token && rawAmount !== null && stage !== 'tracking' && !xchainClosed;
   const rawAmountKey = rawAmount?.toString() ?? '';
   const srcChain = chain?.chain_id; // the API takes EVM ids and maps to the router's own id itself
   const srcToken = token?.address;
@@ -727,12 +726,12 @@ export function DepositPage() {
                     {/* The two numbers that only the Uniswap route has, and the only slippage bound
                         that works on it: `min_out_units` is what the hook itself reverts below. */}
                     {uniswap && est.min_out_units && (
-                      <p className="help num" data-testid="min-out">
+                      <p className="help" data-testid="min-out">
                         min you receive {fmtUnits(est.min_out_units, outDecimals, target === 'WBTC' ? 8 : 6)} {quote.target_asset}
                       </p>
                     )}
                     {uniswap && typeof est.price_impact_bps === 'number' && (
-                      <p className="help num" data-testid="price-impact">
+                      <p className="help" data-testid="price-impact">
                         price impact {(est.price_impact_bps / 100).toFixed(2)}%
                       </p>
                     )}
@@ -817,7 +816,9 @@ export function DepositPage() {
                     ) : (
                       stage !== 'tracking' && (
                         <div className="stack-sm">
-                          {quote.approval && (
+                          {/* The Uniswap route has no button of its own here: its spender is the
+                              router in the quote, so the one Deposit press approves and deposits. */}
+                          {quote.approval && !uniswap && (
                             <div className="row">
                               <button
                                 type="button"

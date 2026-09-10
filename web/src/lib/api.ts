@@ -167,12 +167,18 @@ export const api = {
 
   chains: () => request<{ chains: Chain[] }>('/dex/chains'),
   tokens: (chainId: number) => request<{ tokens: Token[] }>(`/dex/tokens?chain_id=${chainId}`),
-  /** The assets, and the ingress flags the 2026-09-10 build publishes alongside them. */
+  /** The asset registry (ETH/DAI/WBTC), and on some builds the ingress flags alongside it. */
   assets: () => request<AssetsResponse>('/assets'),
   /**
-   * Public health. Read for one thing only: the second copy of the ingress flags, for a build that
-   * publishes them here and not on `/assets`. A build with no such route answers 404 and the caller
-   * carries on — an unreadable read is not evidence that a path is closed (see lib/ingress.ts).
+   * Where the 2026-09-10 API publishes the ingress flags and the registered Uniswap pairs
+   * (`ingress:{uniswap, xchain, direct, uniswap_tokens:[{address,symbol,decimals}]}`). Read for
+   * those alone; a build without the route answers 404 and the caller carries on.
+   */
+  dexAssets: () => request<AssetsResponse>('/dex/assets'),
+  /**
+   * Public health, and the second place the flags are published. A build with no such route answers
+   * 404 and the caller carries on — an unreadable read is not evidence that a path is open or
+   * closed, and silence leaves the defaults in lib/ingress.ts standing.
    */
   health: () => request<HealthResponse>('/health'),
 

@@ -147,7 +147,7 @@ export function SchedulePage() {
   const debitGroth = totalGroth + feeGroth;
   const shortfall = debitGroth - available;
   const overBudget = !!account && shortfall > 0;
-  /** One problem per row, for the rows that are orders — this is what holds the button down. */
+  /** Everything one row is still missing, in the user's words. */
   const rowProblem = (i: (typeof items)[number], n: number) => {
     const label = i.address ? shortAddr(i.address) : `row ${n + 1}`;
     return [i.addressProblem, i.amountProblem, i.timeProblem].filter(Boolean).map((p) => `${label}: ${p}`);
@@ -176,8 +176,7 @@ export function SchedulePage() {
   /** Nothing typed anywhere yet: one muted line, not a list of complaints. */
   const pristine = active.length === 0 && problems.length === 0;
 
-  const setRow = (id: number, patch: Partial<Row>) =>
-    setRows((rs) => rs.map((r) => (r.id === id ? { ...r, ...patch, touched: true } : r)));
+  const setRow = (id: number, patch: Partial<Row>) => setRows((rs) => rs.map((r) => (r.id === id ? { ...r, ...patch, touched: true } : r)));
   /** Leaving a field counts as having been in the row, even when nothing was typed in it. */
   const touchRow = (id: number) => setRows((rs) => rs.map((r) => (r.id === id ? { ...r, touched: true } : r)));
   const addRow = () => setRows((rs) => [...rs, blankRow()]);

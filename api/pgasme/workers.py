@@ -36,7 +36,7 @@ from typing import Any
 
 import httpx
 
-from . import beampay, ethpipe, ledger, scanner, tg, xchain
+from . import beampay, ethpipe, ledger, scanner, tg, uniswap, xchain
 from .assets import ASSETS
 from .config import settings
 from .db import db
@@ -74,7 +74,9 @@ SLA_S: dict[str, float] = {
 TREASURY_SLA_S: dict[str, float] = {"claiming": 30 * 60, "shielding": 2 * 3600}
 NOT_DARK = {"dark": {"$ne": True}}
 # A row a HUMAN owns (payouts._hold_for_a_human): no handler resolves it, so it can only leave
-# by hand — and it must be said out loud until it does.
+# by hand — and it must be said out loud until it does. This is the REMINDER interval, measured
+# from the last thing that said it: the page the hold itself sent (`hold_paged_at`) or the last
+# reminder (`held_reminded_at`), both on the row so a restart cannot lose them.
 HELD_SLA_S = 6 * 3600
 
 
@@ -94,6 +96,47 @@ def stale(field: str, cut: float) -> dict[str, Any]:
             {field: {"$exists": False}, "updated_at": {"$lt": cut}},
         ]
     }
+
+
+def held_paged_at(row: dict[str, Any]) -> float:
+    """When this held row was last paged about — 0.0 when nothing proves it ever was.
+
+    ONE writer of that fact: `payouts._hold_for_a_human`, which stamps `hold_paged_at` in the
+    same call that sends the page (`tg.alert`, immediate). This reads THAT FIELD AND NOTHING
+    ELSE — two implementations of "when did we last say this" would disagree, and the
+    disagreement is a flood.
+
+    ⛔ It used to fall back to `hold_at` / `<field>_at`, and `payouts._hold` writes `hold_at` on
+    every ordinary WAITING hold — so a row parked for a human that was then held once more for
+    a fee budget looked freshly paged, and the reminder about money nobody could move went
+    silent. A row with no `hold_paged_at` has no proof it was ever paged (held by an older
+    build, or by hand), and the safe answer there is to page it.
+    """
+    return float(row.get("hold_paged_at") or 0.0)
+
+
+def held_reminded_at(row: dict[str, Any]) -> float:
+    """When the monitor last sent the reminder about this hold — 0.0 if it never has.
+
+    Written by `stuck_checks()` on the row, because the tg cooldown that also holds this back
+    is per-PROCESS: a restart inside the SLA emptied `tg._last_sent` and every held row was
+    paged again, which is the flood arriving by a different door. The row outlives the process.
+    """
+    return float(row.get("held_reminded_at") or 0.0)
+
+
+def held_reminder_due(row: dict[str, Any], now: float) -> bool:
+    """True when HELD_SLA_S has passed since the last thing that SAID this hold out loud —
+    the hold's own page or the last reminder, whichever is later.
+
+    The 2026-09-10 flood: `_hold_for_a_human` paged "HELD: a shield chunk failed…" and the very
+    next monitor pass paged the same hold again from here, because this check had no idea the
+    hold had already spoken (and its in-memory tg cooldown key had never been used). One event,
+    two pages, and the second one truncated — which is how an operator learns to skim the pager.
+    """
+    return now - max(held_paged_at(row), held_reminded_at(row)) >= HELD_SLA_S
+
+
 PAUSED_REASON = (
     "Pgas.me is paused by the operator (the stop file is set): nothing that moves money is "
     "accepted right now. Balances and estimates are unaffected — try again shortly."
@@ -487,8 +530,11 @@ async def xchain_secondary() -> int:
     )
     n = 0
     for dep in await cur.to_list(100):
-        if dep.get("mode") == "direct":
-            continue  # no cross-chain order exists for a direct deposit; only the chain can advance it
+        if xchain.norm_mode(dep.get("mode")) in ("direct", uniswap.MODE):
+            # No cross-chain order exists on either of these paths: a `direct` deposit IS the pipe
+            # call and a `uniswap` one reaches the pipe through our own hook. Only the chain can
+            # advance them, and asking the router about their hash pages the operator for nothing.
+            continue
         try:
             if dep["status"] == "submitted":
                 if dep.get("src_tx_hash"):
@@ -680,22 +726,50 @@ async def stuck_checks() -> None:
                 cooldown_s=6 * 3600,
             )
     # rows parked for a human: the money is somewhere the machine may not touch, so the pager
-    # keeps saying so — a held row that nobody hears about is the same as a lost one
+    # keeps saying so — a held row that nobody hears about is the same as a lost one. But it is
+    # a REMINDER, not a second announcement: `_hold_for_a_human` already paged when it held the
+    # row, so this waits HELD_SLA_S from THAT page (`held_reminder_due`).
     for coll, field, what in (
         ("payout_requests", "status", "payout"),
         ("deposits", "treasury", "deposit"),
     ):
         for r in await d[coll].find({field: "held"}).limit(50).to_list(50):
+            if not held_reminder_due(r, now):
+                continue
+            # The reason IN FULL, and the id FIRST. The old `[:200]` cut the shield-failure
+            # reason mid-sentence, which meant the operator's copy of the alert ended before the
+            # `replan-shield` command that resolves it — an instruction cut in half is worse
+            # than no instruction. tg.cap() is the one length guard, and it marks its cut.
+            reason = str(r.get("hold_reason") or "no reason was recorded on the row")
+            # said only when the row can prove it: a missing stamp is not "held since 1970"
+            paged_at = held_paged_at(r)
+            since = f" for over {int((now - paged_at) // 3600)} h" if paged_at else ""
             await tg.send(
-                f"HELD: {what} parked for a human — {tg.esc(str(r.get('hold_reason') or ''))[:200]}"
-                f" <code>{r['_id']}</code>",
+                tg.cap(
+                    f"HELD: <code>{r['_id']}</code> {what} parked for a human{since} and "
+                    f"nothing retries it — {tg.esc(reason)}"
+                ),
                 key=f"held:{coll}:{r['_id']}",
                 cooldown_s=HELD_SLA_S,
             )
+            # …and the reminder is now the most recent thing that said it — ON THE ROW, because
+            # the cooldown above dies with the process and a restart inside the SLA re-paged
+            # every held row. Stamped on the ATTEMPT, exactly like that cooldown: a send that
+            # failed must not spin on the next pass either. Bookkeeping, so it deliberately does
+            # NOT touch `updated_at` — that clock belongs to the status machine.
+            await d[coll].update_one({"_id": r["_id"]}, {"$set": {"held_reminded_at": now}})
     q = {"status": {"$in": ["submitted", "order_seen"]}, "created_at": {"$lt": now - 60 * 60}}
     for r in await d.deposits.find(q).limit(50).to_list(50):
+        # say what is actually missing: a `direct` or `uniswap` deposit has no cross-chain order
+        # in its story at all, and a pager that describes the wrong thing is one the operator
+        # learns to skim.
+        missing = (
+            "no pipe lock yet"
+            if xchain.norm_mode(r.get("mode")) in ("direct", uniswap.MODE)
+            else "no cross-chain fill yet"
+        )
         await tg.send(
-            f"STUCK: deposit {r['status']} for over 60 min — no cross-chain fill yet. <code>{r['_id']}</code>",
+            f"STUCK: deposit {r['status']} for over 60 min — {missing}. <code>{r['_id']}</code>",
             key=f"stuck:dep:{r['_id']}:{r['status']}",
             cooldown_s=6 * 3600,
         )

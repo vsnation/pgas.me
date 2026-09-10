@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
-from .. import xchain
+from .. import uniswap, xchain
 from ..assets import ASSETS
 from ..config import LEGACY_CHAIN_ID_FIELD
 
@@ -105,8 +105,20 @@ async def tokens(chain_id: int = Query(..., description="EVM (original) chain id
     return {"tokens": out}
 
 
+# `/v1/assets` is the path of record (API_CONTRACT.md); `/v1/dex/assets` is the same handler
+# under the name the client and the work order both use for it. ONE implementation, two paths —
+# never two handlers, which is how two answers to one question start.
 @router.get("/v1/assets")
+@router.get("/v1/dex/assets")
 async def assets():
+    """The target assets, and which ways in are open.
+
+    `ingress.uniswap_tokens` is the registry itself — the source tokens the gateway route
+    accepts right now — so the client never has to keep its own copy of a list that lives in
+    the server's environment. It is EMPTY whenever the route is off or unusable, and the client
+    treats a route the API does not state as off: an ingress that cannot be served must never
+    look available."""
+    flags = uniswap.ingress_flags()
     return {
         "assets": [
             {
@@ -119,5 +131,6 @@ async def assets():
                 "aid": a.aid,
             }
             for a in ASSETS.values()
-        ]
+        ],
+        "ingress": {**flags, "uniswap_tokens": uniswap.public_tokens()},
     }

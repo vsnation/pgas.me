@@ -287,9 +287,21 @@ async def test_a_held_release_cannot_un_hold_itself_hours_later(mock_db, eth, ar
 
 
 async def test_a_held_row_keeps_paging_until_a_human_moves_it(mock_db, paged):
+    """The id leads, the reason is whole, and a row nothing can date is said out loud.
+
+    This row carries no `hold_at` (a hold from an older build, or one made by hand), so nothing
+    proves the operator was ever told — and the safe answer to that is to tell them. The other
+    half of the rule, that a hold which HAS just paged for itself is not announced twice, is
+    `tests/test_held_page_dedupe.py`; the second assertion below pins the join."""
     await make_payout(mock_db, status="held", hold_reason="the release response was lost")
     await workers.stuck_checks()
-    assert any(t.startswith("HELD: payout parked for a human") for t in paged)
+    assert any(t.startswith("HELD: <code>req1</code> payout parked for a human") for t in paged)
+    assert any("the release response was lost" in t for t in paged)
+    # …and once the hold's own page is on the row, the stuck check stops repeating it
+    paged.clear()
+    await dbmod.db().payout_requests.update_one({"_id": "req1"}, {"$set": {"hold_at": time.time()}})
+    await workers.stuck_checks()
+    assert paged == []
 
 
 # ================================================== §3 · the disproof is not a warning (defect 3)
@@ -359,7 +371,7 @@ async def test_two_processors_produce_exactly_one_shield_chunk(
     await asyncio.gather(payouts._treasury_shielding(dep), payouts._treasury_shielding(dict(dep)))
     assert len(beam_pay.withdrawals) == 1
     row = await deposit(mock_db)
-    assert len(row["shield_calls"]) == 1 and row["shield_calls"][0] > 0
+    assert len(row["shield_calls"]) == 1 and row["shield_calls"][0]["at"] > 0
 
 
 async def test_a_second_processor_loop_refuses_to_run_at_all(mock_db, eth, armed, monkeypatch):
@@ -830,7 +842,13 @@ async def test_the_shield_target_must_be_proven_to_belong_to_this_wallet(
     beam_pay.register(stranger, "max_privacy")
     monkeypatch.setattr(settings, "beam_mp_address", stranger)
     await payouts.process_once()
-    assert beam_pay.withdrawals[-1]["to_address"] == stranger
+    # ⚠️ THE PROVEN PRIMARY IS NOT THE SEND TARGET ANY MORE. It is the float's first entry and
+    # the address a release books to, so a shield still refuses until it is proven — but the
+    # chunk goes to its OWN fresh max-privacy address (`shield_target`), because two sends to
+    # one max-privacy address collide on its one-time voucher.
+    assert beam_pay.withdrawals[-1]["to_address"] == beam_pay.created[-1]["address"]
+    assert beam_pay.withdrawals[-1]["to_address"] != stranger
+    assert beam_pay.created[-1]["note"] == "pgasme shielded|dep1|0"
     proof = await mock_db["pgasme_test"].treasury.find_one({"_id": "mp_address"})
     assert proof["proven_at"] > 0 and proof["type"] == "max_privacy" and proof["is_mine"] is True
     assert proof["proven"] == [
@@ -1214,8 +1232,7 @@ async def test_a_shielding_row_written_before_shield_calls_does_not_send_twice(
     await payouts.process_once()
     row = await deposit(mock_db)
     assert len(beam_pay.withdrawals) == 1
-    assert row["shield_calls"] == [pytest.approx(row["shield_calls"][0])]
-    assert isinstance(row["shield_calls"], list) and row["shield_calls"][0] > 0
+    assert isinstance(row["shield_calls"], list) and row["shield_calls"][0]["at"] > 0
     assert row["shield_txids"] == []  # nothing is booked: the transaction has not appeared
 
     # the pass that follows must NOT call /withdraw again — the marker is what stops it
@@ -1242,9 +1259,16 @@ async def test_a_shielding_row_written_before_shield_calls_does_not_send_twice(
     assert len(beam_pay.withdrawals) == 2  # chunk 1, not a second chunk 0
 
     # the reader is total: a map, a list, a gap and an absent field all answer with a list
-    assert payouts.shield_calls_of({"shield_calls": {"0": 5.0, "2": 7.0}}) == [5.0, 0.0, 7.0]
-    assert payouts.shield_calls_of({"shield_calls": [5.0, 6.0]}) == [5.0, 6.0]
-    assert payouts.shield_calls_of({}) == []
+    def ats(dep: dict[str, Any]) -> list[float]:
+        return [c["at"] for c in payouts.shield_calls_of(dep)]
+
+    assert ats({"shield_calls": {"0": 5.0, "2": 7.0}}) == [5.0, 0.0, 7.0]
+    assert ats({"shield_calls": [5.0, 6.0]}) == [5.0, 6.0]  # the LEGACY bare-timestamp shape
+    assert ats({}) == []
+    # …and the slot the per-chunk address made an object is read the same way, with the address
+    assert payouts.shield_calls_of({"shield_calls": [{"at": 5.0, "to_address": "MP1"}]}) == [
+        {"at": 5.0, "to_address": "MP1"}
+    ]
 
 
 async def test_a_queued_shield_that_never_appears_is_held_for_a_human(

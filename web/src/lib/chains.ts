@@ -180,6 +180,31 @@ export function chainIconUrl(chainId: number): string | null {
   return CHAIN_ICONS.has(chainId) ? `/chains/${chainId}.svg` : null;
 }
 
+/**
+ * The ONE way a chain id is written for a wallet — `wallet_switchEthereumChain` (EIP-3326),
+ * `wallet_addEthereumChain` (EIP-3085) and `eth_chainId` (EIP-695) all specify the same thing:
+ * a 0x-prefixed, **unpadded**, non-zero hexadecimal string. Chain 1 is `0x1`. Never `0x01`.
+ *
+ * ⛔ Never `toBeHex()` for a chain id. ethers pads a quantity to whole BYTES — `toBeHex(1)` is
+ * `"0x01"`, `toBeHex(10)` `"0x0a"`, `toBeHex(999)` `"0x03e7"`, `toBeHex(1514)` `"0x05ea"`,
+ * `toBeHex(1776)` `"0x06f0"` — which is right on the EVM wire and wrong for this parameter.
+ *
+ * Paid for on 2026-09-10 on a real wallet on pgas.me: the admin pressed Deposit while already on
+ * Ethereum, we sent `{chainId:"0x01"}`, the wallet compared the string it was given against the
+ * ones it holds, did not find it, and answered "unrecognized chain" (4902) — so our own 4902 branch
+ * politely offered to ADD Ethereum mainnet to a wallet that has had it since it was installed.
+ * ("When I click Deposit, you ask me to Add ETH Network, but I have it.") MetaMask's family does not
+ * even get that far: it refuses `"0x01"` with -32602 *"Expected 0x-prefixed, unpadded, non-zero
+ * hexadecimal string"*, so on those wallets the Deposit button simply could not switch chains.
+ *
+ * The read side is deliberately the opposite shape: `parseChainId` in `lib/wallet.ts` accepts every
+ * form a wallet might answer with (`'0x1'`, `'0x01'`, `1`, `'1'`, bigint). Strict out, tolerant in.
+ */
+export function chainIdHex(chainId: number): string {
+  if (!Number.isInteger(chainId) || chainId <= 0) throw new Error(`Pgas.me was handed something that is not a chain id: ${chainId}`);
+  return '0x' + chainId.toString(16);
+}
+
 export interface ChainMeta {
   chainName: string;
   nativeCurrency: { name: string; symbol: string; decimals: number };

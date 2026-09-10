@@ -24,8 +24,7 @@ const STEPS = [
  * (`route`); everywhere else the flag decides, and the cross-chain sentence stays whenever the
  * cross-chain order is what a deposit would use.
  */
-const UNISWAP_STEP =
-  'A Uniswap V4 swap on Ethereum whose Pgas hook locks the output in the Beam bridge in the same transaction.';
+const UNISWAP_STEP = 'A Uniswap V4 swap on Ethereum whose Pgas hook locks the output in the Beam bridge in the same transaction.';
 
 function steps(route: 'uniswap' | 'xchain'): string[] {
   if (route !== 'uniswap') return STEPS;

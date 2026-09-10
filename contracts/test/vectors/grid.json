@@ -1,0 +1,271 @@
+{
+  "_": "Golden vectors for the Beam pipe grid / relayer-fee split. Consumed by the Solidity suite (contracts/test/PipeSplit.t.sol) AND by the Python suite. Two implementations of one fact will disagree and one of them reaches money, so neither owns the truth: this file does. Algorithm: value = floor((amount - minRelayerFee) / grid) * grid; relayerFee = amount - value; refuse when grid < 1, when amount <= minRelayerFee, or when value would be 0. grid = 10**(decimals-8): 1e10 for ETH and DAI, 1 for WBTC and USDT.",
+  "count": 16,
+  "vectors": [
+    {
+      "name": "eth_measured_fork_output",
+      "note": "the exact swap output of 50 USDC at mainnet block 25,942,000; matches the real EthPipe log",
+      "amount": "20094131394204378",
+      "min_relayer_fee": "70000000000",
+      "grid": "10000000000",
+      "revert": "",
+      "value": "20094060000000000",
+      "relayer_fee": "71394204378"
+    },
+    {
+      "name": "eth_exact_grid_multiple",
+      "note": "1 ETH with a one-grid-step fee: no tail at all",
+      "amount": "1000000000000000000",
+      "min_relayer_fee": "10000000000",
+      "grid": "10000000000",
+      "revert": "",
+      "value": "999999990000000000",
+      "relayer_fee": "10000000000"
+    },
+    {
+      "name": "eth_one_wei_under_multiple",
+      "note": "one wei under a whole ETH: the whole sub-grid tail rides on the fee",
+      "amount": "999999999999999999",
+      "min_relayer_fee": "0",
+      "grid": "10000000000",
+      "revert": "",
+      "value": "999999990000000000",
+      "relayer_fee": "9999999999"
+    },
+    {
+      "name": "eth_tail_is_exactly_one_wei",
+      "note": "the smallest mintable ETH deposit: one grid step plus one wei of fee",
+      "amount": "10000000001",
+      "min_relayer_fee": "1",
+      "grid": "10000000000",
+      "revert": "",
+      "value": "10000000000",
+      "relayer_fee": "1"
+    },
+    {
+      "name": "eth_amount_equals_min_fee",
+      "note": "nothing is left for the bridge; must refuse, never send a zero-value message",
+      "amount": "70000000000",
+      "min_relayer_fee": "70000000000",
+      "grid": "10000000000",
+      "revert": "AmountBelowRelayerFee",
+      "value": "0",
+      "relayer_fee": "0"
+    },
+    {
+      "name": "eth_amount_is_min_fee_plus_one",
+      "note": "one wei over the fee is still under one grid step: unmintable, must refuse",
+      "amount": "70000000001",
+      "min_relayer_fee": "70000000000",
+      "grid": "10000000000",
+      "revert": "NothingMintable",
+      "value": "0",
+      "relayer_fee": "0"
+    },
+    {
+      "name": "eth_dust_below_one_grid_step",
+      "note": "a whole deposit smaller than one groth: unmintable, must refuse",
+      "amount": "9999999999",
+      "min_relayer_fee": "0",
+      "grid": "10000000000",
+      "revert": "NothingMintable",
+      "value": "0",
+      "relayer_fee": "0"
+    },
+    {
+      "name": "eth_large_100",
+      "note": "100 ETH with a ragged tail",
+      "amount": "100000000000123456789",
+      "min_relayer_fee": "70000000000",
+      "grid": "10000000000",
+      "revert": "",
+      "value": "99999999930000000000",
+      "relayer_fee": "70123456789"
+    },
+    {
+      "name": "dai_18dec_ragged",
+      "note": "DAI shares ETH's grid; the fee floor is far larger and the tail still rides on it",
+      "amount": "5000000000000012345",
+      "min_relayer_fee": "30000000000000",
+      "grid": "10000000000",
+      "revert": "",
+      "value": "4999970000000000000",
+      "relayer_fee": "30000000012345"
+    },
+    {
+      "name": "eth_zero_min_fee",
+      "note": "a zero fee quote is legal for PipeSplit; the hook's own floor is what refuses it",
+      "amount": "12345678901234567890",
+      "min_relayer_fee": "0",
+      "grid": "10000000000",
+      "revert": "",
+      "value": "12345678900000000000",
+      "relayer_fee": "1234567890"
+    },
+    {
+      "name": "wbtc_no_grid",
+      "note": "0.001 WBTC: grid 1, so the floor is a no-op and value is amount - fee exactly",
+      "amount": "100000",
+      "min_relayer_fee": "10",
+      "grid": "1",
+      "revert": "",
+      "value": "99990",
+      "relayer_fee": "10"
+    },
+    {
+      "name": "wbtc_min_plus_one",
+      "note": "one satoshi over the fee is mintable when the grid is 1",
+      "amount": "11",
+      "min_relayer_fee": "10",
+      "grid": "1",
+      "revert": "",
+      "value": "1",
+      "relayer_fee": "10"
+    },
+    {
+      "name": "wbtc_amount_equals_min",
+      "note": "equal is not enough: must refuse",
+      "amount": "10",
+      "min_relayer_fee": "10",
+      "grid": "1",
+      "revert": "AmountBelowRelayerFee",
+      "value": "0",
+      "relayer_fee": "0"
+    },
+    {
+      "name": "wbtc_one_satoshi_no_fee",
+      "note": "the smallest possible mint",
+      "amount": "1",
+      "min_relayer_fee": "0",
+      "grid": "1",
+      "revert": "",
+      "value": "1",
+      "relayer_fee": "0"
+    },
+    {
+      "name": "usdt_6dec_measured",
+      "note": "the fork's ETH 0.01 -> USDT output; 6 decimals scale UP to Beam's 8, so no tail exists",
+      "amount": "24710815",
+      "min_relayer_fee": "1000",
+      "grid": "1",
+      "revert": "",
+      "value": "24709815",
+      "relayer_fee": "1000"
+    },
+    {
+      "name": "grid_zero_refused",
+      "note": "a zero grid has no floor to apply; refuse rather than divide",
+      "amount": "1000",
+      "min_relayer_fee": "1",
+      "grid": "0",
+      "revert": "GridZero",
+      "value": "0",
+      "relayer_fee": "0"
+    }
+  ],
+  "fee_bounds_count": 4,
+  "fee_bounds": [
+    {
+      "name": "at_the_floor",
+      "note": "quote == minRelayerFee is accepted",
+      "out": "20094131394204378",
+      "quote": "10000000000",
+      "min_relayer_fee": "10000000000",
+      "max_relayer_fee_bps": "500",
+      "accept": true,
+      "revert": ""
+    },
+    {
+      "name": "one_wei_below_the_floor",
+      "note": "the floor is immutable; hookData may only raise it",
+      "out": "20094131394204378",
+      "quote": "9999999999",
+      "min_relayer_fee": "10000000000",
+      "max_relayer_fee_bps": "500",
+      "accept": false,
+      "revert": "RelayerFeeBelowFloor"
+    },
+    {
+      "name": "exactly_at_the_bps_ceiling",
+      "note": "quote*10000 == out*maxBps is accepted",
+      "out": "1000000000000000000",
+      "quote": "50000000000000000",
+      "min_relayer_fee": "10000000000",
+      "max_relayer_fee_bps": "500",
+      "accept": true,
+      "revert": ""
+    },
+    {
+      "name": "one_wei_over_the_bps_ceiling",
+      "note": "a relayer cannot be quoted more than the ceiling",
+      "out": "1000000000000000000",
+      "quote": "50000000000000001",
+      "min_relayer_fee": "10000000000",
+      "max_relayer_fee_bps": "500",
+      "accept": false,
+      "revert": "RelayerFeeAboveCeiling"
+    }
+  ],
+  "_realized_fee_bounds": "ADDED 2026-09-10. `fee_bounds` above pins the hook's PRE-split checks, which bound the caller's QUOTE. They are not the numbers that move: what the relayer is actually paid is `relayer_fee = out - value = quote + ((out - quote) mod grid)`, and with the quote sitting on the ceiling the grid tail alone carries it past. These rows pin the POST-split check the hook now makes — `relayer_fee * 10000 <= out * max_relayer_fee_bps` — and are the rule the API's own quote builder must not exceed either. Every field is a decimal string; `value` and `relayer_fee` are what `split(out, quote, grid)` returns.",
+  "realized_fee_bounds_count": 4,
+  "realized_fee_bounds": [
+    {
+      "name": "quote_at_the_ceiling_the_tail_pushes_the_paid_fee_over",
+      "note": "the measured offline output; the quote is exactly on the 500 bps ceiling and passes, the realized fee is 500.0063 bps and must not",
+      "out": "9960069810399032",
+      "quote": "498003490519951",
+      "min_relayer_fee": "10000000000",
+      "grid": "10000000000",
+      "max_relayer_fee_bps": "500",
+      "value": "9462060000000000",
+      "relayer_fee": "498009810399032",
+      "accept": false,
+      "revert": "RealizedFeeAboveCeiling"
+    },
+    {
+      "name": "realized_fee_exactly_at_the_ceiling",
+      "note": "equal is accepted, on the realized number as on the quote",
+      "out": "20000000000000000000",
+      "quote": "1000000000000000000",
+      "min_relayer_fee": "100000000000",
+      "grid": "10000000000",
+      "max_relayer_fee_bps": "500",
+      "value": "19000000000000000000",
+      "relayer_fee": "1000000000000000000",
+      "accept": true,
+      "revert": ""
+    },
+    {
+      "name": "one_wei_of_output_puts_the_tail_over_the_ceiling",
+      "note": "one wei more output, the same quote: the tail is 1 wei and the ceiling is exceeded",
+      "out": "20000000000000000001",
+      "quote": "1000000000000000000",
+      "min_relayer_fee": "100000000000",
+      "grid": "10000000000",
+      "max_relayer_fee_bps": "500",
+      "value": "19000000000000000000",
+      "relayer_fee": "1000000000000000001",
+      "accept": false,
+      "revert": "RealizedFeeAboveCeiling"
+    },
+    {
+      "name": "no_grid_means_no_tail_realized_equals_quote",
+      "note": "WBTC/USDT: grid 1, so the realized fee IS the quote and the new check can never bite",
+      "out": "100000",
+      "quote": "10",
+      "min_relayer_fee": "10",
+      "grid": "1",
+      "max_relayer_fee_bps": "500",
+      "value": "99990",
+      "relayer_fee": "10",
+      "accept": true,
+      "revert": ""
+    }
+  ],
+  "_tariff": "The relayer's e2b tariff per asset, in the asset's Ethereum units, and the floor a route is registered with. ONE source for both sides: the API quotes from api/pgasme/config.py (min_relayer_fee_wei / _dai_units / _wbtc_units, read through ethpipe.min_relayer_fee_units) and contracts/script/PgasAddresses.sol registers the same numbers, asserted against this file by contracts/test/PgasAddresses.t.sol. A floor invented on one side is a second implementation of a price we are quoted.",
+  "tariff": {
+    "eth_min_relayer_fee_wei": "100000000000",
+    "dai_min_relayer_fee_units": "200000000000000",
+    "wbtc_min_relayer_fee_units": "1"
+  }
+}

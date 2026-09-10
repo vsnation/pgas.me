@@ -1,4 +1,4 @@
-"""BeamPay is the ONLY interface to the Beam wallet (CLAUDE.md law 10) — the tests for that.
+"""BeamPay is the ONLY interface to the Beam wallet (operating law 10) — the tests for that.
 
 Four things this file is here to keep true, each of which is a way money or accounting is lost:
 

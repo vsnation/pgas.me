@@ -124,15 +124,22 @@ export class MockApi {
   directEnabled = true;
   instantEnabled = false;
   /**
-   * `ingress:{uniswap,xchain}` as the API publishes it on `/assets` and `/health`.
+   * `ingress:{uniswap, xchain, direct, uniswap_tokens}` as the API publishes it on `/dex/assets`
+   * (with the pairs) and `/health` (without), and `uniswap`/`xchain` inside `/account.ingress`.
    *
    * Both start where the suite's existing journeys live — the pre-Uniswap world — for the same
    * reason `armed` starts false: a test states the world it is exercising. A test of the Uniswap
-   * ingress sets `uniswapEnabled = true`, and `uniswapEnabled = false` IS the "flag off → the old
-   * behaviour" case that the rest of the suite proves on every run.
+   * ingress sets `uniswapEnabled = true`, and `uniswapEnabled = false` IS the "the API says the
+   * path is closed" case that the rest of the suite proves on every run.
    */
   uniswapEnabled = false;
   xchainEnabled = true;
+  /**
+   * An API build that publishes NO flags anywhere: `/dex/assets` and `/health` are 404, `/assets`
+   * carries the asset registry only, and the account's `ingress` is the old `{armed, near}`. That
+   * is today's live API, and the client must land on the defaults (lib/ingress.ts) — Uniswap off.
+   */
+  silentIngress = false;
   /** The pairs a gateway pool is registered for; the client narrows its token list to these. */
   uniswapTokens = ['ETH', 'WETH', 'USDC', 'USDT', 'DAI', 'WBTC'];
   /** What the quoter says this size costs on the inner pool (0 when nothing is swapped). */
@@ -333,15 +340,23 @@ export class MockApi {
     return route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
   }
 
-  /** The one place the flags are stated, so both public reads say the same thing. */
-  private ingress() {
+  /** The one place the flags are stated, so every read that carries them says the same thing. */
+  private ingress(withTokens = false) {
     return {
-      armed: this.armed,
-      near: false,
       uniswap: this.uniswapEnabled,
       xchain: this.xchainEnabled,
-      uniswap_tokens: this.uniswapTokens,
+      // published by the API, read by nothing in the client — a key it must simply carry past
+      direct: true,
+      ...(withTokens ? { uniswap_tokens: this.uniswapTokenRows() } : {}),
     };
+  }
+
+  /** `uniswap_tokens` in the live shape: the registered pairs, by address. */
+  private uniswapTokenRows() {
+    return this.uniswapTokens
+      .map((sym) => TOKENS.find((t) => t.symbol.toLowerCase() === sym.toLowerCase()))
+      .filter((t): t is (typeof TOKENS)[number] => !!t)
+      .map((t) => ({ address: t.address, symbol: t.symbol, decimals: t.decimals }));
   }
 
   private account() {
@@ -353,7 +368,11 @@ export class MockApi {
       denominations: [1000000, 10000000],
       min_payout_groth: this.minAmountGroth,
       modes: { direct: this.directEnabled, instant: this.instantEnabled },
-      ingress: this.ingress(),
+      ingress: {
+        armed: this.armed,
+        near: false,
+        ...(this.silentIngress ? {} : { uniswap: this.uniswapEnabled, xchain: this.xchainEnabled }),
+      },
       deposits: this.deposits,
       requests: this.requests,
       destinations: 1, // the signed-in wallet is still auto-listed; the app no longer reads the list
@@ -420,8 +439,17 @@ export class MockApi {
     if (method === 'GET' && path === '/dex/chains') return this.json(route, 200, { chains: CHAINS });
     if (method === 'GET' && path === '/dex/tokens')
       return this.json(route, 200, { tokens: tokensFor(Number(url.searchParams.get('chain_id'))) });
-    if (method === 'GET' && path === '/assets') return this.json(route, 200, { assets: ASSETS, ingress: this.ingress() });
-    if (method === 'GET' && path === '/health')
+    // The asset registry has never carried the flags; the client reads it here anyway, because an
+    // API build that puts them here instead must still be understood.
+    if (method === 'GET' && path === '/assets') return this.json(route, 200, { assets: ASSETS });
+    // Where the 2026-09-10 API publishes them, pairs and all. `silentIngress` is the build that
+    // has no such route at all: 404, and the client is left with its defaults.
+    if (method === 'GET' && path === '/dex/assets') {
+      if (this.silentIngress) return this.json(route, 404, { detail: 'Not Found' });
+      return this.json(route, 200, { assets: ASSETS, ingress: this.ingress(true) });
+    }
+    if (method === 'GET' && path === '/health') {
+      if (this.silentIngress) return this.json(route, 404, { detail: 'Not Found' });
       return this.json(route, 200, {
         ok: true,
         version: 'test',
@@ -430,6 +458,7 @@ export class MockApi {
         paused: false,
         ingress: this.ingress(),
       });
+    }
     if (!locked()) return;
 
     if (method === 'GET' && path === '/account') return this.json(route, 200, this.account());
@@ -842,6 +871,7 @@ export async function installMockPrices(page: Page) {
 //   utf8Sign            — personal_sign refuses the EIP-191 hex message with -32602 (Coin98, Binance)
 //   reversedSignParams  — personal_sign wants [address, message] (in-app browsers)
 //   unknownChain        — wallet_switchEthereumChain answers 4902 until the chain has been added
+//   strictChainString   — the chainId parameter is looked up as TEXT, never parsed (2026-09-10)
 //   rejectSwitch        — the user presses Cancel: 4001
 //   emptyAccounts       — a locked wallet answers eth_requestAccounts with [] instead of throwing
 //   zeroBalance         — the wallet's own RPC answers 0 for a balance that is not 0 (Zerion)
@@ -852,6 +882,7 @@ export type WalletQuirk =
   | 'utf8Sign'
   | 'reversedSignParams'
   | 'unknownChain'
+  | 'strictChainString'
   | 'rejectSwitch'
   | 'emptyAccounts'
   | 'zeroBalance'
@@ -874,6 +905,12 @@ export interface MockWalletProfile {
   inProviders?: boolean;
   accounts?: string[];
   chainId?: number;
+  /**
+   * The chains this wallet HOLDS, the way a real install holds a list. Absent means "every chain
+   * the app can ask for", which is what every profile written before 2026-09-10 assumed; give it a
+   * list to exercise a chain the wallet genuinely does not have (→ 4902 → wallet_addEthereumChain).
+   */
+  knownChains?: number[];
   quirks?: WalletQuirk[];
   /** Announce this late (ms). 0/undefined = with the first `eip6963:requestProvider`. */
   announceDelayMs?: number;
@@ -959,8 +996,34 @@ export const LEGACY_PROFILES: MockWalletProfile[] = [
 export const ALL_PROFILES: MockWalletProfile[] = [...ANNOUNCED_PROFILES, ...LEGACY_PROFILES];
 
 /**
+ * The wallet from the 2026-09-10 bug report — "When I click Deposit, you ask me to Add ETH Network,
+ * but I have it." — deliberately NOT in ALL_PROFILES: it is a behaviour family, not a twelfth
+ * install, and the picker tests count installs.
+ *
+ * WHICH shipped wallet it was is not known (the admin was on a real wallet on pgas.me and said what
+ * it did, not what it was). What IS known is the behaviour, and the behaviour is the thing that
+ * breaks a dapp: `wallet_switchEthereumChain` is answered by comparing the chainId string it was
+ * handed against the ones it holds, with no EIP-3326 validation. So a padded "0x01" is not refused
+ * as invalid — it is simply not found, the wallet answers 4902, and the dapp's own "your wallet does
+ * not know this chain" branch offers to add Ethereum mainnet to a wallet that has always had it.
+ * It starts on BNB Smart Chain so a switch to Ethereum is actually asked for.
+ */
+export const STRICT_CHAIN_PROFILE: MockWalletProfile = {
+  key: 'strictchain',
+  name: 'String-Compare Wallet',
+  rdns: 'me.pgas.strictchain',
+  color: '#8A5CF6',
+  flags: { isMetaMask: true },
+  global: 'ethereum',
+  chainId: 56,
+  knownChains: [1, 56, 42161, 8453],
+  quirks: ['strictChainString'],
+};
+
+/**
  * Installs one EIP-1193 provider per profile. Each gets a handle at `window.__wallets[key]`:
- *   .state       { accounts, chainId, sent[], signCalls[][], signed, addedChains[], locked }
+ *   .state       { accounts, chainId, sent[], signCalls[][], signed, switchCalls[], addCalls[],
+ *                  addedChains[], addedChainStrings[], locked }
  *   .setAccounts(list)  → emits accountsChanged
  *   .setChain(id)       → emits chainChanged (the wallet doing it, not us asking)
  *   .hiccup()           → emits `disconnect` with the account still connected
@@ -1006,12 +1069,45 @@ export async function installWallets(page: Page, profiles: MockWalletProfile[] =
           signCalls: [] as any[][],
           signed: 0,
           addedChains: [] as number[],
+          /** The chainId STRINGS the adds arrived with — what a string-comparing wallet remembers. */
+          addedChainStrings: [] as string[],
           addCalls: [] as any[],
           switchCalls: [] as any[],
           locked: q('emptyAccounts'),
         };
         const emit = (ev: string, ...args: unknown[]) => (listeners[ev] ?? []).forEach((l) => l(...args));
         const accountsOut = () => (state.locked ? [] : q('lowercase') ? state.accounts.map((a) => a.toLowerCase()) : state.accounts);
+
+        // ---- the chain id on the wire (2026-09-10) ----
+        // EIP-695, EIP-3085 and EIP-3326 all specify ONE form: 0x-prefixed, unpadded, non-zero hex.
+        // This is MetaMask's own test for it, verbatim. Until 2026-09-10 this mock read the parameter
+        // with a bare parseInt(), which accepts "0x01" happily — so it shipped a real bug: the app
+        // sent ethers' toBeHex(1) = "0x01", the admin's wallet did not recognise it, and the app
+        // offered to ADD Ethereum to a wallet that already had it. A mock that parses what real
+        // wallets validate is a mock that certifies the bug.
+        const CANONICAL_CHAIN_ID = /^0x[1-9a-f]+[0-9a-f]*$/i;
+        const chainHex = (n: number) => '0x' + n.toString(16);
+        /** MetaMask's wording, because 'unpadded' is the word an operator will grep for. */
+        const badChainId = (raw: unknown) =>
+          rpcErr(-32602, `Expected 0x-prefixed, unpadded, non-zero hexadecimal string 'chainId'. Received:\n${String(raw)}`);
+        /** The validating family: parse the id, then look it up among the chains this wallet holds. */
+        const knowsNumber = (id: number) => {
+          if (state.addedChains.includes(id)) return true;
+          if (q('unknownChain')) return false; // knows nothing until the dapp adds it
+          return spec.knownChains ? spec.knownChains.includes(id) : true;
+        };
+        /**
+         * The string-comparing family — the one the admin was on. The parameter is never parsed:
+         * it is matched as text against the ids this wallet holds, so a padded "0x01" is not
+         * "invalid", it is simply *not found*, and the wallet answers 4902 exactly as it would for
+         * a chain it has never heard of. That is the whole shape of the 2026-09-10 bug.
+         */
+        const knowsString = (raw: string) => {
+          if (state.addedChainStrings.includes(raw)) return true;
+          if (q('unknownChain')) return false;
+          return spec.knownChains ? spec.knownChains.map((n: number) => chainHex(n)).includes(raw) : CANONICAL_CHAIN_ID.test(raw);
+        };
+
         const provider: any = {
           ...spec.flags,
           async request({ method, params }: { method: string; params?: any[] }) {
@@ -1020,24 +1116,33 @@ export async function installWallets(page: Page, profiles: MockWalletProfile[] =
               case 'eth_accounts':
                 return accountsOut();
               case 'eth_chainId':
-                return '0x' + state.chainId.toString(16);
+                return chainHex(state.chainId);
               case 'net_version':
                 return String(state.chainId);
               case 'wallet_switchEthereumChain': {
-                const target = parseInt(params?.[0]?.chainId, 16);
+                const raw = String(params?.[0]?.chainId);
                 state.switchCalls.push(params?.[0]);
                 if (q('rejectSwitch')) throw rpcErr(4001, 'User rejected the request.');
-                if (q('unknownChain') && !state.addedChains.includes(target))
+                const strict = q('strictChainString');
+                // The validating family never gets as far as the lookup: a padded id is bad params.
+                if (!strict && !CANONICAL_CHAIN_ID.test(raw)) throw badChainId(raw);
+                if (!(strict ? knowsString(raw) : knowsNumber(parseInt(raw, 16))))
                   throw rpcErr(4902, 'Unrecognized chain ID. Try adding the chain using wallet_addEthereumChain first.');
-                state.chainId = target;
-                emit('chainChanged', '0x' + state.chainId.toString(16));
+                state.chainId = parseInt(raw, 16);
+                emit('chainChanged', chainHex(state.chainId));
                 return null;
               }
-              case 'wallet_addEthereumChain':
+              case 'wallet_addEthereumChain': {
                 // MetaMask-family behaviour: the chain is added, the switch is a second call
+                const raw = String(params?.[0]?.chainId);
                 state.addCalls.push(params?.[0]);
-                state.addedChains.push(parseInt(params?.[0]?.chainId, 16));
+                if (!q('strictChainString') && !CANONICAL_CHAIN_ID.test(raw)) throw badChainId(raw);
+                state.addedChains.push(parseInt(raw, 16));
+                // …and the string-comparing wallet remembers the TEXT it was given, so a dapp that
+                // added chain 1 as "0x01" can then switch to "0x01" — the prompt was the whole cost.
+                state.addedChainStrings.push(raw);
                 return null;
+              }
               case 'eth_getBalance':
                 return '0x0'; // zeroBalance: what Zerion answered for a wallet that was not empty
               case 'eth_blockNumber':
@@ -1107,7 +1212,7 @@ export async function installWallets(page: Page, profiles: MockWalletProfile[] =
           },
           setChain(id: number) {
             state.chainId = id;
-            emit('chainChanged', '0x' + id.toString(16));
+            emit('chainChanged', chainHex(id));
           },
           /** An RPC hiccup: the wallet says `disconnect` and stays connected. */
           hiccup() {

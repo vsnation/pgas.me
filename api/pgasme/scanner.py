@@ -26,13 +26,21 @@ order scanner in the reference implementation, ported):
     the router's FulfilledOrder log in the same receipt decoded → orderId → the deposit / quote; if the
     id is unknown, the metadata tag (bytes[45:50] of rawOrderMetadataHex from the router's stats API,
     retried because the router indexes with delay) is matched against `quotes.metadata`;
-  * a receipt with NO FulfilledOrder log is not automatically foreign: a `direct` deposit (the
-    user called the pipe themselves on Ethereum, no cross-chain order in the story) is looked up by its own
-    registered `src_tx_hash`. Only after that fails is the lock unattributed;
+  * a receipt with NO FulfilledOrder log is not automatically foreign. Two other stories end
+    there: a `uniswap` gateway deposit, whose receipt carries OUR hook's own `PgasDeposit(ref,
+    payer, …)` log — the reference finds the deposit (or the quote, when the user signed and
+    never registered the hash) and the payer is what makes it theirs; and a `direct` deposit
+    (the user called the pipe themselves), looked up by its own registered `src_tx_hash`. Only
+    after both fail is the lock unattributed;
   * sanity before any state change: the lock's amount == the quote's value_units, the pipe is
     the asset's pipe, and for a `direct` deposit the receipt's `from` is the wallet that asked
-    for the quote (the hash alone is public — the sender is what makes it the user's). A lock to our pubkey that nobody can be attributed to goes to
-    `unattributed_locks` and pages the operator — it is never credited to anyone.
+    for the quote (the hash alone is public — the sender is what makes it the user's). A
+    `uniswap` deposit is the one whose amount is NOT known in advance — the hook splits the real
+    swap output — so there the check is a BAND (`uniswap.value_band`), plus the hook's `value`
+    and the pipe's `amount` having to be the same number in the same receipt, and the credit
+    takes the pipe log's amount rather than the estimate. A lock to our pubkey that nobody can
+    be attributed to goes to `unattributed_locks` and pages the operator — it is never credited
+    to anyone.
 """
 
 from __future__ import annotations
@@ -45,8 +53,8 @@ from typing import Any
 from eth_abi import decode
 from eth_utils import keccak
 
-from . import ethpipe, tg, xchain
-from .assets import ASSETS, Asset
+from . import ethpipe, tg, uniswap, xchain
+from .assets import ASSETS, Asset, to_groth
 from .config import settings
 from .db import db
 
@@ -73,6 +81,7 @@ RETRY_BACKOFF_S = 120.0
 RETRY_BACKOFF_MAX_S = 3600.0
 RETRY_MAX_TRIES = 12
 DEPOSIT_HASH_INDEX = "uniq_src_tx_hash"
+DEPOSIT_REF_INDEX = "uniq_deposit_ref"
 # an endpoint whose logs lag its own head is skipped for this long (prod: flashbots, every pass)
 ENDPOINT_COOLDOWN_S = 300.0
 _endpoints: dict[str, Any] = {"bad": {}, "sticky": None}
@@ -119,6 +128,19 @@ async def ensure_indexes() -> None:
         partialFilterExpression={"src_tx_hash": {"$type": "string"}},
         name=DEPOSIT_HASH_INDEX,
     )
+    # …and ONE deposit per Uniswap deposit reference, for the same reason: the reference is how
+    # a pipe lock with no cross-chain fill is matched back to a row, and two rows sharing one
+    # would make that match ambiguous exactly when money has already landed. Partial for the
+    # same reason too — every other mode has no reference at all.
+    await db().deposits.create_index(
+        "deposit_ref",
+        unique=True,
+        partialFilterExpression={"deposit_ref": {"$type": "string"}},
+        name=DEPOSIT_REF_INDEX,
+    )
+    # the quote side is a LOOKUP, not a guarantee: a lock may arrive before the user ever
+    # registered the hash, and the reference is then the only way back to the account.
+    await db().quotes.create_index("deposit_ref")
 
 
 # ----------------------------------------------------------------------------- decoding
@@ -366,6 +388,82 @@ def _sane(doc: dict[str, Any], value_units: int, m: dict[str, Any], asset: Asset
     return None
 
 
+def _payer_ok(doc: dict[str, Any], hooked: dict[str, Any]) -> str | None:
+    """The hook names the payer it attributed the deposit to. `hookData` is caller-controlled —
+    anyone may copy someone else's reference into their own call — so the reference alone is a
+    HINT and the payer is what makes the lock this account's (§IDENTITY-BEATS-BALANCE)."""
+    want = (doc.get("address") or "").lower()
+    if not want:
+        return "cannot check the payer: the row carries no wallet address"
+    if hooked["payer"].lower() != want:
+        return (
+            f"payer mismatch: the hook attributed this deposit to {hooked['payer']}, not to the "
+            "wallet that asked for the quote"
+        )
+    return None
+
+
+def _sane_uniswap(
+    doc: dict[str, Any], m: dict[str, Any], asset: Asset, hooked: dict[str, Any]
+) -> str | None:
+    """Is this pipe lock what the gateway deposit we quoted would have produced?
+
+    Unlike `direct` / `xchain`, the amount is NOT known in advance: the hook splits the REAL
+    swap output. So the check is a band, not an equality (uniswap.value_band is the one
+    implementation of it), plus two facts that must hold exactly: the hook's own `value` and the
+    pipe's `amount` are the same number in the same receipt, and that number sits on the asset's
+    grid. Anything outside goes to `unattributed_locks` and pages — it is never credited."""
+    if doc.get("asset") != asset.key:
+        return f"asset mismatch: lock on the {asset.key} pipe, quote for {doc.get('asset')}"
+    if m["address"].lower() != asset.pipe.lower():
+        return "pipe mismatch"
+    if hooked["value"] != m["amount"]:
+        return (
+            f"the hook logged value {hooked['value']} and the pipe logged {m['amount']} in one "
+            "receipt — they must be the same number"
+        )
+    if asset.grid > 1 and m["amount"] % asset.grid:
+        return f"lock {m['amount']} is not a multiple of the {asset.key} grid {asset.grid}"
+    try:
+        lo, hi = uniswap.value_band(
+            int(doc["min_out_units"]),
+            int(doc["out_units"]),
+            int(doc["relayer_fee_quote_units"]),
+            asset,
+        )
+    except (KeyError, TypeError, ValueError, ethpipe.SplitError) as e:
+        # A row that cannot say what it expected cannot vouch for what arrived. Fail closed.
+        return f"cannot check the amount against the quote ({type(e).__name__}: {e})"
+    if not lo <= m["amount"] <= hi:
+        return f"lock {m['amount']} is outside the quoted band [{lo}, {hi}]"
+    return None
+
+
+async def _attribute_uniswap(
+    hooked: list[dict[str, Any]], m: dict[str, Any], asset: Asset
+) -> tuple[dict[str, Any] | None, str, str]:
+    """A pipe lock whose receipt carries OUR hook's `PgasDeposit`: the reference names the row.
+
+    The deposit row is the normal case (the user registered the hash). A QUOTE is the case
+    where they signed and never came back — the money is in the pipe either way, and a deposit
+    the user never registered must still reach them (`lock_deposit` opens the row)."""
+    d = db()
+    reasons: list[str] = []
+    for h in hooked:
+        for coll, how in ((d.deposits, "deposit"), (d.quotes, "quote")):
+            doc = await coll.find_one({"mode": uniswap.MODE, "deposit_ref": h["ref"]})
+            if not doc:
+                continue
+            why = _payer_ok(doc, h) or _sane_uniswap(doc, m, asset, h)
+            if why:
+                reasons.append(why)
+                break
+            return doc, how, ""
+        else:
+            reasons.append(f"no deposit or quote carries the hook reference {h['ref']}")
+    return None, "", "; ".join(reasons)
+
+
 def _direct_sender_ok(dep: dict[str, Any], receipt: dict[str, Any] | None) -> str | None:
     """A registered hash is public information. For a `direct` deposit the claim is only the
     user's if the transaction was SENT by the wallet that asked for the quote."""
@@ -390,9 +488,14 @@ async def attribute(
     """→ (doc, 'deposit'|'quote', reason). doc is None when nothing can be attributed."""
     d = db()
     if not fulfilled:
-        # No cross-chain fill in this receipt. A `direct` deposit IS the pipe call, so the transaction the
-        # client registered is the transaction we are looking at — that hash plus the sender is
-        # the whole claim.
+        # No cross-chain fill in this receipt. Two other stories end here, and both are proven
+        # by something in THIS receipt rather than by the amount:
+        #   * a `uniswap` gateway deposit — our hook's own PgasDeposit log names the reference;
+        #   * a `direct` deposit — the pipe call IS the transaction the client registered, so
+        #     that hash plus the sender is the whole claim.
+        hooked = uniswap.find_deposits_in_receipt(receipt or {})
+        if hooked:
+            return await _attribute_uniswap(hooked, m, asset)
         dep = await d.deposits.find_one(
             {"mode": "direct", "src_tx_hash": (m.get("tx") or "").lower()}
         )
@@ -443,6 +546,7 @@ async def lock_deposit(
     deposit row (the user signed but never registered the hash) gets its deposit created here."""
     d = db()
     now = time.time()
+    mode = xchain.norm_mode(doc.get("mode"))
     lock_fields = {
         "eth.tx": m["tx"],
         "eth.block": m["block"],
@@ -452,6 +556,17 @@ async def lock_deposit(
         "locked_at": now,
         "updated_at": now,
     }
+    if mode == uniswap.MODE:
+        # ⛔ THE PIPE LOG IS THE MONEY. A gateway deposit is worth what the swap actually paid,
+        # never what we quoted: the hook splits the REAL output on-chain. The estimate is kept
+        # beside it as evidence, and `_sane_uniswap` has already refused anything outside the
+        # band this quote could produce.
+        lock_fields |= {
+            "eth.value_units": str(m["amount"]),
+            "eth.relayer_fee_units": str(m["relayer_fee"]),
+            "value_groth": to_groth(int(m["amount"]), asset),
+            "value_groth_quoted": int(doc.get("value_groth") or 0),
+        }
     fill = next((f for f in fulfilled or () if f["order_id"] == doc.get("order_id")), None)
     if fill:
         lock_fields["eth.fill_units"] = str(fill["actual_fulfill_amount"])
@@ -459,10 +574,19 @@ async def lock_deposit(
         dep = await d.deposits.find_one({"quote_id": doc["_id"]})
         if dep is None:
             deposit_id = secrets.token_hex(12)
+            # what the LOG says for a gateway deposit, what the quote says for every other mode
+            value_units = int(m["amount"]) if mode == uniswap.MODE else int(doc["value_units"])
+            relayer_fee = (
+                str(m["relayer_fee"]) if mode == uniswap.MODE else doc["relayer_fee_units"]
+            )
             await d.deposits.insert_one(
                 {
                     "_id": deposit_id,
                     "account_id": doc["account_id"],
+                    # the mode this deposit really is: a row created here used to carry none,
+                    # which reads as the cross-chain mode and is only right for that one.
+                    "mode": mode,
+                    "address": doc.get("address"),
                     "asset": doc["asset"],
                     "status": "submitted",
                     "src": {
@@ -473,11 +597,21 @@ async def lock_deposit(
                     "quote_id": doc["_id"],
                     "src_tx_hash": None,
                     "order_id": doc.get("order_id"),
+                    "deposit_ref": doc.get("deposit_ref"),
+                    "route": doc.get("route"),
+                    "out_units": doc.get("out_units"),
+                    "min_out_units": doc.get("min_out_units"),
+                    "relayer_fee_quote_units": doc.get("relayer_fee_quote_units"),
                     "eth": {
-                        "value_units": doc["value_units"],
-                        "relayer_fee_units": doc["relayer_fee_units"],
+                        "value_units": str(value_units),
+                        "relayer_fee_units": relayer_fee,
                     },
-                    "value_groth": int(doc["value_groth"]),
+                    "value_groth": to_groth(value_units, asset),
+                    **(
+                        {"value_groth_quoted": int(doc["value_groth"])}
+                        if mode == uniswap.MODE
+                        else {}
+                    ),
                     "metadata": doc.get("metadata"),
                     "pubkey": doc.get("pubkey"),
                     "created_at": now,

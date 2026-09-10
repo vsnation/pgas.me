@@ -22,7 +22,7 @@ from conftest import USDC_ARB
 from test_quote_deposits import FakeRouter
 
 from pgasme import xchain
-from pgasme.config import LEGACY_CHAIN_ID_FIELD, LEGACY_MODE, Settings
+from pgasme.config import LEGACY_CHAIN_ID_FIELD, LEGACY_MODE, LEGACY_STATUS_FIELD, Settings
 
 ZERO = "0x0000000000000000000000000000000000000000"
 
@@ -116,3 +116,57 @@ async def test_a_quote_stored_under_the_old_names_still_arms(
     # neither the old nor the new internal field is published back to the client
     assert LEGACY_CHAIN_ID_FIELD not in body["estimate"]["src"]
     assert "route_chain_id" not in body["estimate"]["src"]
+
+
+async def test_a_deposit_stored_under_the_old_status_key_renders_as_route_status(
+    client, user, mock_db
+) -> None:
+    """The router's status field was renamed with everything else; rows written before it were
+    NOT (never edit history to fix a ledger). One reader maps it — `routers/account.public_deposit`,
+    which is what /v1/account and /v1/deposits/{id} both render through — and the old spelling
+    never reaches the wire."""
+    assert LEGACY_STATUS_FIELD == f"{LEGACY_MODE}_status"
+    now = time.time()
+    await mock_db["pgasme_test"].deposits.insert_one(
+        {
+            "_id": "legacy2",
+            "account_id": user["account_id"],
+            "asset": "ETH",
+            "mode": LEGACY_MODE,
+            "status": "credited",
+            LEGACY_STATUS_FIELD: "Fulfilled",
+            "src": {"chain_id": 42161, "token": ZERO, "amount": "1"},
+            "quote_id": "q0",
+            "eth": {"value_units": "1", "relayer_fee_units": "1"},
+            "value_groth": 1,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    one = (await client.get("/v1/deposits/legacy2", headers=user["headers"])).json()
+    assert one["route_status"] == "Fulfilled" and LEGACY_STATUS_FIELD not in one
+    acct = (await client.get("/v1/account", headers=user["headers"])).json()
+    row = next(d for d in acct["deposits"] if d["_id"] == "legacy2")
+    assert row["route_status"] == "Fulfilled" and LEGACY_STATUS_FIELD not in row
+    # the stored row is untouched: the alias is a read, not a migration
+    stored = await mock_db["pgasme_test"].deposits.find_one({"_id": "legacy2"})
+    assert stored[LEGACY_STATUS_FIELD] == "Fulfilled" and "route_status" not in stored
+    # …and a deposit that never had a router status gains no null one — a blank `route_status`
+    # would read as "unknown", not as "not applicable"
+    await mock_db["pgasme_test"].deposits.insert_one(
+        {
+            "_id": "plain1",
+            "account_id": user["account_id"],
+            "asset": "ETH",
+            "mode": "direct",
+            "status": "credited",
+            "src": {"chain_id": 1, "token": ZERO, "amount": "1"},
+            "quote_id": "q1",
+            "eth": {"value_units": "1", "relayer_fee_units": "1"},
+            "value_groth": 1,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    plain = (await client.get("/v1/deposits/plain1", headers=user["headers"])).json()
+    assert plain["mode"] == "direct" and "route_status" not in plain

@@ -6,7 +6,7 @@ import time
 
 from fastapi import APIRouter
 
-from .. import __version__, workers
+from .. import __version__, uniswap, workers
 from ..config import settings
 from ..db import db, index_error_labels, indexes_ok
 
@@ -63,7 +63,14 @@ async def health() -> dict:
         "dev_endpoints": settings.dev_endpoints_active,
         "indexes_ok": indexes_ok(),
         "index_errors": index_error_labels(),
+        # whether BeamPay's webhook can be delivered at all: with no token the route answers 503
+        # to every delivery and BeamPay's worker pages the operator on every failed attempt. The
+        # BOOLEAN only — the value is a credential and never leaves the process.
+        "beampay_webhook": bool(settings.beampay_webhook_token),
         "ingress_armed": settings.ingress_ready,
+        # which ways in this build will serve (booleans only — /v1/dex/assets carries the
+        # registry). ONE implementation behind this, /v1/dex/assets and /v1/account.
+        "ingress": uniswap.ingress_flags(),
         "ingress_assets": {k: settings.ingress_ready_for(k) for k in ("ETH", "DAI", "WBTC")},
         "ingress_near": settings.ingress_near_enabled,
         "payout_direct": settings.payout_direct_enabled,

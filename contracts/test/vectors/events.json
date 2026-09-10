@@ -1,0 +1,25 @@
+{
+  "_": "The two logs a deposit leaves, pinned for every reader on the other side of them. The API resolves a deposit from these and nothing else, so the ABI is a shared fact and not an implementation detail: neither side owns it, this file does. Read it (do not copy it) the way test/vectors/grid.json is read. WARNING: the draft signature in the build design document (bytes32,address,Currency,uint256,uint256,bytes) is NOT what is deployed - it is a different topic0 and a different field order.",
+  "pgas_deposit": {
+    "emitter": "the PgasIngressHook address",
+    "signature": "PgasDeposit(bytes32,address,address,uint256,address,uint256,uint256,bytes)",
+    "topic0": "0xd0e41515b729c9019d2f260f5fb9501b4fc547032008d04c4cdbfda6b788ae2b",
+    "topics": ["topic0", "ref (bytes32)", "payer (address)", "tokenIn (address, Currency)"],
+    "data": [
+      "amountIn (uint256)",
+      "target (address, Currency)",
+      "value (uint256)",
+      "relayerFee (uint256)",
+      "receiverBeamPubkey (bytes, 33)"
+    ]
+  },
+  "new_local_message": {
+    "emitter": "the Beam bridge pipe for the target asset",
+    "signature": "NewLocalMessage(uint64,uint256,uint256,bytes)",
+    "topic0": "0x5f52670be4e2f3d7b079180b485ab44712641a10d1c77e843355f96036608ac7",
+    "topics": ["topic0"],
+    "data": ["msgId (uint64)", "amount (uint256) - the MINTED value, not value+relayerFee", "relayerFee (uint256)", "receiver (bytes, 33)"]
+  },
+  "pairing": "ONE TRANSACTION MAY CARRY N DEPOSITS. The hook's re-entrancy guard blocks nesting, not a sequence: any caller can take the PoolManager lock itself and issue N swaps on a gateway pool inside one unlock, producing N PgasDeposit logs and N NewLocalMessage logs in one receipt - with a `ref` of its own choosing, repeated. The bridge's msgId cannot be carried in PgasDeposit (sendFunds returns nothing), so the only pairing key is log ORDER, and the rule is ORDINAL: within one receipt the k-th NewLocalMessage emitted by the TARGET PIPE belongs to the k-th PgasDeposit emitted by the hook, and the pipe log always comes first. It holds because each deposit emits exactly one of each in that order and no deposit can start inside another. It is NOT adjacency: on a native route the deposit log is the very next log, but on an ERC-20 route the allowance being cleared puts an Approval log between the two, so a reader written against logIndex+1 works on ETH and silently fails on DAI. Never pair on 'the first NewLocalMessage in the receipt'. contracts/test/PgasDepositPairing.t.sol holds both halves of this.",
+  "ref_is_not_an_authorisation": "`ref` is unauthenticated, forgeable and multi-emittable: it is copied out of caller-controlled hookData, no contract checks it, marks it used, or refuses a repeat, and `payer` is only as good as the router that reported it. Match a deposit on (ref, tx.from) - the sender is what makes the receipt the user's - and mark a ref spent only AFTER a credit succeeds, never on sighting, or a $1 deposit carrying a victim's ref burns their quote. The credited amount is the paired NewLocalMessage's `amount`, never the quote's estimate and never a PgasDeposit found by ref alone."
+}

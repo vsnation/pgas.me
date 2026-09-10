@@ -3,7 +3,7 @@
 // `useStore()` and nothing else; each slice is memoized so a render only re-runs when its own
 // inputs change.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { hexlify, toBeHex, toUtf8Bytes } from 'ethers';
+import { hexlify, toUtf8Bytes } from 'ethers';
 import {
   SESSION_EVENT,
   SESSION_EXPIRED_EVENT,
@@ -15,7 +15,7 @@ import {
   setSession,
   type Session,
 } from '../lib/api';
-import { CHAIN_META } from '../lib/chains';
+import { CHAIN_META, chainIdHex } from '../lib/chains';
 import { checksum, hexValue } from '../lib/format';
 import { ingressPartial, uniswapTokenList, type IngressPartial } from '../lib/ingress';
 import { buildSiweMessage } from '../lib/siwe';
@@ -250,7 +250,10 @@ function useWalletState(onDisconnect: () => void): WalletState {
   const switchChain = useCallback(async (target: number) => {
     const p = attached.current?.provider;
     if (!p) throw new Error('Connect a wallet first');
-    const hex = toBeHex(target);
+    // The canonical, unpadded EIP-3326/EIP-3085 form — `chainIdHex` and nothing else. A padded
+    // "0x01" is what made a wallet that already had Ethereum answer 4902 and land the user in the
+    // Add-chain branch below (see lib/chains.ts).
+    const hex = chainIdHex(target);
     const readChain = () => p.request({ method: 'eth_chainId' }).then(parseChainId, () => null);
     if ((await readChain()) === target) {
       setChainId(target);
@@ -611,20 +614,27 @@ function useDataState(): DataState {
     let alive = true;
     setLoading(true);
     void (async () => {
-      const [c, a, h] = await Promise.allSettled([api.chains(), api.assets(), api.health()]);
+      const [c, a, d, h] = await Promise.allSettled([api.chains(), api.assets(), api.dexAssets(), api.health()]);
       if (!alive) return;
       const errs: string[] = [];
       if (c.status === 'fulfilled') setChains(Array.isArray(c.value.chains) ? c.value.chains : []);
       else errs.push(`chains: ${errorText(c.reason)}`);
       if (a.status === 'fulfilled') setAssets(Array.isArray(a.value.assets) ? a.value.assets : []);
       else errs.push(`assets: ${errorText(a.reason)}`);
-      // The ingress flags are published on both reads; `/assets` wins where both state one, and a
-      // build with no `/health` route (or none of these keys) simply states nothing. It is never an
-      // error: the deposit paths have defaults, and a 404 here must not colour the page red.
-      const health = h.status === 'fulfilled' ? h.value : null;
+      /**
+       * The ingress flags, from wherever this API build publishes them: `/dex/assets` is where the
+       * 2026-09-10 API puts them (with the registered pairs), `/assets` and `/health` are read in
+       * case a build puts them there instead, and the account has the last word only when none of
+       * the three said anything (Deposit merges it in). A build that publishes none of it — or
+       * 404s these routes — states nothing, and nothing is exactly what it contributes: the
+       * defaults in lib/ingress.ts stand, and `uniswap` is off until an API says otherwise.
+       * None of this is an error, so none of it colours the page red.
+       */
+      const dex = d.status === 'fulfilled' ? d.value : null;
       const assetsPayload = a.status === 'fulfilled' ? a.value : null;
-      setIngress({ ...ingressPartial(health), ...ingressPartial(assetsPayload) });
-      setUniswapTokens(uniswapTokenList(assetsPayload) ?? uniswapTokenList(health));
+      const health = h.status === 'fulfilled' ? h.value : null;
+      setIngress({ ...ingressPartial(health), ...ingressPartial(assetsPayload), ...ingressPartial(dex) });
+      setUniswapTokens(uniswapTokenList(dex) ?? uniswapTokenList(assetsPayload) ?? uniswapTokenList(health));
       setError(errs.length ? errs.join(' · ') : null);
       setLoading(false);
     })();

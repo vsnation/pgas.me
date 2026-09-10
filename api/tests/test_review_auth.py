@@ -29,7 +29,7 @@ from pgasme import auth
 from pgasme import db as dbmod
 from pgasme.config import MIN_SECRET_CHARS, Settings, settings
 from pgasme.db import db, ensure_indexes, prune_quotes
-from pgasme.main import RedactDestinationPaths, create_app
+from pgasme.main import RedactAccessLog, create_app
 
 API_DIR = Path(__file__).resolve().parents[1]
 GOOD = "x" * MIN_SECRET_CHARS
@@ -347,7 +347,7 @@ async def test_the_path_route_still_works_for_shipped_clients(client, wallet):
 
 
 def test_the_access_log_does_not_keep_a_destination_beside_an_ip():
-    f = RedactDestinationPaths()
+    f = RedactAccessLog()
 
     def line(path: str) -> str:
         rec = logging.LogRecord(
@@ -367,3 +367,9 @@ def test_the_access_log_does_not_keep_a_destination_beside_an_ip():
     assert "<redacted>" in line(f"/v1/destinations/{addr}")
     assert "/v1/destinations/nonce" in line("/v1/destinations/nonce")
     assert "/v1/siwe/nonce" in line("/v1/siwe/nonce")
+    # BeamPay can only carry its credential in the URL, so the query of every /internal/ line
+    # is dropped — a token in an access log is a logged secret whoever wrote the route.
+    hook = "/internal/beampay/webhook"
+    assert "s3cr3t" not in line(f"{hook}?token=s3cr3t")
+    assert line(f"{hook}?token=s3cr3t").endswith(f'{hook}?<redacted> HTTP/1.1" 200')
+    assert f'{hook} HTTP/1.1" 200' in line(hook)  # no query: nothing to redact

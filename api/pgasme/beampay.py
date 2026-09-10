@@ -1,4 +1,4 @@
-"""BeamPay — the ONE interface to the Beam wallet's money (CLAUDE.md law 10).
+"""BeamPay — the ONE interface to the Beam wallet's money (operating law 10: BeamPay-only).
 
 Admin, 2026-09-09: *"Avoid using wallet-api. Only Beampay as it counts all balances."* Every
 balance, every transaction, every status, every address and every withdrawal on the Beam side

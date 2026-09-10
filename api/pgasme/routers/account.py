@@ -17,9 +17,9 @@ from typing import Any
 
 from fastapi import APIRouter
 
-from .. import auth, ledger, xchain
+from .. import auth, ledger, uniswap, xchain
 from ..assets import ASSETS
-from ..config import settings
+from ..config import LEGACY_STATUS_FIELD, settings
 from ..db import db
 
 router = APIRouter(prefix="/v1/account", tags=["account"])
@@ -68,6 +68,14 @@ def public_deposit(d: dict) -> dict:
     # ONE reader for the mode (xchain.norm_mode): rows written before the same-chain modes
     # existed carry none, and rows written before the rename carry the router's own name.
     d["mode"] = xchain.norm_mode(d.get("mode"))
+    # …and rows written before the rename carry the router's own name for the status field too.
+    # The STORED row is never rewritten (never edit history to fix a ledger); it is read here,
+    # once, for both this route and GET /v1/deposits/{id}, and the old spelling never reaches
+    # the wire. A row with neither key gains neither: a null `route_status` on a deposit that
+    # has no router status would read as "unknown", not as "not applicable".
+    legacy_status = d.pop(LEGACY_STATUS_FIELD, None)
+    if legacy_status is not None and not d.get("route_status"):
+        d["route_status"] = legacy_status
     return d
 
 
@@ -121,7 +129,14 @@ async def account(acct=auth.Account):
                 "direct": settings.payout_direct_enabled,
                 "instant": settings.payout_instant_enabled,
             },
-            "ingress": {"armed": settings.ingress_ready, "near": settings.ingress_near_enabled},
+            # `armed`/`near` as before, plus which ways in are open — the client reads the
+            # route flags here as well as from /v1/health, and both come from the ONE
+            # implementation in uniswap.ingress_flags().
+            "ingress": {
+                "armed": settings.ingress_ready,
+                "near": settings.ingress_near_enabled,
+                **{k: v for k, v in uniswap.ingress_flags().items() if k != "direct"},
+            },
             "deposits": [public_deposit(d) for d in deposits],
             "requests": [public_request(r) for r in requests],
             "destinations": dests,
