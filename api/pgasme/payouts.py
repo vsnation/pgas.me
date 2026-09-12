@@ -3085,7 +3085,12 @@ def inflight_pipeline(asset: Asset, exclude_rid: str | None = None) -> list[dict
     """The aggregation `inflight_groth` runs — exposed so a test can assert on the QUESTION,
     which is the only way to assert on a limit a mongomock double does not honour."""
     committed: list[dict[str, Any]] = [
-        {"status": {"$in": list(INFLIGHT)}},
+        # ⛔ A BOOKED BURN IS NOT IN FLIGHT (T56). `kernel_at` is stamped only after the kernel
+        # confirmed AND the ledger release was booked (BOOK FIRST, MARK SECOND), so by then the
+        # wallet's buckets and BeamPay's balance have both already fallen. Counted here as well,
+        # a `bridging` row waiting on the Ethereum side was subtracted twice for its whole ~1 h
+        # delivery (live 2026-09-11: 235,115 − 740,526 → every withdrawal refused).
+        {"status": {"$in": list(INFLIGHT)}, "kernel_at": {"$exists": False}},
         # ⛔ A HELD BURN IS STILL COMMITTED FLOAT. `_hold_for_a_human` moves an unresolved
         # release out of `releasing`, and a held release is BY DEFINITION one whose txid was
         # never captured — so it was never registered with BeamPay either, the flow booked to
@@ -5517,31 +5522,37 @@ async def _payout_bridging(row: dict[str, Any]) -> None:
     # of 171 contract txs are frozen at 0. Gating on that number meant every payout stopped
     # dead in `bridging` with the bETH burned and the ledger release already taken.
     #
-    # So a frozen 0 is treated as NO COUNT AVAILABLE — never as a real zero — and maturity is
-    # counted from the wallet height we recorded at kernel time against BeamPay's
-    # `/wallet_status.current_height`, which does move.
-    reported = tx.get("confirmations")
-    confs = int(reported) if reported is not None else 0
-    if confs <= 0:
-        height = int(await bp.height())
-        h0 = int(row.get("beam_height_at_kernel") or 0)
-        if not h0:
-            # a row booked before this was recorded: start the clock now and over-wait
-            h0 = height
-            await _checkpoint("payout_requests", rid, beam_height_at_kernel=h0)
-            row = {**row, "beam_height_at_kernel": h0}
-        if height <= 0:
-            # ⛔ AN UNREADABLE COUNT IS NOT A COUNT — and neither is an unreadable height.
-            await _hold(
-                "payout_requests",
-                rid,
-                "BeamPay reported no confirmation count for this crossing and no wallet height "
-                "to derive one from — refusing to guess",
-                key=f"payout-noconfs:{rid}",
-                cooldown_s=6 * 3600,
-            )
-            return
-        confs = max(height - h0, 0)
+    # ⛔ **AND THE VALUE IT FREEZES AT IS ANY NUMBER, NOT ONLY 0** — it is whatever the wallet
+    # reported on the first status-3 sighting, which is a race with that 3-second poller. Payout
+    # `64ee5540…` was booked with **1**, so a gate that only distrusted 0 compared 1 < 61 on
+    # every pass for 37 hours while the relayer had already paid the user on Ethereum. So the
+    # reported count is never a CEILING: maturity is ALWAYS derived from the wallet height we
+    # recorded at kernel time against BeamPay's `/wallet_status.current_height`, which does
+    # move, and the reported number may only RAISE that.
+    reported = int(tx.get("confirmations") or 0)
+    height = int(await bp.height())
+    h0 = int(row.get("beam_height_at_kernel") or 0)
+    if not h0 and height > 0:
+        # a row booked before this was recorded: start the clock now and over-wait
+        h0 = height
+        await _checkpoint("payout_requests", rid, beam_height_at_kernel=h0)
+        row = {**row, "beam_height_at_kernel": h0}
+    derived = max(height - h0, 0) if height > 0 and h0 else 0
+    confs = max(derived, reported)
+    if height <= 0 and confs < settings.beam_confirmations:
+        # ⛔ AN UNREADABLE COUNT IS NOT A COUNT — and neither is an unreadable height. A count
+        # BeamPay states ABOVE the threshold is evidence in its own right and advances above;
+        # one frozen BELOW it is evidence of nothing, and with no height to derive from there is
+        # nothing honest left to do but wait and say so.
+        await _hold(
+            "payout_requests",
+            rid,
+            "BeamPay reported no confirmation count for this crossing and no wallet height "
+            "to derive one from — refusing to guess",
+            key=f"payout-noconfs:{rid}",
+            cooldown_s=6 * 3600,
+        )
+        return
     if confs < settings.beam_confirmations:
         if int(row.get("beam_confirmations") or -1) != confs:
             await _checkpoint("payout_requests", rid, beam_confirmations=confs)

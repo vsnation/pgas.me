@@ -22,9 +22,8 @@
 // Which paths are open — and which one this page leads with when both are — is the API's statement,
 // never this file's assumption: lib/ingress.ts reads it in one place and every branch here reads
 // that answer.
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { BrowserProvider, Interface, formatUnits } from 'ethers';
-import { Explainer } from '../components/Explainer';
 import { HowItWorks, type HowItWorksRoute } from '../components/HowItWorks';
 import { Portfolio } from '../components/Portfolio';
 import { SignInGate } from '../components/SignInGate';
@@ -188,7 +187,7 @@ function expiresInSeconds(expiresAt: string | number | null, receivedAt: number)
   return Math.max(0, QUOTE_TTL_FALLBACK_S - Math.round((Date.now() - receivedAt) / 1000));
 }
 
-export function DepositPage() {
+export function DepositBody({ modes }: { modes: ReactNode }) {
   const { wallet, session, data } = useStore();
   const { chains, assets } = data;
 
@@ -491,6 +490,32 @@ export function DepositPage() {
     },
     [resetFlow],
   );
+
+  /**
+   * T57 — the empty state opens on something the wallet actually holds.
+   *
+   * The panel already opens on the chain the wallet is on and that chain's own coin. When the
+   * wallet holds NONE of that coin, the user is looking at a pair they cannot pay with — which is
+   * the empty state the admin's screenshot caught — so the largest holding the scan found is
+   * selected instead.
+   *
+   * ⛔ A PAIR THE WALLET REALLY HOLDS IS NEVER OVERRIDDEN, and no amount is ever filled in. A money
+   * page that quietly swaps the token under a returning user, or types a number into their order
+   * for them, is a surprise and not a convenience. It runs once per wallet, and never after the
+   * user has touched the pay side.
+   */
+  const preselected = useRef(false);
+  useEffect(() => {
+    if (preselected.current || pickedByUser.current || amount !== '' || !holdings.length || chainId === null || !token) return;
+    preselected.current = true;
+    const held = holdings.some((h) => h.chainId === chainId && h.address.toLowerCase() === token.address.toLowerCase());
+    if (held) return; // what is on screen is a real holding: leave it alone
+    const best = holdings[0]; // the scan sorts by value, so the first is the largest
+    setChainId(best.chainId);
+    setSelectedKey(best.key);
+    setMaxRaw(best.raw);
+    setToken({ address: best.native ? NATIVE_ADDRESS : best.address, symbol: best.symbol, name: best.name, decimals: best.decimals, logo: best.logo });
+  }, [holdings, chainId, token, amount]);
 
   // ---- quote: debounced, abortable, re-quoted automatically when it expires ----
   const sessionToken = session.session?.token ?? null;
@@ -931,21 +956,38 @@ export function DepositPage() {
           ? 'Sent. Its status is below.'
           : null;
 
+  /**
+   * T57 — the primary button is ALWAYS on the panel, and when it cannot act its LABEL is the
+   * reason. The old empty state had no button at all: two grey zeros and nothing to press, so the
+   * one question the page exists to answer — "what happens if I do this?" — had nothing to ask it
+   * with. Null here means the flow below owns the button.
+   */
+  const signedIn = !!sessionToken;
+  const signInNow = !signedIn && !!wallet.address && !session.signingIn ? () => void session.signIn().catch(() => undefined) : null;
+  const blocked: string | null = !wallet.address
+    ? 'Connect your wallet'
+    : session.signingIn
+      ? 'Waiting for your signature…'
+      : !signedIn
+        ? 'Sign in with wallet'
+        : stage === 'tracking'
+          ? 'Sent — following it below'
+          : stage === 'registering'
+            ? 'Registering the deposit…'
+            : !chain || !token
+              ? 'Choose what to pay with'
+              : rawAmount === null
+                ? 'Enter an amount'
+                : belowMin
+                  ? 'Enter a larger amount'
+                  : quoteError
+                    ? 'No quote right now'
+                    : !quote || !est
+                      ? 'Getting a quote…'
+                      : null;
+
   return (
-    <div className="page">
-      <div className="page-head">
-        <div className="stack-sm">
-          <h1>Deposit</h1>
-          <p className="muted">
-            Pay from any chain. Fund fresh wallets later, with no on-chain link to the source. <HowItWorks route={howItWorksRoute} />
-          </p>
-        </div>
-      </div>
-
-      {/* T31 B′: for EVERY visitor, signed in or not — the admin's screenshot of the signed-in page
-          was three cards that never said what the product is or which tab comes next. */}
-      <Explainer current="deposit" />
-
+    <>
       {/* T31 H — a sent transaction, above everything, wherever the page happens to be. It survives
           a reload, so it cannot live inside a quote card that a reload leaves empty. */}
       {pending && (
@@ -971,29 +1013,29 @@ export function DepositPage() {
       {wallet.address ? (
         <Portfolio address={wallet.address} selectedKey={selectedKey} onPick={onPick} onLoaded={setPortfolio} />
       ) : (
-        <section className="card">
-          <h2>Your portfolio</h2>
+        <section className="card" data-testid="portfolio-placeholder">
+          <h2>Your wallet</h2>
           <p className="muted small" style={{ marginTop: 6 }}>
             Connect your wallet and everything it holds, on every chain, becomes a tap-to-pay chip here.
           </p>
         </section>
       )}
 
-      {/* ═══ T53 — ONE panel, shaped like a swap ═══════════════════════════════════════════════
-          Admin 2026-09-10: "Quote block I don't think is actually needed when you can make it in
-          What to deposit, to look like DEX Swap." Two cards side by side asked the user to read a
-          form on the left and a price on the right and hold the relationship between them in their
-          head. Here the relationship IS the layout: what you pay, what you receive, what it costs,
-          and the one button that does the next thing. */}
-      <div className="swap-col">
-        <SwapPanel testId="deposit-form" route={uniswapPrimary ? 'uniswap' : 'classic'}>
+      {/* ═══ T53/T57 — ONE panel, shaped like a swap, headed by the direction ═══════════════════
+          The relationship IS the layout: what you pay, what you receive, what it costs, and the one
+          button that does the next thing. T57 put `Deposit | Withdraw` where the title used to be —
+          the control says what the panel is, so "What to deposit" had nothing left to add. */}
+      <SwapPanel testId="deposit-form" route={uniswapPrimary ? 'uniswap' : 'classic'}>
           <SwapHead
-            title={uniswapPrimary ? 'Pay with Uniswap V4' : 'What to deposit'}
+            head={modes}
             sub={
               uniswapPrimary && (
-                <span className="tiny muted" data-testid="uniswap-primary">
-                  {twoStep ? 'two steps, both in your own wallet' : 'one transaction on Ethereum'}
-                </span>
+                <>
+                  <span className="tiny strong">Pay with Uniswap V4</span>
+                  <span className="tiny muted" data-testid="uniswap-primary">
+                    {twoStep ? 'two steps, both in your own wallet' : 'one transaction on Ethereum'}
+                  </span>
+                </>
               )
             }
           >
@@ -1047,11 +1089,6 @@ export function DepositPage() {
               </button>
             )}
           </SwapHead>
-
-          {/* T31 B′ — the admin could not tell what this card wanted from him. One line, above it. */}
-          <p className="tiny muted" data-testid="deposit-lead">
-            Pick something you hold — the chips above are your wallet — choose what your balance is kept in, and enter an amount.
-          </p>
 
           {/* `quote-card` is this region now: the price and everything that follows from it. The
               suite's assertions about what a quote may never say (a quote id, an order id, a
@@ -1138,11 +1175,15 @@ export function DepositPage() {
 
               <SwapSeam />
 
+              {/* ⛔ NOT "You receive on Ethereum" (T57 defect 8). The deposit lands in the user's
+                  PGAS BALANCE, on Beam; Ethereum is where it later leaves, which is a different
+                  page and a later day. The old label named the wrong end of the journey. */}
               <SwapLeg
                 tone="out"
-                label={`You receive on Ethereum${quoteLoading && quote ? ' · refreshing…' : ''}`}
+                label={`You receive in your Pgas balance${quoteLoading && quote ? ' · refreshing…' : ''}`}
+                aside={<span className="tiny muted">held as</span>}
                 control={
-                  <div className="seg" role="radiogroup" aria-label="Target asset">
+                  <div className="seg" role="radiogroup" aria-label="Held as">
                     {(assets.length ? assets : ([{ key: 'ETH', symbol: 'ETH' }] as Asset[])).map((a) => (
                       <button
                         key={a.key}
@@ -1181,13 +1222,21 @@ export function DepositPage() {
                 {quote && est ? (
                   <span data-testid="quote-out">{fmtUnits(est.out_units, outDecimals, target === 'WBTC' ? 8 : 6)}</span>
                 ) : (
-                  <span className="muted">0.0</span>
+                  // a dash is "not known yet"; the grey 0.0 that used to be here was a number
+                  <span className="muted">—</span>
                 )}
               </SwapLeg>
             </div>
 
-            <SignInGate what="a quote" verb="get">
-              {xchainClosed ? (
+            {/* The sign-in state, when there is one to report. Its children are empty on purpose:
+                the panel below is always drawn, and the BUTTON carries the reason (T57). */}
+            {wallet.address && !signedIn && (
+              <SignInGate what="a quote" verb="get">
+                {null}
+              </SignInGate>
+            )}
+
+            {xchainClosed ? (
                 /* The chips stay: what the wallet holds elsewhere is still worth seeing. What is
                    closed is the crossing, and the only thing that opens it is paying from Ethereum. */
                 <div className="stack-sm">
@@ -1211,19 +1260,9 @@ export function DepositPage() {
                     </button>
                   </div>
                 </div>
-              ) : !chain || !token ? (
-                <p className="muted small">Pick what you want to pay with.</p>
-              ) : rawAmount === null ? (
-                // T31 B′ — an empty panel that says only "enter an amount" tells a new user nothing
-                // about what they are about to see, or what it costs.
-                <p className="muted small" data-testid="quote-empty">
-                  Enter an amount and you&rsquo;ll see what lands in your private balance — as {target} on Ethereum through the Beam bridge
-                  — how long it takes and what the bridge charges. Then one click to deposit.
-                </p>
               ) : (
                 <div className="stack">
                   {stage === 'tracking' && <div className="banner banner-ok">Transaction sent — follow the status below.</div>}
-                  {quoteLoading && !quote && <p className="muted small">Getting a quote…</p>}
                   {quoteError &&
                     (belowMin ? (
                       // the only place a floor is ever stated, and it is the API's own sentence
@@ -1233,10 +1272,12 @@ export function DepositPage() {
                     ) : (
                       <div className="banner banner-error">{quoteError}</div>
                     ))}
-                  {quote && est && (
-                    <>
-                      {/* ---- the detail strip: what this costs and where it goes ---- */}
+                  {/* ---- the detail strip: what this costs and where it goes. ALWAYS drawn (T57
+                          defect 5): a first-time visitor can read what a deposit costs before
+                          typing anything, and the numbers arrive into a shape they have already
+                          seen instead of a box appearing under their hands. ---- */}
                       <SwapDetails
+                        testId="cost-strip"
                         summary={
                           <>
                             <span>What this costs</span>
@@ -1244,7 +1285,7 @@ export function DepositPage() {
                                 router window re-quotes itself — so what is worth saying is how
                                 old the number you are reading is, next to the numbers. The
                                 countdown that used to be here was a clock nobody could act on. */}
-                            {!expired && (
+                            {quote && !expired && (
                               <span className="sw-fresh" data-testid="quote-age">
                                 <span>updated {quoteAgeS < 5 ? 'just now' : `${quoteAgeS} s ago`}</span>
                                 <button
@@ -1266,7 +1307,13 @@ export function DepositPage() {
                           </>
                         }
                       >
-                        <SwapRow label="Route">{routeLabel}</SwapRow>
+                        {/* The mechanism panel lives HERE now, on the row it is about, rather than
+                            under the page title where it was one of four routes to the same
+                            explanation (T57 defect 1). */}
+                        <SwapRow label="Route">
+                          {quote ? routeLabel : <span className="muted">—</span>}
+                          <HowItWorks route={howItWorksRoute} />
+                        </SwapRow>
                         {/* Ours is charged on the way OUT and never here — said on the page where
                             a depositor is deciding, not left for them to find later. The number is
                             the account's `fee_bps`; a build that has not answered yet says the
@@ -1279,10 +1326,10 @@ export function DepositPage() {
                             bridge's cut is a cent — a number worth rounding, not stating to six
                             decimals. */}
                         <SwapNote testId="lands-in">
-                          Lands in your balance in ≈ {fmtDuration(est.eta_s)}
+                          Lands in your balance in ≈ {est ? fmtDuration(est.eta_s) : '—'}
                           {relayerFeeUsd !== null ? ` · bridge fee ${fmtUsd(relayerFeeUsd)}` : ''}
                         </SwapNote>
-                        {mode === 'direct' && (
+                        {quote && mode === 'direct' && (
                           <SwapNote tone="good" testId="direct-note">
                             Direct deposit — your {quote.target_asset} goes straight into the Beam bridge, no routing fee.
                           </SwapNote>
@@ -1298,18 +1345,31 @@ export function DepositPage() {
                             multi-chain payout is designed, not live — so it is named as what is
                             enabled, not as what exists. */}
                         <SwapNote testId="arrives-as">
-                          Arrives as {quote.target_asset} on Ethereum through the Beam bridge. From your balance you schedule payouts to the
-                          wallets you choose — on Ethereum now, other chains as they are enabled.
+                          Arrives as {quote?.target_asset ?? target} on Ethereum through the Beam bridge. From your balance you schedule
+                          payouts to the wallets you choose — on Ethereum now, other chains as they are enabled.
                         </SwapNote>
                       </SwapDetails>
 
-                      {/* ---- the action: one primary button, whose label is the next step ---- */}
+                      {/* ---- the action: one primary button, whose label is the next step — or,
+                              when there is no next step to take, the reason there is not ---- */}
                       <SwapAction>
                         {swapDone && (
                           <div className="banner banner-ok" data-testid="swap-done">
                             Swapped {swapDone.from} → {swapDone.amount} {swapDone.to}. Step 2: deposit it below.
                           </div>
                         )}
+                        {blocked ? (
+                          <button
+                            type="button"
+                            className={`btn btn-lg${signInNow ? ' btn-primary' : ''}`}
+                            disabled={!signInNow}
+                            onClick={signInNow ?? undefined}
+                            data-testid="money-cta"
+                          >
+                            {blocked}
+                          </button>
+                        ) : quote && est ? (
+                          <>
                         {(mode === 'swap' || twoStep) && quote.swap_tx ? (
                           /* Two routes, one handshake: the router's single-chain `swap`, and the
                              two-step Uniswap route (U2). Both land the asset in the USER's own
@@ -1402,9 +1462,14 @@ export function DepositPage() {
                         ) : !canDeposit ? (
                           // the API's own note here is `ingress not armed: no Beam pubkey
                           // configured`, which names a flag and a key the user has never heard of
-                          <div className="banner banner-warn" data-testid="unarmed-banner">
-                            <span>Deposits are paused right now — this is a preview of what you would get.</span>
-                          </div>
+                          <>
+                            <div className="banner banner-warn" data-testid="unarmed-banner">
+                              <span>Deposits are paused right now — this is a preview of what you would get.</span>
+                            </div>
+                            <button type="button" className="btn btn-lg" disabled data-testid="money-cta">
+                              Deposits are paused
+                            </button>
+                          </>
                         ) : (
                           stage !== 'tracking' && (
                             <>
@@ -1476,6 +1541,8 @@ export function DepositPage() {
                             </>
                           )
                         )}
+                          </>
+                        ) : null}
                         {flowError && <div className="banner banner-error">{flowError}</div>}
                         {flowStatus && (
                           <p className="sw-status" data-testid="deposit-status">
@@ -1483,29 +1550,25 @@ export function DepositPage() {
                           </p>
                         )}
                       </SwapAction>
-                    </>
-                  )}
                 </div>
               )}
-            </SignInGate>
           </div>
         </SwapPanel>
 
-        {(stage === 'tracking' || tracked) && (txHash || depositId) && (
-          <DepositTimeline
-            deposit={tracked}
-            txHash={txHash}
-            chainId={chain?.chain_id}
-            uniswap={tracked?.mode ? tracked.mode === 'uniswap' : uniswap}
-            onNew={() => {
-              resetFlow();
-              setAmount('');
-              setQuote(null);
-            }}
-          />
-        )}
-      </div>
-    </div>
+      {(stage === 'tracking' || tracked) && (txHash || depositId) && (
+        <DepositTimeline
+          deposit={tracked}
+          txHash={txHash}
+          chainId={chain?.chain_id}
+          uniswap={tracked?.mode ? tracked.mode === 'uniswap' : uniswap}
+          onNew={() => {
+            resetFlow();
+            setAmount('');
+            setQuote(null);
+          }}
+        />
+      )}
+    </>
   );
 }
 
@@ -1598,10 +1661,11 @@ function DepositTimeline({
               New deposit
             </button>
           )}
-          {/* T31 B′ — the end of one job is the start of the next, and the next one is a tab away. */}
+          {/* T31 B′ — the end of one job is the start of the next, and since T57 the next one is
+              the other half of this very page. */}
           {status === 'credited' && (
-            <button type="button" className="btn btn-sm btn-primary" data-testid="go-schedule" onClick={() => route.navigate('schedule')}>
-              Now schedule payouts →
+            <button type="button" className="btn btn-sm btn-primary" data-testid="go-schedule" onClick={() => route.goMoney('withdraw')}>
+              Now withdraw to your wallets →
             </button>
           )}
         </div>

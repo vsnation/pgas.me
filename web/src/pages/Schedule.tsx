@@ -26,8 +26,7 @@
 // problem on its row, the batch's under the totals, the message in the banner. It composes none
 // of them, and it never puts a structured refusal on the screen as JSON — that blob listed every
 // destination address in the batch.
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { HowItWorks } from '../components/HowItWorks';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { PayoutEta, PayoutStatusCell } from '../components/PayoutStatus';
 import { SignInGate } from '../components/SignInGate';
 import { SwapAction, SwapDetails, SwapHead, SwapLeg, SwapNote, SwapPanel, SwapRow, SwapSeam } from '../components/SwapPanel';
@@ -134,8 +133,8 @@ const blankRow = (): Row => ({ id: nextRowId++, address: '', amount: '', preset:
 /** An untouched row with neither an address nor an amount in it is not an order — it is a blank. */
 const isBlankRow = (r: Row): boolean => !r.address.trim() && !r.amount.trim();
 
-export function SchedulePage() {
-  const { session } = useStore();
+export function WithdrawBody({ modes }: { modes: ReactNode }) {
+  const { session, wallet } = useStore();
   const account = session.account;
 
   // ── T48 block: the form opens on the order the Balance page handed it ────────────────────────
@@ -393,8 +392,24 @@ export function SchedulePage() {
    * long as they type. An em dash says the true thing, next to "Pricing this list…".
    */
   const money = (g: number) => (checking ? '—' : `${fmtGroth(g)} ${ASSET}`);
-  /** Nothing typed anywhere yet: one muted line, not a list of complaints. */
-  const pristine = active.length === 0 && problems.length === 0;
+  /**
+   * T57 — the button is always there, and its label is either what pressing it does or WHY it
+   * cannot be pressed. The muted hint that used to sit beside it ("Add a wallet and an amount.")
+   * said the same thing somewhere nobody was looking, which is how a form grows prose.
+   */
+  const submitLabel = submitting
+    ? 'Scheduling…'
+    : active.length === 0
+      ? 'Add a wallet and an amount'
+      : overBudget
+        ? 'Not enough balance'
+        : treasuryProblem
+          ? 'More than we can send today'
+          : rowProblems.length > 0 || batchProblems.length > 0
+            ? 'Fix the rows above'
+            : fresh && deliveredGrothTotal !== null
+              ? `Schedule ${fmtGroth(deliveredGrothTotal)} ${ASSET} to ${active.length} wallet${active.length === 1 ? '' : 's'}`
+              : `Schedule ${active.length} order${active.length === 1 ? '' : 's'}`;
 
   /**
    * Ask the API what this list costs, ~300 ms after the last change, and again on every change
@@ -541,7 +556,7 @@ export function SchedulePage() {
    * whatever follows it until the scroll reaches its own place in the flow. So it is drawn only
    * while the card it repeats cannot be seen, which is the only time it is worth anything.
    */
-  const totalsRef = useRef<HTMLElement | null>(null);
+  const totalsRef = useRef<HTMLDetailsElement | null>(null);
   const [totalsSeen, setTotalsSeen] = useState(false);
   const hasAccount = !!account;
   useEffect(() => {
@@ -553,37 +568,69 @@ export function SchedulePage() {
   }, [hasAccount]);
 
   return (
-    <div className="page">
-      <div className="page-head">
-        <div className="stack-sm">
-          <h1>Schedule</h1>
-          <p className="muted">
-            Send ETH from your balance to any wallets, at the time you choose. <HowItWorks />
-          </p>
-          {/* T31 B′ (admin 2026-09-10 09:0xZ: "For us it's clear, not for new users"): one line
-              under the title saying what this page is FOR and what to do on it. */}
-          <p className="tiny muted" data-testid="page-lead">
-            List the wallets you want funded, how much each should receive and when — one order per line. Pgas.me sends each to the bridge
-            in time and pays it out of your balance.
-          </p>
+    <>
+      {/* The context card (T57): what this panel spends, above it and on the same axis. The
+          Deposit half shows the wallet's holdings here; this half shows the balance they became.
+          Every number is the API's — `available` is its `available_groth` once a preview has
+          answered, and "Deliverable now" is its treasury verdict or a dash, never a zero we made
+          up (T52: "we could not measure the treasury" is not "we cannot pay you"). */}
+      <section className="card pgas-balance-card" data-testid="pgas-balance">
+        <div className="card-head">
+          <h2>Your Pgas balance</h2>
+          <span className="tiny muted">on Beam — deposits arrive here</span>
         </div>
-      </div>
-      <SignInGate what="payouts" verb="schedule">
+        {account ? (
+          <div className="pgas-balance">
+            <div>
+              <div className="b-label">Available</div>
+              <div className="b-value" data-testid="bal-available">{`${fmtGroth(available)} ${ASSET}`}</div>
+            </div>
+            <div>
+              <div className="b-label">Scheduled</div>
+              <div className="b-value" data-testid="bal-scheduled">{`${fmtGroth(account.balances[ASSET]?.scheduled ?? 0)} ${ASSET}`}</div>
+            </div>
+            <div>
+              <div className="b-label">Sent</div>
+              <div className="b-value" data-testid="bal-sent">{`${fmtGroth(account.balances[ASSET]?.sent ?? 0)} ${ASSET}`}</div>
+            </div>
+            <div>
+              <div className="b-label">Deliverable now</div>
+              <div className="b-value" data-testid="bal-deliverable">
+                {deliverableNow === null ? '—' : `${fmtGroth(deliverableNow)} ${ASSET}`}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <p className="muted small">Connect your wallet and your balance appears here.</p>
+        )}
+      </section>
+
+      <SwapPanel testId="schedule-form" className="schedule-form">
+        <SwapHead
+          head={modes}
+          sub={
+            account && (
+              <span className="tiny muted" data-testid="bridge-head">
+                bridge takes {Math.round(etaS / 60)} min · sent that far ahead of your time
+                {bridgeNow !== null ? ` · a crossing costs about ${fmtGroth(bridgeNow)} ${ASSET} right now` : ''}
+              </span>
+            )
+          }
+        />
         {!account ? (
-          <p className="muted">Loading the account…</p>
+          <>
+            {/* Its children are empty on purpose: the BUTTON below carries the reason (T57). */}
+            <SignInGate what="payouts" verb="schedule">
+              {null}
+            </SignInGate>
+            <SwapAction>
+              <button type="button" className="btn btn-lg" disabled data-testid="money-cta">
+                {wallet.address ? 'Loading your balance…' : 'Connect your wallet'}
+              </button>
+            </SwapAction>
+          </>
         ) : (
           <>
-            <div className="swap-col">
-              <SwapPanel testId="schedule-form" className="schedule-form">
-                <SwapHead
-                  title="Orders to schedule"
-                  sub={
-                    <span className="tiny muted" data-testid="bridge-head">
-                      bridge takes {Math.round(etaS / 60)} min · sent that far ahead of your time
-                      {bridgeNow !== null ? ` · a crossing costs about ${fmtGroth(bridgeNow)} ${ASSET} right now` : ''}
-                    </span>
-                  }
-                />
                 {feesError && (
                   <div className="banner banner-warn" data-testid="fees-error">
                     Fees could not be read ({feesError}) — every number below is still the API's own, from the preview.
@@ -926,11 +973,18 @@ export function SchedulePage() {
                     </button>
                   </div>
                 </div>
-              </SwapPanel>
 
-              <SwapPanel testId="schedule-totals" className="schedule-totals" busy={previewing ? 'yes' : 'no'} panelRef={totalsRef}>
-                {/* Every number in this strip came off `POST /v1/withdrawals/preview`. */}
-                <SwapDetails summary="What this list costs">
+                {/* T57 — the cost strip is part of THIS panel now, not a second card under it.
+                    What a list costs is the same object as the list; two cards asked the user to
+                    read one, then the other, and hold the relationship between them in their head.
+                    Every number in it still came off `POST /v1/withdrawals/preview`, and the
+                    `schedule-totals` name travels with the region it always described. */}
+                <SwapDetails
+                  summary="What this list costs"
+                  testId="schedule-totals"
+                  busy={previewing ? 'yes' : 'no'}
+                  detailsRef={totalsRef}
+                >
                   <SwapRow label="Orders" testId="total-orders">
                     {active.length}
                   </SwapRow>
@@ -1016,8 +1070,6 @@ export function SchedulePage() {
                     ))}
                   </ul>
                 )}
-                {/* a form nobody has typed in yet: one muted line, and a button that stays down */}
-                {pristine && <SwapNote testId="schedule-hint">Add a wallet and an amount.</SwapNote>}
                 <SwapAction>
                   <button
                     type="button"
@@ -1030,14 +1082,9 @@ export function SchedulePage() {
                         the amount the WALLETS receive (the API's `delivered_groth` total, never a
                         sum made here) and how many of them. A list the API has not priced yet
                         falls back to the count — a button that named an amount while the strip
-                        above it says "—" would be stating a number nothing has answered. */}
-                    {submitting
-                      ? 'Scheduling…'
-                      : active.length === 0
-                        ? 'Schedule orders'
-                        : fresh && deliveredGrothTotal !== null
-                          ? `Schedule ${fmtGroth(deliveredGrothTotal)} ${ASSET} to ${active.length} wallet${active.length === 1 ? '' : 's'}`
-                          : `Schedule ${active.length} order${active.length === 1 ? '' : 's'}`}
+                        above it says "—" would be stating a number nothing has answered. T57 gave
+                        it the other half: when it cannot act, the label is the reason. */}
+                    {submitLabel}
                   </button>
                   {/* ⛔ "you receive exactly what you enter" is TRUE only while every row can pay
                     its fees on top. The moment one cannot, the same sentence is an overclaim about
@@ -1067,8 +1114,9 @@ export function SchedulePage() {
                     </div>
                   )}
                 </SwapAction>
-              </SwapPanel>
-            </div>
+          </>
+        )}
+      </SwapPanel>
 
             {/* Phones only (CSS): the one number that decides whether the button can be pressed at
                 all, kept above the tab bar while the list of rows scrolls. The API's own total,
@@ -1083,6 +1131,7 @@ export function SchedulePage() {
               <span className={`num strong${overBudget ? ' error-text' : ''}`}>{money(debitGroth)}</span>
             </div>
 
+            {account && (
             <section className="card">
               <div className="card-head">
                 <h2>Scheduled orders</h2>
@@ -1180,9 +1229,7 @@ export function SchedulePage() {
                 time sooner than that arrives as soon as the bridge can manage it, not before.
               </p>
             </section>
-          </>
-        )}
-      </SignInGate>
-    </div>
+            )}
+    </>
   );
 }

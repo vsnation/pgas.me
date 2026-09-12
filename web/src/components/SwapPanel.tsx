@@ -43,15 +43,62 @@ export function SwapPanel({
   );
 }
 
-/** Title on the left, whatever the page needs on the right (a route toggle, a freshness line). */
-export function SwapHead({ title, sub, children }: { title: ReactNode; sub?: ReactNode; children?: ReactNode }) {
+/**
+ * Title on the left, whatever the page needs on the right (a route toggle, a freshness line).
+ *
+ * `head` replaces the `<h2>` for a panel whose head is a CONTROL rather than a name — the money
+ * page's `Deposit | Withdraw` (T57). A heading element wrapped round a radiogroup would announce
+ * the control as a title to a screen reader, which is a different thing from what it is; and the
+ * control already says what the panel is, so there is nothing left for a title to add.
+ */
+export function SwapHead({ title, head, sub, children }: { title?: ReactNode; head?: ReactNode; sub?: ReactNode; children?: ReactNode }) {
   return (
     <div className="sw-head">
       <div className="sw-head-main">
-        <h2>{title}</h2>
+        {head !== undefined ? head : <h2>{title}</h2>}
         {sub}
       </div>
       {children !== undefined && children !== null && children !== false && <div className="sw-head-aside">{children}</div>}
+    </div>
+  );
+}
+
+/**
+ * The segmented control a panel is headed by: the money page's direction (T57), and nothing else
+ * so far. Presentation only — it is handed the value and the options and reports a press.
+ */
+export function SwapModes<T extends string>({
+  value,
+  options,
+  onChange,
+  label,
+  testId,
+  disabled,
+}: {
+  value: T;
+  options: { id: T; label: string }[];
+  onChange: (id: T) => void;
+  label: string;
+  testId?: string;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="seg seg-modes" role="radiogroup" aria-label={label} data-testid={testId} data-mode={value}>
+      {options.map((o) => (
+        <button
+          key={o.id}
+          type="button"
+          role="radio"
+          aria-checked={value === o.id}
+          className={value === o.id ? 'active' : ''}
+          disabled={disabled}
+          data-mode={o.id}
+          data-testid={`mode-${o.id}`}
+          onClick={() => onChange(o.id)}
+        >
+          {o.label}
+        </button>
+      ))}
     </div>
   );
 }

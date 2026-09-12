@@ -10,9 +10,8 @@ import { shortAddr } from './lib/format';
 import type { WalletOption } from './lib/wallet';
 import { AdminPage, isAdminPath } from './pages/Admin';
 import { BalancePage } from './pages/Balance';
-import { DepositPage } from './pages/Deposit';
 import { HowItWorksPage } from './pages/HowItWorks';
-import { SchedulePage } from './pages/Schedule';
+import { MoneyPage } from './pages/Money';
 import { HOW_PATH, StoreProvider, TABS, useStore, type Tab } from './state/store';
 
 /** Sun and moon, drawn rather than fetched: two paths beat a webfont for one icon. */
@@ -62,10 +61,34 @@ function TabButtons({ where }: { where: 'header' | 'bar' }) {
           aria-current={route.tab === t.id ? 'page' : undefined}
           onClick={() => route.navigate(t.id)}
         >
-          {t.label}
+          {where === 'bar' ? t.short : t.label}
         </button>
       ))}
     </>
+  );
+}
+
+/**
+ * The explainer page's link. It is an `<a>` with a real href in both places it appears — it is a
+ * page, so it must open in a new tab and be followable by a crawler — and the click handler keeps
+ * the in-app navigation for everyone else. T57 left these and the footer as the ONLY routes to it.
+ */
+function HowTab({ where }: { where: 'header' | 'bar' }) {
+  const { route } = useStore();
+  const cls = where === 'header' ? 'nav-tab' : 'tabbar-tab';
+  return (
+    <a
+      className={`${cls}${route.tab === 'how' ? ' active' : ''}`}
+      href={HOW_PATH}
+      aria-current={route.tab === 'how' ? 'page' : undefined}
+      data-testid={where === 'header' ? 'nav-how' : 'tabbar-how'}
+      onClick={(e) => {
+        e.preventDefault();
+        route.navigate('how');
+      }}
+    >
+      How it works
+    </a>
   );
 }
 
@@ -152,14 +175,14 @@ function AccountControl() {
 function Header() {
   const { route } = useStore();
   return (
-    <header className="header">
+    <header className="header" data-testid="header">
       <div className="container header-inner">
         <a
           className="brand"
           href="/"
           onClick={(e) => {
             e.preventDefault();
-            route.navigate('deposit');
+            route.navigate('money');
           }}
         >
           <img className="brand-logo" src="/logo-256.png" alt="" width={36} height={36} />
@@ -167,21 +190,7 @@ function Header() {
         </a>
         <nav className="nav" aria-label="Sections">
           <TabButtons where="header" />
-          {/* T44 — a link, not a tab: the phone's bottom bar is a three-column grid of the three
-              things you DO with money, and a page you read once does not belong in it. Here on
-              desktop, in the footer everywhere, and on the "What is Pgas.me" card. */}
-          <a
-            className={`nav-tab${route.tab === 'how' ? ' active' : ''}`}
-            href={HOW_PATH}
-            aria-current={route.tab === 'how' ? 'page' : undefined}
-            data-testid="nav-how"
-            onClick={(e) => {
-              e.preventDefault();
-              route.navigate('how');
-            }}
-          >
-            How it works
-          </a>
+          <HowTab where="header" />
         </nav>
         <div className="header-right">
           {/* T54 — which endpoints THIS BROWSER reads chains through. App chrome, like the theme
@@ -226,6 +235,9 @@ function TabBar() {
   return (
     <nav className="tabbar" aria-label="Sections" data-testid="tabbar" ref={ref}>
       <TabButtons where="bar" />
+      {/* T57 — Deposit and Withdraw became one tab, which freed the third column. It goes to the
+          explainer: on a phone the header's nav is hidden, so this and the footer are the ways in. */}
+      <HowTab where="bar" />
     </nav>
   );
 }
@@ -362,12 +374,10 @@ function Page() {
   switch (tab) {
     case 'balance':
       return <BalancePage />;
-    case 'schedule':
-      return <SchedulePage />;
     case 'how':
       return <HowItWorksPage />;
     default:
-      return <DepositPage />;
+      return <MoneyPage />;
   }
 }
 

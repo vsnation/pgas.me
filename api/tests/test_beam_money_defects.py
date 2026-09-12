@@ -501,6 +501,122 @@ async def test_a_frozen_confirmation_count_does_not_strand_the_payout_in_bridgin
     assert row["status"] == "delivering" and row["beam_confirmations"] == settings.beam_confirmations
 
 
+async def test_a_frozen_count_of_one_is_a_floor_and_never_a_ceiling(
+    mock_db, eth, armed, beam_pay
+):
+    """⛔ **THE FROZEN VALUE CAN BE ANY NUMBER, NOT ONLY 0.** It is whatever the wallet happened
+    to report on the first status-3 sighting — a race with a 3-second poller — so the door that
+    saves a frozen 0 (`confs <= 0`) never opens for a row frozen at 1. Payout `64ee5540…`
+    (0.00735839 ETH, kernel `16f8d727…`, 2026-09-10 18:59:44Z) was booked with **1** and compared
+    1 < 61 on every pass for 37 hours, `updated_at` frozen at the kernel, while the bridge had
+    already paid the user in Ethereum block 25949221 — the wallet height had moved 2,466 blocks.
+
+    So maturity is ALWAYS derived from the height that moves, and the reported count may only
+    RAISE that number, never cap it."""
+    eth.start = {ETH.pipe.lower(): 5 * 10**18}
+    await make_payout(mock_db)
+    await payouts.process_once()  # → releasing
+    await payouts.process_once()  # → bridging: the release is signed and submitted
+    beam_pay.tx("beamtx-1")["confirmations"] = 1  # exactly what the live row was booked with
+    await payouts.process_once()  # the kernel: the release is booked
+    row = await payout(mock_db)
+    assert row["kernel_at"] > 0 and row["beam_height_at_kernel"] == beam_pay.height_
+    assert row["status"] == "bridging" and row["beam_confirmations"] == 1
+
+    beam_pay.height_ += 5_000  # the number that actually moves
+    await payouts.process_once()
+    row = await payout(mock_db)
+    assert row["status"] == "delivering"
+    assert row["beam_confirmations"] == 5_000  # the DERIVED count, never the frozen 1
+
+
+async def test_a_reported_zero_still_starts_a_legacy_rows_clock_and_waits_it_out(
+    mock_db, eth, armed, beam_pay
+):
+    """The 0 case is the one the height fallback was written for, and it does not change: a row
+    booked before `beam_height_at_kernel` existed starts its clock NOW and over-waits, which is
+    the safe direction, and a frozen 0 advances nothing by itself."""
+    eth.start = {ETH.pipe.lower(): 5 * 10**18}
+    await make_payout(mock_db)
+    for _ in range(3):
+        await payouts.process_once()
+    assert beam_pay.tx("beamtx-1")["confirmations"] == 0
+    await mock_db["pgasme_test"].payout_requests.update_one(
+        {"_id": "req1"}, {"$unset": {"beam_height_at_kernel": ""}}
+    )
+    beam_pay.height_ += 1_000  # …and the wallet moved on while the row carried no baseline
+
+    await payouts.process_once()
+    row = await payout(mock_db)
+    assert row["status"] == "bridging"
+    assert row["beam_height_at_kernel"] == beam_pay.height_  # the clock starts now
+    assert row["beam_confirmations"] == 0
+
+    beam_pay.height_ += settings.beam_confirmations
+    await payouts.process_once()
+    row = await payout(mock_db)
+    assert row["status"] == "delivering"
+    assert row["beam_confirmations"] == settings.beam_confirmations
+
+
+async def test_a_reported_count_above_the_threshold_advances_with_no_readable_height(
+    mock_db, eth, armed, beam_pay
+):
+    """⛔ AN UNREADABLE HEIGHT MAY NOT SIT ON A CROSSING THAT IS ALREADY MATURE. The height is
+    how maturity is DERIVED, but a count BeamPay states ABOVE the threshold is evidence in its
+    own right — and the bETH is already burned."""
+    eth.start = {ETH.pipe.lower(): 5 * 10**18}
+    await make_payout(mock_db)
+    for _ in range(3):
+        await payouts.process_once()  # → releasing → bridging → the kernel
+    beam_pay.tx("beamtx-1")["confirmations"] = 70
+    beam_pay.height_ = 0  # a wallet that answers no height at all is not a height of 0
+
+    await payouts.process_once()
+    row = await payout(mock_db)
+    assert row["status"] == "delivering" and row["beam_confirmations"] == 70
+    assert "hold_reason" not in row
+
+
+async def test_a_frozen_count_below_the_threshold_holds_when_the_height_is_unreadable(
+    mock_db, eth, armed, beam_pay
+):
+    """The mirror of the test above, and today's sentence unchanged: a count frozen BELOW the
+    threshold is evidence of nothing, so with no height to derive from there is nothing honest
+    left to do but wait and say so. Before this fix a frozen 1 did not hold at all — it read as
+    a crossing one block old, for ever."""
+    eth.start = {ETH.pipe.lower(): 5 * 10**18}
+    await make_payout(mock_db)
+    for _ in range(3):
+        await payouts.process_once()
+    beam_pay.tx("beamtx-1")["confirmations"] = 1
+    beam_pay.height_ = 0
+
+    await payouts.process_once()
+    row = await payout(mock_db)
+    assert row["status"] == "bridging"  # NOT delivering
+    assert "refusing to guess" in row["hold_detail"]
+
+
+async def test_a_young_crossing_waits_and_checkpoints_the_derived_count(
+    mock_db, eth, armed, beam_pay
+):
+    """The fix is a FLOOR, not a bypass. Three blocks past the kernel is three confirmations; the
+    reported 1 may only raise that number and does not; the row waits — and the count a human
+    reading the row acts on is the one that moves."""
+    eth.start = {ETH.pipe.lower(): 5 * 10**18}
+    await make_payout(mock_db)
+    await payouts.process_once()
+    await payouts.process_once()
+    beam_pay.tx("beamtx-1")["confirmations"] = 1
+    await payouts.process_once()  # the kernel
+    beam_pay.height_ += 3
+
+    await payouts.process_once()
+    row = await payout(mock_db)
+    assert row["status"] == "bridging" and row["beam_confirmations"] == 3
+
+
 # ============================================ §H · guards that must not depend on a window
 
 

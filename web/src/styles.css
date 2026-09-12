@@ -2065,8 +2065,11 @@ details.plain summary {
    form to fill in rather than a price to accept. Everything below is layout — no new colour, no
    new radius, no new font: the tokens at the top of this file are the whole palette. */
 
+/* T57 — 720 px, and the CONTEXT CARD lives in it too. Until then the portfolio card was full
+   bleed (1120 px) above a 620 px panel: two widths on one page, which is what made the bottom
+   third read as dead space — the eye had no column to follow down. One column, one axis. */
 .swap-col {
-  max-width: 620px;
+  max-width: 720px;
   width: 100%;
   margin: 0 auto;
   display: flex;
@@ -2660,5 +2663,157 @@ details.plain summary {
   }
   .data.orders td[data-label='Status']::before {
     display: none;
+  }
+}
+
+/* ═══ T57 — one money page (Deposit + Withdraw) ═══════════════════════════════════════════════
+   Admin 2026-09-12, with a screenshot of the Deposit page: "Don't you think we should have
+   DEPOSIT and WITHDRAW at the same page? Improve it, it looks like AI slop now."
+
+   Nothing below is a new colour, font, radius or shadow — every value is a token from the top of
+   this file. What changed is the SHAPE: one column, one width, one axis, and a panel whose head
+   is the direction rather than a title. */
+
+.money-page {
+  gap: 14px;
+}
+/* ONE LINE. It was ~230 px of title, lede and link row, which put the first control the user
+   could touch past the middle of the fold. */
+.money-head {
+  align-items: center;
+}
+.money-head h1 {
+  font-size: 21px;
+  line-height: 1.2;
+}
+
+/* the direction, where a DEX puts buy and sell */
+.seg.seg-modes {
+  border-radius: 999px;
+}
+.seg.seg-modes button {
+  padding: 7px 18px;
+  font-size: 14px;
+}
+
+/* the context card and the panel are one object read downwards: same width, same padding, same
+   edge — a 20 px card above a 16 px panel reads as two designs meeting */
+.swap-col > .card {
+  padding: 16px;
+}
+.portfolio-card .card-head,
+.pgas-balance-card .card-head {
+  margin-bottom: 12px;
+}
+
+/* ---- the Pgas balance, as the withdraw side's context ---- */
+.pgas-balance {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px 14px;
+}
+.pgas-balance .b-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-weight: 600;
+}
+.pgas-balance .b-value {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 15px;
+  line-height: 1.3;
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+/* ---- chips: grouped by chain, one value format, top six ---- */
+/* ⛔ NOT a horizontal scroller any more. A sideways row hid whatever did not fit behind a gesture
+   nobody makes on a desktop, and it was the reason four holdings called ETH could sit side by side
+   with nothing saying which chain each was on. */
+.portfolio-chips {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: visible;
+  padding: 0;
+  margin: 0;
+}
+.pf-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.pf-group-head {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  font-weight: 600;
+}
+.pf-group-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.portfolio-chip {
+  padding: 6px 14px 6px 8px;
+}
+.portfolio-chip-info {
+  gap: 1px;
+}
+/* the value is the thing the eye is sorting on, so it is the thing that reads first */
+.portfolio-chip-value {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--ink);
+  white-space: nowrap;
+}
+.portfolio-chip-line {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  line-height: 1.2;
+}
+.portfolio-chip-sym {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.portfolio-chip-amt {
+  font-size: 11.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.portfolio-more {
+  align-self: flex-start;
+}
+/* ≤ 5 min is quiet; older than that the age is the thing to act on, and Refresh is beside it */
+.portfolio-as-of[data-stale='yes'] {
+  color: var(--amber);
+  font-weight: 600;
+}
+
+/* the panel head holds a control, so its baseline is the control's, not a heading's */
+.sw-head-main {
+  align-items: center;
+}
+
+@media (max-width: 560px) {
+  .money-head h1 {
+    font-size: 20px;
+  }
+  .pgas-balance {
+    grid-template-columns: 1fr 1fr;
+  }
+  .seg.seg-modes button {
+    padding: 7px 14px;
+    font-size: 13.5px;
   }
 }

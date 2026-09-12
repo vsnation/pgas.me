@@ -656,60 +656,94 @@ function useDataState(): DataState {
 }
 
 // ---------- route ----------
-export type Tab = 'deposit' | 'balance' | 'schedule' | 'how';
+/**
+ * T57 (admin 2026-09-12: "Don't you think we should have DEPOSIT and WITHDRAW at the same page?").
+ * Putting money in and taking it out are ONE page with two modes — they are the same sentence
+ * ("you pay X, you receive Y") read in two directions — so there is one tab for both, and the
+ * direction is a segmented control in the panel's head, where a DEX puts buy and sell.
+ */
+export type Tab = 'money' | 'balance' | 'how';
+export type MoneyMode = 'deposit' | 'withdraw';
 
-// Three tabs, one intention each: put money in, look at it, send it out (admin 2026-09-09).
-// The Wallets tab went with the destination registry earlier the same day — an address is typed on
-// Schedule, so there is nothing to register — and Activity went with the screen review: deposits and
-// payouts are one timeline at the bottom of Balance, which is where a user looks for them.
-export const TABS: { id: Tab; label: string; path: string }[] = [
-  { id: 'deposit', label: 'Deposit', path: '/' },
-  { id: 'balance', label: 'Balance', path: '/balance' },
-  { id: 'schedule', label: 'Schedule', path: '/schedule' },
+/**
+ * The things you DO with money. `label` is the desktop nav's; `short` is the phone bar's, where
+ * three columns share 390 px and "Deposit & withdraw" would be an ellipsis.
+ */
+export const TABS: { id: Tab; label: string; short: string; path: string }[] = [
+  { id: 'money', label: 'Deposit & withdraw', short: 'Move', path: '/deposit' },
+  { id: 'balance', label: 'Balance', short: 'Balance', path: '/balance' },
 ];
 
 /**
- * `/how-it-works` (T44) is a ROUTE but not a TAB, and the difference is load-bearing: `TABS` is the
- * three things you DO with money, rendered twice — as the header tabs and as the phone's bottom bar,
- * which is a three-column grid a thumb reaches. A fourth entry there would put a page you read once
- * beside the three you use every time, and shrink each of them by a quarter. So the explainer page
- * is linked from the header (desktop), the footer (everywhere) and the "What is Pgas.me" card, and
- * `TABS` still means what it meant.
+ * `/how-it-works` (T44) is a ROUTE but not a TAB: `TABS` is what you DO, and this is a page you
+ * read once. It keeps its own link in the header (desktop) and the footer (everywhere) — and,
+ * since T57 left the phone bar with a spare column, a third column there too. Those two places
+ * are now the ONLY ones: the lede link and the explainer's were three and four of four (T57
+ * defect 1), and a page with four routes to one explainer is a page that cannot say what it wants.
  */
 export const HOW_PATH = '/how-it-works';
+export const MODE_PATHS: Record<MoneyMode, string> = { deposit: '/deposit', withdraw: '/withdraw' };
+/** The name this page had until T57. It is in old links, DMs and bookmarks, so it still lands. */
+export const LEGACY_WITHDRAW_PATH = '/schedule';
 const PATHS: Record<Tab, string> = {
-  deposit: '/',
+  money: MODE_PATHS.deposit,
   balance: '/balance',
-  schedule: '/schedule',
   how: HOW_PATH,
 };
 
 export interface RouteState {
   tab: Tab;
+  /** Which direction the money page is pointing; only meaningful while `tab === 'money'`. */
+  mode: MoneyMode;
   navigate(tab: Tab): void;
+  goMoney(mode: MoneyMode): void;
 }
 
-function tabFromPath(path: string): Tab {
+interface Place {
+  tab: Tab;
+  mode: MoneyMode;
+}
+
+function placeFromPath(path: string): Place {
   const p = path.replace(/\/+$/, '') || '/';
-  if (p === '/activity') return 'balance'; // the old bookmark still lands on the timeline
-  const hit = (Object.keys(PATHS) as Tab[]).find((t) => PATHS[t] === p);
-  return hit ?? 'deposit';
+  if (p === '/activity') return { tab: 'balance', mode: 'deposit' }; // the old bookmark still lands on the timeline
+  if (p === '/balance') return { tab: 'balance', mode: 'deposit' };
+  if (p === HOW_PATH) return { tab: 'how', mode: 'deposit' };
+  // `/withdraw` and its old name both point the one page the other way
+  if (p === MODE_PATHS.withdraw || p === LEGACY_WITHDRAW_PATH) return { tab: 'money', mode: 'withdraw' };
+  return { tab: 'money', mode: 'deposit' };
 }
 
 function useRouteState(): RouteState {
-  const [tab, setTab] = useState<Tab>(() => tabFromPath(window.location.pathname));
+  const [place, setPlace] = useState<Place>(() => placeFromPath(window.location.pathname));
+  /**
+   * ⛔ The `/schedule` redirect REPLACES rather than pushes. A pushed redirect puts the old path
+   * back in the history one entry down, so Back lands on it, which redirects again — a trap the
+   * user cannot get out of with the control they reached for.
+   */
   useEffect(() => {
-    const onPop = () => setTab(tabFromPath(window.location.pathname));
+    const fix = () => {
+      if (window.location.pathname.replace(/\/+$/, '') === LEGACY_WITHDRAW_PATH) {
+        window.history.replaceState(null, '', MODE_PATHS.withdraw);
+      }
+    };
+    fix();
+    const onPop = () => {
+      setPlace(placeFromPath(window.location.pathname));
+      fix();
+    };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
   }, []);
-  const navigate = useCallback((t: Tab) => {
-    const path = PATHS[t] ?? '/';
+  const go = useCallback((next: Place) => {
+    const path = next.tab === 'money' ? MODE_PATHS[next.mode] : PATHS[next.tab];
     if (window.location.pathname !== path) window.history.pushState(null, '', path);
-    setTab(t);
+    setPlace(next);
     window.scrollTo({ top: 0 });
   }, []);
-  return useMemo(() => ({ tab, navigate }), [tab, navigate]);
+  const navigate = useCallback((t: Tab) => go({ tab: t, mode: 'deposit' }), [go]);
+  const goMoney = useCallback((m: MoneyMode) => go({ tab: 'money', mode: m }), [go]);
+  return useMemo(() => ({ tab: place.tab, mode: place.mode, navigate, goMoney }), [place, navigate, goMoney]);
 }
 
 // ---------- theme ----------

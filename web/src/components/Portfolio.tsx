@@ -1,9 +1,26 @@
 // Balances read client-side: the connected wallet's holdings across every chain the API lists —
-// the Deposit page's tap-to-pay chips. (The per-destination native balances went with the Wallets
-// page on 2026-09-09: a payout address is typed now, not registered, so there is no list to price.)
-// The chip row is buybeam.my's: one horizontally scrolling line of pills, token logo with the chain
-// badge on its corner, symbol over the USD value (or the balance when nothing priced it).
-import { useCallback, useEffect, useRef, useState } from 'react';
+// the money page's tap-to-pay chips, and the context card above the Deposit panel.
+//
+// T57 (2026-09-12) rebuilt the row itself. The admin's screenshot showed four entries all labelled
+// ETH with tiny chain badges and no chain names, in two different formats ($ for most, a bare `1`
+// for a token nothing could price), with "as of 44 h ago" whispered in grey beside a quiet
+// Refresh. So:
+//
+//   · GROUPED BY CHAIN, with the chain NAMED. A badge 13 px across is not an answer to "which
+//     ETH is this?" — four rows called ETH are four different holdings and the page has to say so.
+//   · ONE VALUE FORMAT: the dollar figure, with the token amount under it. A holding nothing could
+//     price shows the amount and the words "no price" — which is what is true, where a bare
+//     number was a quantity masquerading as a value.
+//   · TOP 6, then "+N more". Sorted by value, so the six are the six that matter; the rest are one
+//     press away rather than a sideways scroll nobody finds.
+//   · STALENESS IS LOUD WHEN IT MATTERS. Under five minutes it is quiet grey; older than that it
+//     is amber and Refresh becomes the prominent control. ⛔ Refresh is still the ONLY thing that
+//     starts a scan (T31 F) — saying an old number is old is not the same as re-reading thirty
+//     public RPCs because a page was opened.
+//   · "Endpoints" is gone. It duplicated the header's gear and put jargon beside money controls;
+//     the gear is the one entry point. The links that appear only when a chain COULD NOT be read
+//     stay — those are a way out of a failure, not a second copy of a control.
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { chainIconUrl } from '../lib/chains';
 import { fmtAgo, fmtNumber, fmtUsd } from '../lib/format';
 import {
@@ -18,11 +35,18 @@ import {
 import { RpcSettingsLink } from './RpcSettings';
 import { useStore } from '../state/store';
 
-const MAX_CHIPS = 24;
+/** How many chips are shown before the disclosure. Sorted by value, so these are the six. */
+const TOP_CHIPS = 6;
+/** Older than this and the age is worth saying out loud (amber), not whispering. */
+const STALE_MS = 5 * 60 * 1000;
 
-/** buybeam's portfolioBalanceLabel: the USD value once it is worth a cent, else the raw balance. */
-function chipLabel(h: Holding): string {
-  if (h.usd !== undefined && h.usd >= 0.01) return fmtUsd(h.usd);
+/** Has anything priced this holding? A value under a cent is not a value worth two decimals. */
+function isPriced(h: Holding): boolean {
+  return h.usd !== undefined && h.usd >= 0.01;
+}
+
+/** The token amount, at the precision the size of it deserves. */
+function chipAmount(h: Holding): string {
   return fmtNumber(h.amount, h.amount >= 1 ? 2 : 6);
 }
 
@@ -44,6 +68,18 @@ function ChipIcons({ h }: { h: Holding }) {
   );
 }
 
+/** The holdings on screen, in chain order of first appearance — which is value order, since the
+ *  list arrives sorted by value and a chain's place is its biggest holding's. */
+function groupByChain(hs: Holding[]): { chainId: number; name: string; list: Holding[] }[] {
+  const out: { chainId: number; name: string; list: Holding[] }[] = [];
+  for (const h of hs) {
+    const hit = out.find((g) => g.chainId === h.chainId);
+    if (hit) hit.list.push(h);
+    else out.push({ chainId: h.chainId, name: h.chainName, list: [h] });
+  }
+  return out;
+}
+
 export function Portfolio({
   address,
   selectedKey,
@@ -55,7 +91,7 @@ export function Portfolio({
   onPick: (h: Holding) => void;
   /**
    * The scan result, published to whoever composes this card. ONE writer: this component scans and
-   * caches, the Deposit page reads what it publishes — the chips and the "Pay with" picker are the
+   * caches, the Deposit body reads what it publishes — the chips and the "Pay with" picker are the
    * same holdings, not two lists that can disagree (T31 G).
    */
   onLoaded?: (p: PortfolioData | null) => void;
@@ -67,8 +103,8 @@ export function Portfolio({
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<[number, number]>([0, 0]);
   const [error, setError] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState(false);
   const run = useRef(0);
-  const row = useRef<HTMLDivElement>(null);
   const { provider, chainId } = wallet;
 
   /**
@@ -124,6 +160,7 @@ export function Portfolio({
       shownFor.current = address;
       setPortfolio(null);
       setLive([]);
+      setExpanded(false);
     }
     void scan(false);
   }, [address, chains, scan]);
@@ -139,10 +176,13 @@ export function Portfolio({
   const evm = scans.filter((c) => !c.nonEvm);
   const reachable = evm.filter((c) => c.via !== 'none').length;
   const nonEvm = scans.filter((c) => c.nonEvm).length;
-  const chips = holdings.slice(0, MAX_CHIPS);
-  const firstKey = chips[0]?.key;
+  const chips = expanded ? holdings : holdings.slice(0, TOP_CHIPS);
+  const groups = useMemo(() => groupByChain(chips), [chips]);
+  const hidden = holdings.length - chips.length;
   const totalUsd = holdings.reduce((s, h) => s + (h.usd ?? 0), 0);
   const settled = !!portfolio && !scanning;
+  /** An old number needs a date on it — and, past five minutes, one nobody has to look for. */
+  const stale = settled && Date.now() - portfolio.at > STALE_MS;
   /** EVM chains no endpoint could be read through — the failure a different endpoint might fix. */
   const unreadable = evm.filter((c) => c.via === 'none');
 
@@ -152,7 +192,6 @@ export function Portfolio({
   const scanNote = [
     `read ${reachable} of ${evm.length} EVM chains${scans.some((c) => c.via === 'wallet') ? ' (one through the wallet)' : ''}`,
     nonEvm ? `${nonEvm} not scanned (non-EVM)` : '',
-    holdings.length > MAX_CHIPS ? `showing the top ${MAX_CHIPS} of ${holdings.length}` : '',
     portfolio && !scanning && holdings.length > 0 && !portfolio.priced
       ? pricesRateLimited()
         ? 'prices skipped (CoinGecko rate limit)'
@@ -165,19 +204,10 @@ export function Portfolio({
     .filter(Boolean)
     .join(' · ');
 
-  // chains land one by one and the list re-sorts when prices arrive; Chrome keeps whatever chip was
-  // leftmost in place, which leaves the row scrolled past the biggest holdings. Whenever a new chip
-  // takes the front, put the row back at the start — a scroll the user made himself is untouched.
-  useEffect(() => {
-    if (row.current) row.current.scrollLeft = 0;
-  }, [firstKey]);
-
   return (
-    <section className="card" data-testid="portfolio">
+    <section className="card portfolio-card" data-testid="portfolio">
       <div className="card-head">
-        <div>
-          <h2>Your portfolio</h2>
-        </div>
+        <h2>Your wallet</h2>
         <div className="row">
           {portfolio?.priced && totalUsd > 0 && (
             <span className="num strong" title="Sum of priced holdings">
@@ -185,13 +215,18 @@ export function Portfolio({
             </span>
           )}
           {settled && (
-            <span className="tiny muted" data-testid="portfolio-as-of" title={new Date(portfolio.at).toLocaleString()}>
-              as of {fmtAgo(portfolio.at)}
+            <span
+              className={`tiny portfolio-as-of${stale ? '' : ' muted'}`}
+              data-testid="portfolio-as-of"
+              data-stale={stale ? 'yes' : 'no'}
+              title={new Date(portfolio.at).toLocaleString()}
+            >
+              updated {fmtAgo(portfolio.at)}
             </span>
           )}
           <button
             type="button"
-            className="btn btn-sm"
+            className={`btn btn-sm${stale ? ' btn-primary' : ''}`}
             onClick={() => scan(true)}
             disabled={scanning || !chains.length}
             title={scanNote ? `Re-read every chain — ${scanNote}` : 'Re-read every chain'}
@@ -199,9 +234,6 @@ export function Portfolio({
           >
             {scanning ? 'Scanning…' : 'Refresh'}
           </button>
-          {/* T54 — the second way into the endpoint settings, where a person who just watched a
-              chain fail to load is actually looking. The header's gear is the first. */}
-          <RpcSettingsLink testId="rpc-settings-portfolio">Endpoints</RpcSettingsLink>
         </div>
       </div>
 
@@ -234,23 +266,44 @@ export function Portfolio({
       )}
 
       {(chips.length > 0 || settled) && (
-        <div className="stack">
+        <div className="stack-sm">
           {chips.length ? (
-            <div className="portfolio-chips" data-testid="portfolio-chips" ref={row}>
-              {chips.map((h) => (
-                <button
-                  key={h.key}
-                  type="button"
-                  className={`portfolio-chip${selectedKey === h.key ? ' selected' : ''}`}
-                  onClick={() => onPick(h)}
-                  title={`${h.symbol} on ${h.chainName}`}
-                >
-                  <ChipIcons h={h} />
-                  <span className="portfolio-chip-info">
-                    <span className="portfolio-chip-sym">{h.symbol}</span>
-                    <span className="portfolio-chip-usd">{chipLabel(h)}</span>
-                  </span>
-                </button>
+            <div className="portfolio-chips" data-testid="portfolio-chips" data-holdings={holdings.length} data-shown={chips.length}>
+              {groups.map((g) => (
+                <div className="pf-group" key={g.chainId} data-pf-chain={g.chainId}>
+                  <div className="pf-group-head">{g.name}</div>
+                  <div className="pf-group-chips">
+                    {g.list.map((h) => {
+                      const priced = isPriced(h);
+                      const amount = chipAmount(h);
+                      return (
+                        <button
+                          key={h.key}
+                          type="button"
+                          className={`portfolio-chip${selectedKey === h.key ? ' selected' : ''}`}
+                          onClick={() => onPick(h)}
+                          title={`${h.symbol} on ${h.chainName}`}
+                          data-holding={h.key}
+                          data-priced={priced ? 'yes' : 'no'}
+                        >
+                          <ChipIcons h={h} />
+                          <span className="portfolio-chip-info">
+                            {/* ⛔ ONE FORMAT. The dollar figure when there is one, the amount when
+                                there is not — and the class that names it USD is on the element
+                                only while it really is USD. */}
+                            <span className={`portfolio-chip-value${priced ? ' portfolio-chip-usd' : ''}`}>
+                              {priced ? fmtUsd(h.usd) : amount}
+                            </span>
+                            <span className="portfolio-chip-line">
+                              <span className="portfolio-chip-sym">{h.symbol}</span>
+                              <span className="portfolio-chip-amt">{priced ? amount : 'no price'}</span>
+                            </span>
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
               ))}
             </div>
           ) : (
@@ -259,6 +312,17 @@ export function Portfolio({
                 ? 'No chain could be read right now — the RPCs did not answer. Pick a chain and token below by hand.'
                 : `No holdings found on ${reachable} reachable chain${reachable === 1 ? '' : 's'}.`}
             </div>
+          )}
+          {(hidden > 0 || expanded) && (
+            <button
+              type="button"
+              className="link-btn tiny portfolio-more"
+              data-testid={expanded ? 'portfolio-less' : 'portfolio-more'}
+              aria-expanded={expanded}
+              onClick={() => setExpanded((o) => !o)}
+            >
+              {expanded ? 'Show fewer' : `+${hidden} more`}
+            </button>
           )}
         </div>
       )}

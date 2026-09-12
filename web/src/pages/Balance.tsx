@@ -129,7 +129,7 @@ function Payouts({ requests, history }: { requests: PayoutRequest[]; history: Hi
   const scheduleAgain = (o: PayoutRow) => {
     const asked = requestedGroth(o);
     if (asked !== null) setSchedulePrefill({ W: o.W, groth: asked });
-    route.navigate('schedule');
+    route.goMoney('withdraw');
   };
 
   const cancel = async (id: string) => {

@@ -317,7 +317,7 @@ export function HowItWorksPage() {
             balances, addresses and times in them are that suite&rsquo;s example data, not anybody&rsquo;s account.
           </p>
         </div>
-        <button type="button" className="btn btn-primary" data-testid="how-start" onClick={() => route.navigate('deposit')}>
+        <button type="button" className="btn btn-primary" data-testid="how-start" onClick={() => route.navigate('money')}>
           Start a deposit →
         </button>
       </div>
@@ -428,11 +428,11 @@ export function HowItWorksPage() {
       </section>
 
       <div className="row how-cta">
-        <button type="button" className="btn btn-primary" onClick={() => route.navigate('deposit')}>
+        <button type="button" className="btn btn-primary" onClick={() => route.navigate('money')}>
           Start a deposit →
         </button>
-        <button type="button" className="btn" onClick={() => route.navigate('schedule')}>
-          Or go straight to Schedule
+        <button type="button" className="btn" onClick={() => route.goMoney('withdraw')}>
+          Or go straight to Withdraw
         </button>
       </div>
     </div>

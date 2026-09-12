@@ -515,3 +515,95 @@ async def test_a_funded_crossing_is_picked_up_on_the_next_pass(mock_db, monkeypa
 def test_the_funded_wait_says_the_money_is_on_its_way():
     user, _op = payouts.hold_texts("payout-funding", {"operator": "x"})
     assert user == "Funds are on their way to the bridge — usually a few minutes"
+
+
+# ═════════════════ T56 · a crossing whose burn is booked is not committed float twice ═════════
+#
+# Live, 2026-09-11 10:54Z: every withdrawal refused with "No withdrawal can be delivered right
+# now" while the wallet could spend 235,115 groth of bETH (coins 35,125 + 199,990, BeamPay's
+# treasury ledger agreeing). Order 64ee… was `bridging` WITH `kernel_at` — its crossing burned at
+# 2026-09-10 18:59Z and its ledger release was booked, so its 740,526 groth had already left the
+# wallet AND the ledger. `inflight_pipeline` still counted it (`status in INFLIGHT`), and
+# `_float_schedule` subtracted it from a wallet that no longer held it: 235,115 − 740,526 → 0.
+
+LIVE_SPENDABLE = 235_115
+PREVIEW_ASK = 200_000  # 0.002 ETH
+
+
+def _live_wallet(beam_pay: FakeBeamPay) -> None:
+    beam_pay.wallet_totals[ETH.aid] = {
+        "available": LIVE_SPENDABLE,
+        "available_regular": LIVE_SPENDABLE,
+        "available_mp": 0,
+        "maturing_mp": MATURING,
+    }
+
+
+async def _booked_crossing(mock_db: Any) -> dict[str, Any]:
+    now = time.time()
+    return await make_payout(
+        mock_db, amount=735_839, rid="64ee5540b52aaa8cfdf3e373", status="bridging",
+        relayer_fee_groth=4_687, bridge_fee_groth=9_444, fund_groth=740_526,
+        fund_called_at=now - 3_700, kernel_at=now - 60, release_booked_txid="beamtx-booked",
+        msg_id=94, beam_txid="beamtx-booked",
+    )
+
+
+async def test_a_booked_crossing_is_not_subtracted_from_the_wallet_twice(
+    client, user, mock_db, shielded_last_night, monkeypatch, beam_pay
+):
+    _live_wallet(beam_pay)
+    await _booked_crossing(mock_db)
+    assert await payouts.inflight_groth(ETH) == 0  # the burn is booked: nothing is in flight
+    got = await payouts.float_schedule(ETH)
+    assert got is not None
+    assert got["committed_groth"] == 0
+    assert got["spendable_now_groth"] == LIVE_SPENDABLE
+
+    monkeypatch.setattr(settings, "payout_direct_enabled", True)
+    await fund(user, "ETH", 10 * GROTH)
+    r = await client.post("/v1/withdrawals/preview", json=_body(PREVIEW_ASK), headers=user["headers"])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["items"][0].get("problem_code") != "treasury_float"
+    assert body["treasury"]["ok"] is True
+    assert body["treasury"]["float_now_groth"] == LIVE_SPENDABLE
+    assert body["treasury"]["deliverable_now_groth"] == LIVE_SPENDABLE - BRIDGE
+    assert "problem" not in body["treasury"]
+
+
+async def test_a_release_whose_kernel_has_not_confirmed_stays_committed(
+    mock_db, shielded_last_night, beam_pay
+):
+    _live_wallet(beam_pay)
+    await _booked_crossing(mock_db)
+    await make_payout(mock_db, amount=100_000, rid="sending", status="releasing",
+                      relayer_fee_groth=5_000, bridge_fee_groth=7_000)
+    await make_payout(mock_db, amount=50_000, rid="mined-not-booked", status="bridging",
+                      relayer_fee_groth=1_000, beam_txid="t-unbooked")
+    assert await payouts.inflight_groth(ETH) == 105_000 + 51_000
+    got = await payouts.float_schedule(ETH)
+    assert got["committed_groth"] == 156_000
+    assert got["spendable_now_groth"] == LIVE_SPENDABLE - 156_000
+    # the question itself: the INFLIGHT clause is gated on the burn, the same way
+    # `inflight_release_query` and `crossing_pipeline` already are
+    clauses = payouts.inflight_pipeline(ETH)[0]["$match"]["$and"][0]["$or"]
+    assert clauses[0] == {"status": {"$in": list(payouts.INFLIGHT)}, "kernel_at": {"$exists": False}}
+
+
+async def test_the_funded_and_held_clauses_are_unchanged(mock_db, beam_pay):
+    clauses = payouts.inflight_pipeline(ETH)[0]["$match"]["$and"][0]["$or"]
+    assert clauses[1:] == [
+        {"status": payouts.HELD, "held_from": {"$in": list(payouts.INFLIGHT)},
+         "float_resolved": {"$ne": True}},
+        {"fund_called_at": {"$exists": True}, "kernel_at": {"$exists": False},
+         "status": {"$in": ["scheduled", payouts.DELAYED]}},
+        {"fund_called_at": {"$exists": True}, "kernel_at": {"$exists": False},
+         "status": payouts.HELD, "held_from": {"$in": ["scheduled", payouts.DELAYED]},
+         "float_resolved": {"$ne": True}},
+    ]
+    now = time.time()
+    await make_payout(mock_db, amount=300_000, rid="funded", relayer_fee_groth=3_000,
+                      fund_groth=303_000, fund_called_at=now - 30)
+    assert await payouts.inflight_groth(ETH) == 303_000  # funded, not burned: committed
+    assert await payouts.queued_crossing_groth(ETH) == 303_000

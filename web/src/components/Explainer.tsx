@@ -1,25 +1,32 @@
 // "Add explanation about what is pgas.me. If you see my screenshot, it's not clear what to do here.
 // For us it's clear, not for new users." — the admin, 2026-09-10, looking at the signed-in Deposit
 // page: portfolio chips, a "What to deposit" card and an empty Quote card, with nothing on screen
-// saying what the product is or which of the three tabs comes next.
+// saying what the product is or which of the tabs comes next.
 //
-// So this panel is for EVERY visitor, signed in or not, and it is open by default. It is not a
-// modal (a modal is a thing you have to know to open) and not a marketing hero (the page under it
-// is the product): the existing card, the existing type scale, two sentences and the three tabs as
-// three numbered steps with the one you are on lit up.
+// T57 (2026-09-12) narrowed where it appears, not what it says. Two changes, both from the admin's
+// screenshot of the result:
 //
-// Dismissing it is remembered; the "What is Pgas.me?" link brings it back. A first-time visitor —
-// anyone whose browser has never stored that choice — always gets it open.
+//   1. ⛔ NO LINK TO THE EXPLAINER PAGE FROM HERE. This card's "How it works, step by step →" was
+//      the third of FOUR routes to one page in a single view (nav, the page lede, this row, the
+//      footer). It is in the nav and the footer now, and those are the only two.
+//   2. It renders only while NO WALLET IS CONNECTED. A visitor who has not connected anything has
+//      nothing else to do on the money page and every reason to ask what it is; once a wallet is
+//      connected the panel is the page, and a card above it is the 230 px of preamble that put the
+//      first control past the middle of the fold. The money page decides that (pages/Money.tsx) —
+//      this component still just draws itself.
+//
+// Dismissing it is remembered; the "What is Pgas.me?" link brings it back.
 import { useCallback, useEffect, useState } from 'react';
-import { HOW_PATH, useStore, type Tab } from '../state/store';
+import { useStore } from '../state/store';
 
 const KEY = 'pgas.explainer.v1';
 
-/** The three tabs, said as what the user DOES in each — the order money moves through the app. */
-const STEPS: { tab: Tab; title: string; line: string }[] = [
-  { tab: 'deposit', title: 'Deposit', line: 'Pay from any wallet, on any chain. This page.' },
-  { tab: 'balance', title: 'Balance', line: 'See it arrive on Beam’s confidential ledger.' },
-  { tab: 'schedule', title: 'Schedule', line: 'List the wallets, the amounts and the times.' },
+/** What the user DOES, in the order money moves through the app — two tabs, three steps. */
+type StepId = 'deposit' | 'balance' | 'withdraw';
+const STEPS: { id: StepId; title: string; line: string }[] = [
+  { id: 'deposit', title: 'Deposit', line: 'Pay from any wallet, on any chain.' },
+  { id: 'balance', title: 'Balance', line: 'See it arrive on Beam’s confidential ledger.' },
+  { id: 'withdraw', title: 'Withdraw', line: 'List the wallets, the amounts and the times.' },
 ];
 
 function storedDismissed(): boolean {
@@ -39,33 +46,8 @@ function remember(dismissed: boolean): void {
   }
 }
 
-/**
- * The way to the long form (T44). An `<a>` with a real href rather than a button: it is a page,
- * so it must be openable in a new tab and followable by a crawler; the click handler keeps the
- * in-app navigation for everyone else.
- */
-function HowLink() {
-  const { route } = useStore();
-  return (
-    <a
-      className="link-btn"
-      href={HOW_PATH}
-      data-testid="explainer-how"
-      onClick={(e) => {
-        e.preventDefault();
-        route.navigate('how');
-      }}
-    >
-      How it works, step by step →
-    </a>
-  );
-}
-
-/**
- * `current` is the tab this page IS — the step that lights up. Every page can render this; the
- * Deposit page is the one a first visit lands on.
- */
-export function Explainer({ current = 'deposit' }: { current?: Tab } = {}) {
+/** `current` is the step this page IS — the one that lights up. */
+export function Explainer({ current = 'deposit' }: { current?: StepId } = {}) {
   const { wallet, route } = useStore();
   const [dismissed, setDismissed] = useState<boolean>(() => storedDismissed());
   // storage is read once per mount; a second tab that dismissed it does not reach back into this one
@@ -80,13 +62,20 @@ export function Explainer({ current = 'deposit' }: { current?: Tab } = {}) {
     setDismissed(false);
   }, []);
 
+  const go = useCallback(
+    (id: StepId) => {
+      if (id === 'balance') route.navigate('balance');
+      else route.goMoney(id);
+    },
+    [route],
+  );
+
   if (dismissed) {
     return (
       <div className="explainer-collapsed row" data-testid="explainer-collapsed">
         <button type="button" className="link-btn" data-testid="explainer-show" onClick={show}>
           What is Pgas.me?
         </button>
-        <HowLink />
       </div>
     );
   }
@@ -102,15 +91,12 @@ export function Explainer({ current = 'deposit' }: { current?: Tab } = {}) {
       <div className="stack">
         <p className="muted small" data-testid="explainer-what">
           Private gas for fresh EVM wallets: you deposit from any wallet and any chain, and the value settles on Beam&rsquo;s confidential
-          ledger. Later you schedule payouts to new wallets, and nothing on any public chain links them to the deposit.
+          ledger. Later you withdraw to new wallets, and nothing on any public chain links them to the deposit.
         </p>
-        <div className="row">
-          <HowLink />
-        </div>
         <ol className="explainer-steps" data-testid="explainer-steps">
           {STEPS.map((s, i) => (
-            <li key={s.tab} className={`explainer-step${s.tab === current ? ' current' : ''}`} data-step={s.tab}>
-              <button type="button" onClick={() => route.navigate(s.tab)} aria-current={s.tab === current ? 'step' : undefined}>
+            <li key={s.id} className={`explainer-step${s.id === current ? ' current' : ''}`} data-step={s.id}>
+              <button type="button" onClick={() => go(s.id)} aria-current={s.id === current ? 'step' : undefined}>
                 <span className="n" aria-hidden="true">
                   {i + 1}
                 </span>
