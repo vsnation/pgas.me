@@ -282,10 +282,10 @@ Two Uniswap V4 paths live in this repository, and only one of them ships.
 
 What **ships** is the two-step route: swap the token you hold through the canonical Uniswap V4 pool
 with the Universal Router — priced by reading the V4 Quoter — into your own wallet, then deposit
-what arrived. The client half is live and covered end to end; the API half that builds the
-Universal Router calldata is **landing**, and today the API's `uniswap` quote branch still builds
-the one-transaction form. That is said here rather than glossed, because the table below is only
-worth anything if every row is true.
+what arrived. Both halves are here and both are tested: the API builds the `execute` calldata and
+the approvals, the client sends them in order and re-quotes on what actually landed. The route is
+dark on our own deployment until its pool registry (`PGAS_UNISWAP_POOLS`) is filled, and that is
+the only thing between this code and a live swap — nothing else is missing.
 
 Beside it, built and adversarially reviewed but **not deployed**, is the one-transaction hook
 route: a zero-liquidity gateway pool whose `beforeSwap` routes the input through the canonical pool
@@ -300,16 +300,22 @@ Every line range below was re-checked against the files in this commit.
 
 | what | file | lines |
 |---|---|---|
-| Which pairs have a route, and the canonical pool each one prices against | `api/pgasme/uniswap.py` | L274–L314 |
-| The V4 Quoter read — `quoteExactInputSingle` by `eth_call`, never our own curve math; an unreadable quote is never a zero, and a pool that quotes nothing is refused | `api/pgasme/uniswap.py` | L421–L468 |
-| Selector and event-topic pins, kept next to the artifact they came from and asserted by the suite | `api/pgasme/uniswap.py`, `api/tests/test_uniswap_quote.py` | L62–L80, L158–L160 |
-| The `uniswap` branch of `POST /v1/quote` (one-transaction form today; the two-step builder is landing) | `api/pgasme/routers/quote.py` | L922–L1071 |
-| Which route a request gets, and what happens when the registry is unreadable | `api/pgasme/routers/quote.py` | L1074–L1086, L1116–L1183 |
-| Which `uniswap` shape a quote is — the API says so, the client never guesses | `web/src/pages/Deposit.tsx` | L244–L256 |
-| Approve Permit2, sign the permit, swap into your own wallet, re-quote what actually arrived | `web/src/pages/Deposit.tsx` | L649–L724 |
-| When the Uniswap route is offered at all, and the sentence explaining why it is not | `web/src/pages/Deposit.tsx` | L199–L224, L774–L785, L845–L880 |
+| The pins: `execute` selector, the `V4_SWAP` command byte, the action ids | `api/pgasme/uniswap.py` | L112–L120 |
+| Which pairs have a route, and the canonical hook-less pool each one prices against | `api/pgasme/uniswap.py` | L368–L416 |
+| The V4 Quoter read — `quoteExactInputSingle` by `eth_call`, never our own curve math; an unreadable quote is never a zero | `api/pgasme/uniswap.py` | L540–L628 |
+| Pool liveness before we quote — `extsload` of slot0 and liquidity on the PoolManager, so a dead pool is refused as a dead pool | `api/pgasme/uniswap.py` | L630–L690 |
+| The action encoding: `SWAP_EXACT_IN_SINGLE`, `SETTLE_ALL`, `TAKE_ALL` | `api/pgasme/uniswap.py` | L691–L723 |
+| **`UniversalRouter.execute(bytes commands, bytes[] inputs, uint256 deadline)` — the whole of step 1** | `api/pgasme/uniswap.py` | L724–L736 |
+| The approvals, in order: the zero-first reset a USDT-style token needs, the token's allowance to Permit2, then Permit2's allowance for the router with its expiry | `api/pgasme/uniswap.py` | L909–L977 |
+| The two-step branch of `POST /v1/quote` | `api/pgasme/routers/quote.py` | L968–L1127 |
+| Which route a request gets — one resolver, `uniswap.wants_uniswap`, and what happens when the registry is unreadable | `api/pgasme/routers/quote.py` | L929–L967, L1354 |
+| Which `uniswap` shape a quote is — the API says so, the client never guesses | `web/src/pages/Deposit.tsx` | L330–L344 |
+| Send every approval in order, then the swap, then re-quote what actually arrived | `web/src/pages/Deposit.tsx` | L806–L860 |
+| When the Uniswap route is offered at all, and when it is not | `web/src/pages/Deposit.tsx` | L285–L311, L350 |
 | Which ingress routes are open — the API's statement, read in one place | `web/src/lib/ingress.ts` | L19–L47 |
-| The two-step flow driven end to end against a mock wallet: six cases including a wallet that cannot sign typed data | `web/e2e/uniswap-two-step.spec.ts` | whole file |
+| The golden vector: the exact calldata at block 25,942,000, written by the API's test and executed by the fork test | `contracts/test/vectors/uniswap-two-step.json` | whole file |
+| The API's own calldata sent to the **real** Universal Router on a mainnet fork — 9 tests, including proof that command `0x10` is `V4_SWAP` in the deployed router and that the pool id and state slot we compute are the live ones | `contracts/test/fork/UniswapTwoStep.t.sol` | whole file |
+| The builder under test (33) and the flow driven against a mock wallet (10) | `api/tests/test_uniswap_two_step.py`, `web/e2e/uniswap-two-step.spec.ts` | whole files |
 
 ### Reference, not deployed: the one-transaction hook route
 
@@ -329,8 +335,8 @@ Every line range below was re-checked against the files in this commit.
 | A 50-USDC deposit into the **real** Beam bridge pipe on a mainnet fork, event and balance asserted | `contracts/test/fork/PgasMainnetFork.t.sol` | L217–L263 |
 | The pinned pipe code hashes, read at the pinned block and again at the chain tip | `contracts/test/fork/PgasMainnetFork.t.sol` | L414–L474 |
 | Golden vectors both the Solidity and the Python split are tested against | `contracts/test/vectors/grid.json`, `contracts/test/vectors/events.json` | whole files |
-| Decoding the hook's `PgasDeposit` log | `api/pgasme/uniswap.py` | L539–L592 |
-| The value band a lock may fall in, and the refusal when a quote's own numbers admit none | `api/pgasme/uniswap.py` | L595–L653 |
+| Decoding the hook's `PgasDeposit` log (`deposit_log`) | `api/pgasme/uniswap.py` | whole file, hook section |
+| The value band a lock may fall in, and the refusal when a quote's own numbers admit none | `api/pgasme/uniswap.py` | whole file, hook section |
 | Crediting a bridge lock back to the deposit its `PgasDeposit` log names | `api/pgasme/scanner.py` | L446–L504 |
 
 The offline suite is 76 tests and the mainnet-fork suite is 9; both are described in
