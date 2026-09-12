@@ -192,3 +192,83 @@ are **not deployed** — no mainnet address, no testnet address — and stay in 
 reviewed reference rather than live infrastructure. What ships to users is the two-step Uniswap
 route, landing in the next release; the cross-chain route remains the default. If a Uniswap-operated executor for
 post-swap calldata ever ships, we will delete most of `contracts/` and be glad to.
+
+## The same deposit, as two requests
+
+Both routes do one thing: take a token the user already holds and end with `EthPipe.sendFunds(value,
+relayerFee, receiverBeamPubkey)` executed on Ethereum. Here is what each one costs an integrator, in
+the literal shapes our code builds.
+
+### Cross-chain solver (deBridge DLN): one HTTP GET, one signature
+
+```
+GET https://dln.debridge.finance/v1.0/dln/order/create-tx
+    ?srcChainId=42161
+    &srcChainTokenIn=0xaf88d065e77c8cC2239327C5EDb3A432268e5831       # USDC on Arbitrum
+    &srcChainTokenInAmount=50000000
+    &dstChainId=1
+    &dstChainTokenOut=0x0000000000000000000000000000000000000000      # native ETH
+    &dstChainTokenOutAmount=19993660737233356
+    &dstChainTokenOutRecipient=<the user's own wallet>                # also the hook's fallback
+    &srcChainOrderAuthorityAddress=<the user>
+    &dstChainOrderAuthorityAddress=<the user>
+    &senderAddress=<the user>
+    &prependOperatingExpenses=false
+    &slippage=<bps>
+    &dlnHook={"type":"evm_transaction_call","data":{
+        "to":"0xB1d7FF9D3aCaf30e282c5F6eb1F2A6503f516a96",            # the Beam bridge's ETH pipe
+        "calldata":"0x4d5dd2bc…",                                     # sendFunds(value, relayerFee, pubkey)
+        "gas":250000}}
+```
+
+The answer contains a ready-to-sign `tx`. That is the whole integration: build one URL, hand the
+transaction to the wallet. Three properties come for free and none of them is ours to implement:
+the hook is success-required, its fallback recipient is the field we already set to the user's own
+wallet, and the API pre-simulates the fill, so a hook that would revert comes back as
+`errorId: HOOK_FAILED` instead of a transaction that fails on chain. We deployed nothing.
+
+### Uniswap v4, the shipped two-step: up to four transactions we assemble ourselves
+
+Step 1 is a swap into the user's own wallet. Before it, up to three approvals, each one calldata we
+encode:
+
+```
+1. ERC-20  approve(Permit2, 0)                     # only when a short non-zero allowance exists;
+                                                   # USDT reverts on a non-zero -> non-zero raise
+2. ERC-20  approve(Permit2, 50000000)
+3. Permit2 approve(token, UniversalRouter, 50000000, expiration = deadline)
+```
+
+Then the swap itself, `UniversalRouter.execute(bytes commands, bytes[] inputs, uint256 deadline)`:
+
+```
+to        0x66a9893cC07D91D95644AEDD05D03f95e1dBA8Af   # the v4-capable Universal Router
+selector  0x3593564c
+commands  0x10                                          # V4_SWAP
+actions   0x060c0f                                      # SWAP_EXACT_IN_SINGLE, SETTLE_ALL, TAKE_ALL
+inputs[0] abi.encode(actions, params[3])                # 1,666 hex chars
+poolKey   {currency0: 0x0000…0000, currency1: 0xA0b8…eB48, fee: 3000,
+           tickSpacing: 60, hooks: 0x0000…0000}
+amountIn  50000000            minOut 19993660737233356  # quoter 20094131394204378 less 50 bps
+deadline  now + 1200
+total calldata: 2,186 hex chars, all of it built by us
+```
+
+Step 2 is a second transaction: re-quote on what actually arrived, then the direct
+`sendFunds(value, relayerFee, pubkey)` deposit. Two signatures, four transactions worst case.
+
+Before any of that we read the chain ourselves to avoid quoting into a dead pool: `extsload` on the
+PoolManager for slot0 and liquidity, then an `eth_call` to the V4 Quoter, then both allowances with
+independent readability flags. The fixed addresses we pin, because the route cannot be built without
+them: Universal Router, Permit2, PoolManager, Quoter. The cross-chain route pins none.
+
+### What it costs to switch each one on
+
+The cross-chain lane needs one environment value, the API base. Our Uniswap lane needs the flag,
+four validated addresses and a pool registry: every pair we serve has to be listed with its exact
+`PoolKey`, because a v4 pool is identified by a struct rather than by a pair address, and one
+malformed row takes the registry down rather than silently serving the rest. That registry is the
+reason the lane is still dark on our box while the cross-chain one has been live since day one.
+
+None of this is a complaint about v4's design. It is the honest cost of an integration that has to
+assemble router commands, actions and a PoolKey itself, next to one that takes a URL.
