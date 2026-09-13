@@ -458,6 +458,42 @@ async def test_the_account_route_carries_the_eta_on_every_order(mock_db, client,
     assert "failed" not in str(rows["r-delay"]).lower()
 
 
+async def test_a_delays_sentence_does_not_outlive_the_delay(mock_db):
+    """⛔ **A WAIT'S TEXT MUST DIE WITH THE WAIT.** `_delay` writes `delay_reason` in the same
+    `_set` as `hold_reason`, but `_advance`'s `$unset` list — which clears every other trace of
+    a hold on the way out — did not name it. So the sentence rode along through every later
+    transition: payout 42bc6678 was read out of the live database on 2026-09-13 sitting in
+    `sent`, delivered, still saying *"Funds are on their way to the bridge — usually a few
+    minutes"*.
+
+    It is only ever READ while the row is `delayed` (`eta_for`), which is exactly why it went
+    unnoticed for so long: nothing user-facing was wrong, and every operator read of a finished
+    row was. The law this pins is the one about a record that must exist on every path,
+    inverted — a field written beside its siblings and forgotten where they are all cleared."""
+    now = time.time()
+    await mock_db["pgasme_test"].payout_requests.insert_one(
+        {
+            "_id": "r-stale", "account_id": "acct1", "asset": "ETH", "mode": "direct",
+            "W": W, "amount_groth": 500_000, "status": payouts.DELAYED,
+            "hold_reason": "no free coin", "delay_reason": "no free coin",
+            "hold_detail": "the wallet can spend 0 ETH", "hold_code": "payout-wallet",
+            "next_attempt_at": now + 120, "created_at": now,
+        }
+    )
+    # the row moves on, exactly as a release does
+    claimed = await payouts._advance(
+        "payout_requests", "r-stale", "status", payouts.DELAYED, "releasing",
+        "payout_releasing", "Payout releasing", "request_id",
+    )
+    assert claimed is not None, "the transition must have been claimed by this pass"
+
+    row = await mock_db["pgasme_test"].payout_requests.find_one({"_id": "r-stale"})
+    assert row["status"] == "releasing"
+    # the whole family goes together — the twin included
+    for gone in ("hold_reason", "delay_reason", "hold_detail", "hold_code"):
+        assert gone not in row, f"{gone} outlived the wait it described"
+
+
 # ═════════════════════════════════════════════════════════ 4 · NO SHIELDING
 
 

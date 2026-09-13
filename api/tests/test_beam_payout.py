@@ -524,9 +524,15 @@ class FakeWalletApi(beam.Wallet):
         rows: list[dict[str, Any]] = []
         for t in (self.bp.totals() if self.bp else []):
             aid = int(t["asset_id"])
-            for field, kind, bucket in (
-                ("available_regular", "norm", "regular"),
-                ("available_mp", "shld", "shielded"),
+            # ⛔ THE STATUS NUMBER IS PER TYPE, and this fixture used to mint BOTH buckets at
+            # status 1 — a value the real wallet never produces for a shielded coin. Beam
+            # numbers an ordinary output Available=1 and a shielded one Available=2, so the
+            # green suite was pinning the very assumption that made `coin_counts` discard every
+            # available shielded coin in production. Read live 2026-09-13: `{"type": "shld",
+            # "status": 2, "status_string": "available"}`.
+            for field, kind, bucket, avail in (
+                ("available_regular", "norm", "regular", 1),
+                ("available_mp", "shld", "shielded", 2),
             ):
                 value = int(t.get(field) or 0)
                 exact = self.coin_amounts.get((aid, bucket))
@@ -538,7 +544,7 @@ class FakeWalletApi(beam.Wallet):
                 rows.extend(
                     {
                         "amount": amount, "asset_id": aid, "type": kind,
-                        "status": 1, "status_string": "available",
+                        "status": avail, "status_string": "available",
                         "id": f"{aid}-{bucket}-{i}", "maturity": self.height,
                         "createTxId": "", "spentTxId": "",
                     }

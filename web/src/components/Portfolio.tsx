@@ -20,7 +20,7 @@
 //   · "Endpoints" is gone. It duplicated the header's gear and put jargon beside money controls;
 //     the gear is the one entry point. The links that appear only when a chain COULD NOT be read
 //     stay — those are a way out of a failure, not a second copy of a control.
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { chainIconUrl } from '../lib/chains';
 import { fmtAgo, fmtNumber, fmtUsd } from '../lib/format';
 import {
@@ -35,8 +35,8 @@ import {
 import { RpcSettingsLink } from './RpcSettings';
 import { useStore } from '../state/store';
 
-/** How many chips are shown before the disclosure. Sorted by value, so these are the six. */
-const TOP_CHIPS = 6;
+/** How many chips are shown before the disclosure. They wrap, so a dozen costs three rows. */
+const TOP_CHIPS = 12;
 /** Older than this and the age is worth saying out loud (amber), not whispering. */
 const STALE_MS = 5 * 60 * 1000;
 
@@ -66,18 +66,6 @@ function ChipIcons({ h }: { h: Holding }) {
       )}
     </span>
   );
-}
-
-/** The holdings on screen, in chain order of first appearance — which is value order, since the
- *  list arrives sorted by value and a chain's place is its biggest holding's. */
-function groupByChain(hs: Holding[]): { chainId: number; name: string; list: Holding[] }[] {
-  const out: { chainId: number; name: string; list: Holding[] }[] = [];
-  for (const h of hs) {
-    const hit = out.find((g) => g.chainId === h.chainId);
-    if (hit) hit.list.push(h);
-    else out.push({ chainId: h.chainId, name: h.chainName, list: [h] });
-  }
-  return out;
 }
 
 export function Portfolio({
@@ -177,7 +165,6 @@ export function Portfolio({
   const reachable = evm.filter((c) => c.via !== 'none').length;
   const nonEvm = scans.filter((c) => c.nonEvm).length;
   const chips = expanded ? holdings : holdings.slice(0, TOP_CHIPS);
-  const groups = useMemo(() => groupByChain(chips), [chips]);
   const hidden = holdings.length - chips.length;
   const totalUsd = holdings.reduce((s, h) => s + (h.usd ?? 0), 0);
   const settled = !!portfolio && !scanning;
@@ -269,42 +256,36 @@ export function Portfolio({
         <div className="stack-sm">
           {chips.length ? (
             <div className="portfolio-chips" data-testid="portfolio-chips" data-holdings={holdings.length} data-shown={chips.length}>
-              {groups.map((g) => (
-                <div className="pf-group" key={g.chainId} data-pf-chain={g.chainId}>
-                  <div className="pf-group-head">{g.name}</div>
-                  <div className="pf-group-chips">
-                    {g.list.map((h) => {
-                      const priced = isPriced(h);
-                      const amount = chipAmount(h);
-                      return (
-                        <button
-                          key={h.key}
-                          type="button"
-                          className={`portfolio-chip${selectedKey === h.key ? ' selected' : ''}`}
-                          onClick={() => onPick(h)}
-                          title={`${h.symbol} on ${h.chainName}`}
-                          data-holding={h.key}
-                          data-priced={priced ? 'yes' : 'no'}
-                        >
-                          <ChipIcons h={h} />
-                          <span className="portfolio-chip-info">
-                            {/* ⛔ ONE FORMAT. The dollar figure when there is one, the amount when
+              {chips.map((h) => {
+                const priced = isPriced(h);
+                const amount = chipAmount(h);
+                return (
+                  <button
+                    key={h.key}
+                    type="button"
+                    className={`portfolio-chip${selectedKey === h.key ? ' selected' : ''}`}
+                    onClick={() => onPick(h)}
+                    title={`${h.symbol} on ${h.chainName}`}
+                    data-holding={h.key}
+                    data-priced={priced ? 'yes' : 'no'}
+                  >
+                    <ChipIcons h={h} />
+                    <span className="portfolio-chip-info">
+                      {/* ⛔ ONE FORMAT. The dollar figure when there is one, the amount when
                                 there is not — and the class that names it USD is on the element
                                 only while it really is USD. */}
-                            <span className={`portfolio-chip-value${priced ? ' portfolio-chip-usd' : ''}`}>
-                              {priced ? fmtUsd(h.usd) : amount}
-                            </span>
-                            <span className="portfolio-chip-line">
-                              <span className="portfolio-chip-sym">{h.symbol}</span>
-                              <span className="portfolio-chip-amt">{priced ? amount : 'no price'}</span>
-                            </span>
-                          </span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </div>
-              ))}
+                      <span className={`portfolio-chip-value${priced ? ' portfolio-chip-usd' : ''}`}>
+                        {priced ? fmtUsd(h.usd) : amount}
+                      </span>
+                      <span className="portfolio-chip-line">
+                        <span className="portfolio-chip-sym">{h.symbol}</span>
+                        <span className="portfolio-chip-amt">{priced ? amount : 'no price'}</span>
+                        <span className="portfolio-chip-chain-name">{h.chainName}</span>
+                      </span>
+                    </span>
+                  </button>
+                );
+              })}
             </div>
           ) : (
             <div className="empty" data-testid="portfolio-empty">

@@ -857,14 +857,14 @@ async def coin_counts_now() -> dict[int, dict[str, int]]:
 
     out: dict[int, dict[str, int]] = {}
     for u in await beam.wallet().utxos():
-        if payouts._groth(u.get("status")) != payouts.UTXO_AVAILABLE:
+        # ⛔ the SAME two readers the money path uses (`payouts.utxo_available` /
+        # `payouts.is_shielded`), never a second copy of the status rule: this panel exists to
+        # show the operator the numbers the gate is actually using, and a panel that reads
+        # coins its own way is law 9 with a screen attached.
+        if not payouts.utxo_available(u):
             continue  # maturing, spent, in flight — not a coin a send can pick up
         aid = payouts._groth(u.get("asset_id"))
-        bucket = (
-            payouts.SOURCE_SHIELDED
-            if str(u.get("type") or "").lower() == payouts.UTXO_SHIELDED_TYPE
-            else payouts.SOURCE_REGULAR
-        )
+        bucket = payouts.SOURCE_SHIELDED if payouts.is_shielded(u) else payouts.SOURCE_REGULAR
         row = out.setdefault(aid, {payouts.SOURCE_REGULAR: 0, payouts.SOURCE_SHIELDED: 0})
         row[bucket] += 1
     return out

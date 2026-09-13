@@ -418,6 +418,14 @@ async def _advance(
             # silence of a hold that was resolved.
             "$unset": {
                 "hold_reason": "",
+                # ⛔ **AND ITS TWIN.** `_delay` writes `delay_reason` in the SAME `_set` as
+                # `hold_reason`, and this list forgot it — so every other trace of a wait was
+                # cleared on the way out and the delay's own sentence rode along for ever. A
+                # payout delivered on 2026-09-13 was still advertising "Funds are on their way
+                # to the bridge" in `sent`. Only `eta_for` reads it, and only while the row is
+                # `delayed`, so nothing is lost by clearing it here: the next delay rewrites it
+                # after its own transition, exactly as `hold_reason` already does.
+                "delay_reason": "",
                 "hold_at": "",
                 "hold_paged_at": "",
                 "held_reminded_at": "",
@@ -1737,12 +1745,50 @@ def _groth(v: Any) -> int:
     return int(str(v).strip())
 
 
-# The wallet's own words for a spendable coin and for a shielded one (read off the box
-# 2026-09-10: `{"amount": …, "asset_id": 36, "type": "shld", "status": 3, "status_string":
-# "maturing"}`). `norm` and `chng` are ordinary outputs; only status 1 can be spent.
-UTXO_AVAILABLE = 1
+# The wallet's own words for a spendable coin. ⛔ **THERE ARE TWO STATUS ENUMS, NOT ONE.** Beam
+# numbers an ordinary output on `Coin::Status` (Available=1) and a shielded one on
+# `ShieldedCoin::Status` (Available=2) — the same word on two different scales, and both spell
+# Maturing 3, which is precisely what made the mistake invisible. The old single constant was
+# written on 2026-09-10 from a *maturing* `shld` row and the ORDINARY enum's "1" was carried
+# onto it; from that day every AVAILABLE shielded coin read as unspendable, so the coin gate
+# counted zero shielded coins, the release refused the one bucket it could have drawn on, and
+# the product told people their money sat in a shielded pool it could not reach. Read live off
+# the wallet 2026-09-13: `{"type": "shld", "status": 2, "status_string": "available"}` twice
+# (1,000,000 and 652,864 groth of bETH) beside `{"type": "norm", "status": 1, ...}`.
+UTXO_AVAILABLE_REGULAR = 1
+UTXO_AVAILABLE_SHIELDED = 2
+UTXO_AVAILABLE_WORD = "available"
 UTXO_SHIELDED_TYPE = "shld"
 BEAM_ASSET_ID = 0
+
+
+def is_shielded(u: dict[str, Any]) -> bool:
+    """Is this UTXO a shielded (max-privacy) output? ONE reader (law 9).
+
+    The bucket a coin is counted in and the enum its status is read on are THE SAME FACT. Two
+    places deciding it separately is how they come to disagree."""
+    return str(u.get("type") or "").lower() == UTXO_SHIELDED_TYPE
+
+
+def utxo_available(u: dict[str, Any]) -> bool:
+    """Can a send pick this coin up RIGHT NOW? ONE reader, covering BOTH enums.
+
+    ⛔ RAISES (via `_groth`) on a status that is not a number, and deliberately so: an
+    unreadable coin list is not "no coins" and not "plenty" (law 8). The release turns that
+    raise into a hold that names the parse failure in its own words, which a silent `False`
+    would have hidden for ever.
+
+    The NUMBER decides, on the enum belonging to this coin's type. `status_string` may only
+    ever VETO: where the wallet spells a word at all, it has to be the available one. That
+    ordering is the point — the number is authoritative but enum-dependent, the word is
+    enum-independent but optional, and of the two possible mistakes only an OVERCOUNT can
+    actually hurt, because it hands the wallet a send it cannot fund (`Not enough inputs`,
+    two releases 0.7 s apart, 2026-09-10 10:30Z). An undercount merely defers a pass."""
+    want = UTXO_AVAILABLE_SHIELDED if is_shielded(u) else UTXO_AVAILABLE_REGULAR
+    if _groth(u.get("status")) != want:
+        return False
+    word = str(u.get("status_string") or "").strip().lower()
+    return not word or word.startswith(UTXO_AVAILABLE_WORD)
 
 
 def coin_capacity(amounts: Iterable[int], need: int) -> int:
@@ -1807,14 +1853,10 @@ async def coin_counts() -> dict[int, dict[str, Any]]:
         return {aid: dict(v) for aid, v in cached.items()}
     out: dict[int, dict[str, Any]] = {}
     for u in await beam.wallet().utxos():
-        if _groth(u.get("status")) != UTXO_AVAILABLE:
+        if not utxo_available(u):
             continue  # maturing, spent, in flight — not a coin a send can pick up
         aid = _groth(u.get("asset_id"))
-        bucket = (
-            SOURCE_SHIELDED
-            if str(u.get("type") or "").lower() == UTXO_SHIELDED_TYPE
-            else SOURCE_REGULAR
-        )
+        bucket = SOURCE_SHIELDED if is_shielded(u) else SOURCE_REGULAR
         row = out.setdefault(
             aid,
             {

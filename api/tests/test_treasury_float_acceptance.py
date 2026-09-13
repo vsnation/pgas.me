@@ -36,7 +36,6 @@ rung was taken from the gate refusals it had collected before the funding.
 
 from __future__ import annotations
 
-import datetime as dt
 import math
 import re
 import time
@@ -66,9 +65,18 @@ from pgasme.routers import withdrawals as w
 # ── the live numbers, 2026-09-10 15:36Z ───────────────────────────────────────────────────────
 SPENDABLE = 775_651  # what the wallet could spend, regular, in groth
 MATURING = 1_652_864  # locked in three max-privacy outputs
-UNLOCK = dt.datetime(2026, 9, 12, 23, 21, 0, tzinfo=dt.UTC).timestamp()
-UNLOCK_2 = dt.datetime(2026, 9, 13, 0, 27, 0, tzinfo=dt.UTC).timestamp()
-UNLOCK_WORDS = "Sat 12 Sep, 23:21Z"
+# ⛔ **RELATIVE TO THE CLOCK, NEVER A CALENDAR DATE.** These were the live absolute moments
+# (2026-09-12 23:21Z and 2026-09-13 00:27Z) with the rendered words typed in beside them. On
+# 2026-09-13 the clock simply walked past both: a shield still inside its 72 h lock became one
+# whose lock had expired, `maturing_schedule` correctly dropped every entry, and four tests
+# failed on a sentence nobody had edited — the code was right and the suite was lying about it.
+# What this file pins is the SCENARIO (value locked now, unlocking later), so the anchors come
+# off the same clock the code reads and the WORDS come off the anchors, via the one formatter
+# that writes them. Whole seconds, so `(at + MAX_PRIVACY_LOCK_S)` round-trips exactly.
+_NOW = time.time()
+UNLOCK = float(int(_NOW + 11 * 3600))  # the first two chunks: locked now, free in ~11 h
+UNLOCK_2 = float(int(_NOW + 12 * 3600 + 360))  # the third, an hour and change behind them
+UNLOCK_WORDS = payouts.fmt_when(UNLOCK)
 RELAYER = 6_340  # the crossing's own fee at that minute…
 BRIDGE = math.ceil(RELAYER * w.headroom_for(0))  # …7,925 groth, the headroom floor included
 ASKED = 1_000_000  # the admin's 0.01 ETH
@@ -137,7 +145,8 @@ def pinned_fee(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 async def shielded_last_night(mock_db: Any) -> None:
-    """The three max-privacy chunks of 2026-09-09 23:2xZ, on the deposit row that made them."""
+    """The three max-privacy chunks, on the deposit row that made them — settled ~61 h ago and
+    so still inside the 72 h max-privacy lock, which is the state this whole file is about."""
     await mock_db["pgasme_test"].deposits.insert_one(
         {
             "_id": "dep-shield",
