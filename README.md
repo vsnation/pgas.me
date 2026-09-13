@@ -19,6 +19,18 @@ under wallet, coin and fee gates. The instant payout lane and the one-transactio
 are both behind flags that are off — the hook deliberately, as a reviewed reference rather than a
 deployment. Everything that moves money checks one kill-switch file before each irreversible step.
 
+## Features
+
+- Private funding of fresh EVM wallets
+- Pay with ETH, DAI or WBTC
+- Ethereum → Beam → Ethereum settlement
+- Scheduled payouts
+- Multiple destination wallets per deposit
+- Real-time balance and payout status
+- Sign-In with Ethereum
+- Append-only accounting ledger
+- On-chain deposit verification
+
 ## How it works
 
 Seven steps, in the screens themselves. Every picture below is this app, captured by its own
